@@ -106,6 +106,12 @@ void GPUExecutor::Execute()
   //     mutex-protected cache load, so they don't need to be per-thread.
   const int num_gpus_for_exec = static_cast<int>(gpuBufferManager->tables_per_gpu.size());
 
+  // Toggle: SIRIUS_LEGACY_PARALLEL=0 forces the old sequential per-GPU loop
+  // (Phase 2). Default (unset or =1) uses the parallel N-thread executor
+  // (Phase B4). Useful for A/B timing and debugging.
+  const char* parallel_env = std::getenv("SIRIUS_LEGACY_PARALLEL");
+  const bool run_parallel  = !parallel_env || std::string(parallel_env) != "0";
+
   std::vector<std::thread> workers;
   std::vector<std::exception_ptr> errors(num_gpus_for_exec);
   workers.reserve(num_gpus_for_exec);
@@ -117,15 +123,9 @@ void GPUExecutor::Execute()
   int initial_idx_w   = initial_idx;
   auto* gpu_bm        = gpuBufferManager;
 
-  for (int gpu_iter = 0; gpu_iter < num_gpus_for_exec; ++gpu_iter) {
-    workers.emplace_back([gpu_iter,
-                          &scheduled_ref,
-                          &executor_ref,
-                          &context_ref,
-                          initial_idx_w,
-                          gpu_bm,
-                          &errors]() {
-      try {
+  auto worker_body = [&scheduled_ref, &executor_ref, &context_ref, initial_idx_w, gpu_bm](
+                      int gpu_iter, std::exception_ptr* err_slot) {
+    try {
         gpu_bm->set_gpu_for_thread(gpu_iter);
         SIRIUS_LOG_DEBUG("Per-GPU worker thread: GPU {}", gpu_iter);
 
@@ -257,14 +257,24 @@ void GPUExecutor::Execute()
       pipeline->sink->Sink(*sink_relation);
     }
   }  // end for-pipeline
-      } catch (...) {
-        errors[gpu_iter] = std::current_exception();
-      }
-    });  // end worker lambda
-  }      // end per-GPU spawn loop
+    } catch (...) {
+      *err_slot = std::current_exception();
+    }
+  };  // end worker_body lambda
 
-  // Wait for all workers and propagate the first non-null exception, if any.
-  for (auto& w : workers) { w.join(); }
+  if (run_parallel) {
+    SIRIUS_LOG_DEBUG("Executor mode: parallel ({} workers)", num_gpus_for_exec);
+    for (int gpu_iter = 0; gpu_iter < num_gpus_for_exec; ++gpu_iter) {
+      workers.emplace_back(worker_body, gpu_iter, &errors[gpu_iter]);
+    }
+    for (auto& w : workers) { w.join(); }
+  } else {
+    SIRIUS_LOG_DEBUG("Executor mode: sequential ({} iters)", num_gpus_for_exec);
+    for (int gpu_iter = 0; gpu_iter < num_gpus_for_exec; ++gpu_iter) {
+      worker_body(gpu_iter, &errors[gpu_iter]);
+    }
+  }
+
   for (auto& e : errors) {
     if (e) std::rethrow_exception(e);
   }
