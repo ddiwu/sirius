@@ -27,11 +27,16 @@
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/execution/physical_operator_states.hpp"
 #include "duckdb/optimizer/join_order/join_node.hpp"
+#include "gpu_buffer_manager.hpp"
 #include "gpu_columns.hpp"
 #include "helper/types.hpp"
 
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/data_repository.hpp>
+
+#include <array>
+#include <memory>
+#include <mutex>
 
 namespace duckdb {
 class GPUExecutor;
@@ -45,6 +50,22 @@ class GPUMetaPipeline;
 
 enum class MemoryBarrierType { PIPELINE, PARTIAL, FULL };
 
+//! Base class for per-GPU runtime state attached to a GPUPhysicalOperator.
+//!
+//! Phase B (concurrent multi-GPU execute) requires that operator instances be
+//! shared between worker threads (one thread per GPU) but that any *mutable*
+//! per-query / per-execution state be isolated per thread. We carry that
+//! isolated state in subclasses of OpRuntimeState held in the operator's
+//! per_gpu_state vector, indexed by `sirius_current_gpu`.
+//!
+//! Each concrete operator that has runtime-mutable members defines its own
+//! `<Op>RuntimeState : OpRuntimeState` subclass and accesses it through
+//! `runtime_state<...>(gpu)`.
+class OpRuntimeState {
+ public:
+  virtual ~OpRuntimeState() = default;
+};
+
 //! GPUPhysicalOperator is the base class of the physical operators present in the
 //! execution plan
 class GPUPhysicalOperator {
@@ -57,8 +78,9 @@ class GPUPhysicalOperator {
                       idx_t estimated_cardinality)
     : type(type), types(std::move(types)), estimated_cardinality(estimated_cardinality)
   {
+    per_gpu_state.resize(GPUBufferManager::GetMaxGpus());
   }
-  GPUPhysicalOperator() = default;
+  GPUPhysicalOperator() { per_gpu_state.resize(GPUBufferManager::GetMaxGpus()); }
 
   virtual ~GPUPhysicalOperator() {}
 
@@ -77,6 +99,24 @@ class GPUPhysicalOperator {
   unique_ptr<GlobalOperatorState> op_state;
   //! Lock for (re)setting any of the operator states
   mutex lock;
+
+  //! Per-GPU runtime state. Lazy-initialised by `runtime_state<T>(gpu)`.
+  //! `mutable` so const member functions (e.g. GetData) can lazily initialise.
+  mutable vector<unique_ptr<OpRuntimeState>> per_gpu_state;
+  //! Guards the lazy creation of per_gpu_state slots.
+  mutable std::mutex per_gpu_state_mutex;
+
+  //! Returns (and lazy-creates) this operator's per-GPU runtime state for
+  //! `gpu`. T must derive from OpRuntimeState. Each concrete operator that
+  //! holds runtime state declares a single `T` subclass and uses this helper.
+  template <typename T>
+  T& runtime_state(int gpu) const
+  {
+    std::lock_guard<std::mutex> lk(per_gpu_state_mutex);
+    auto& slot = per_gpu_state[gpu];
+    if (!slot) { slot = std::make_unique<T>(); }
+    return static_cast<T&>(*slot);
+  }
 
  public:
   virtual string GetName() const;

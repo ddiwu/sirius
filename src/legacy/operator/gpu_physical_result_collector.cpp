@@ -64,8 +64,10 @@ void GPUPhysicalResultCollector::BuildPipelines(GPUPipeline& current,
 }
 
 GPUPhysicalMaterializedCollector::GPUPhysicalMaterializedCollector(GPUPreparedStatementData& data)
-  : GPUPhysicalResultCollector(data), result_collection(make_uniq<GPUResultCollection>())
+  : GPUPhysicalResultCollector(data)
 {
+  // Per-GPU result_collection now lives in ResultCollectorRuntimeState; it's
+  // lazy-initialised on first Sink for each GPU. No work needed here.
 }
 
 //===--------------------------------------------------------------------===//
@@ -494,8 +496,14 @@ SinkResultType GPUPhysicalMaterializedCollector::ConvertGPUTableToCPUCollection(
 
 SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation& input_relation) const
 {
+  // Each GPU worker thread accumulates into its own per-GPU collection. They
+  // are merged at GetResult time. Lazy-init on first Sink for this GPU.
+  auto& rstate = runtime_state<ResultCollectorRuntimeState>(sirius_current_gpu);
+  if (!rstate.result_collection) {
+    rstate.result_collection = make_uniq<GPUResultCollection>();
+  }
   return ConvertGPUTableToCPUCollection(
-    input_relation, types, result_collection.get(), gpuBufferManager);
+    input_relation, types, rstate.result_collection.get(), gpuBufferManager);
 }
 
 unique_ptr<GlobalSinkState> GPUPhysicalMaterializedCollector::GetGlobalSinkState(
@@ -516,12 +524,30 @@ unique_ptr<LocalSinkState> GPUPhysicalMaterializedCollector::GetLocalSinkState(
 unique_ptr<QueryResult> GPUPhysicalMaterializedCollector::GetResult(GlobalSinkState& state)
 {
   auto& gstate = state.Cast<GPUMaterializedCollectorGlobalState>();
-  // Currently the result will be empty
   if (!gstate.context)
     throw InvalidInputException("No context set in GPUMaterializedCollectorState");
-  auto prop   = gstate.context->GetClientProperties();
+  auto prop = gstate.context->GetClientProperties();
+
+  // Concatenate the per-GPU result_collections (in GPU id order) into one
+  // combined collection that GPUQueryResult will hand out chunk-by-chunk.
+  auto combined = make_uniq<GPUResultCollection>();
+  for (int g = 0; g < GPUBufferManager::GetMaxGpus(); ++g) {
+    if (!per_gpu_state[g]) continue;
+    auto& rstate = static_cast<ResultCollectorRuntimeState&>(*per_gpu_state[g]);
+    if (!rstate.result_collection) continue;
+    auto& src = *rstate.result_collection;
+    if (src.write_idx == 0) continue;  // empty per-GPU collection
+    combined->SetCapacity(src.write_idx);
+    for (size_t i = 0; i < src.write_idx; ++i) {
+      // Move chunks across; src is destructed when its RuntimeState is freed.
+      combined->AddChunk(src.data_chunks[i]);
+    }
+    // Release the per-GPU collection now that we've moved its content.
+    rstate.result_collection.reset();
+  }
+
   auto result = make_uniq<GPUQueryResult>(
-    statement_type, properties, names, types, prop, std::move(result_collection));
+    statement_type, properties, names, types, prop, std::move(combined));
   return std::move(result);
 }
 

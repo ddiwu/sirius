@@ -33,6 +33,13 @@ using gpu_pool_memory_resource = rmm::mr::pool_memory_resource;
 using gpu_pool_memory_resource = rmm::mr::pool_memory_resource<rmm::mr::cuda_memory_resource>;
 #endif
 
+// Maximum number of GPUs the legacy buffer manager (and per-operator
+// runtime-state arrays sized by it) supports. Mirrors the NUM_GPUS macro
+// in gpu_buffer_manager.cpp; exposed in the header so other layers
+// (operators, executor) can size per-GPU containers without taking a
+// runtime dependency on the singleton.
+constexpr int kSiriusLegacyNumGpus = 2;
+
 // Per-thread "current GPU" for the legacy execution path. Set by
 // GPUBufferManager::set_gpu_for_thread(g) at the start of a per-GPU worker.
 // Processing-pool allocations and table reads in that thread observe it.
@@ -146,6 +153,12 @@ class GPUBufferManager {
   // cudf's thread-local default device resource so all subsequent kernel
   // launches and intermediate allocations land on `g`.
   void set_gpu_for_thread(int g);
+
+  // Maximum number of GPUs supported (matches the legacy NUM_GPUS macro).
+  // Static so callers can size per-GPU state without instantiating the
+  // singleton (operators are constructed during plan generation, before
+  // gpu_buffer_init has been called).
+  static constexpr int GetMaxGpus() { return kSiriusLegacyNumGpus; }
 
   template <typename T>
   T* customCudaMalloc(size_t size, int gpu, bool caching);

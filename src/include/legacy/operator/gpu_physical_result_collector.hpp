@@ -56,10 +56,17 @@ class GPUPhysicalResultCollector : public GPUPhysicalOperator {
   bool IsSource() const override { return true; }
 };
 
+// Per-GPU runtime state for the materialized collector. Each GPU worker
+// thread accumulates its partition's chunks into its own
+// `result_collection`; on GetResult the per-GPU collections are concatenated
+// into a single combined GPUResultCollection that's handed to DuckDB.
+struct ResultCollectorRuntimeState : OpRuntimeState {
+  unique_ptr<GPUResultCollection> result_collection;
+};
+
 class GPUPhysicalMaterializedCollector : public GPUPhysicalResultCollector {
  public:
   GPUPhysicalMaterializedCollector(GPUPreparedStatementData& data);
-  unique_ptr<GPUResultCollection> result_collection;
 
  public:
   unique_ptr<QueryResult> GetResult(GlobalSinkState& state) override;

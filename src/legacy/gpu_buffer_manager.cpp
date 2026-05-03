@@ -28,7 +28,9 @@
 #include <rmm/aligned.hpp>
 #include <rmm/cuda_stream_view.hpp>
 
-#define NUM_GPUS 2
+// Local alias for kSiriusLegacyNumGpus (declared in the header) so existing
+// code paths can keep using NUM_GPUS without churn.
+#define NUM_GPUS kSiriusLegacyNumGpus
 
 namespace duckdb {
 
