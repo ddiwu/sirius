@@ -30,7 +30,22 @@
 
 #include <stdio.h>
 
+#include <atomic>
+#include <exception>
+#include <mutex>
+#include <thread>
+
 namespace duckdb {
+
+namespace {
+// Serializes the cache-load section (GetDataDuckDB) across per-GPU worker
+// threads in parallel Execute(). The first thread to enter this section
+// loads the cache for ALL GPUs (Phase 1's per-GPU partitioning runs inside
+// GetDataDuckDB); subsequent threads observe `already_cached=true` on every
+// column and short-circuit. Without this lock, multiple threads would race
+// on TableScan's shared mutable members (column_size, num_rows, ...).
+std::mutex g_cache_load_mutex;
+}  // namespace
 
 void GPUExecutor::Reset()
 {
@@ -74,19 +89,47 @@ void GPUExecutor::Execute()
 
   SIRIUS_LOG_DEBUG("Total meta pipelines {}", scheduled.size());
 
-  // Phase 2: run the entire pipeline graph once per GPU. The first iteration
-  // (g=0) populates the cache for every GPU via Phase 1's partitioned scan;
-  // subsequent iterations short-circuit the load (already_cached) and only
-  // run the read+compute side on tables_per_gpu[g]. The result_collector
-  // accumulates rows from each GPU's partition, giving a concat-style merge.
-  // (Sequential, not concurrent — true parallelism comes later.)
-  const int num_gpus_for_exec =
-    static_cast<int>(gpuBufferManager->tables_per_gpu.size());
-  for (int gpu_iter = 0; gpu_iter < num_gpus_for_exec; ++gpu_iter) {
-    gpuBufferManager->set_gpu_for_thread(gpu_iter);
-    SIRIUS_LOG_DEBUG("Per-GPU iteration: GPU {}", gpu_iter);
+  // Phase B: run the entire pipeline graph concurrently across N GPUs.
+  // Each worker thread is bound to one GPU via set_gpu_for_thread() and
+  // runs the same plan against its GPU's partition (tables_per_gpu[g]).
+  //
+  //   - The scan's cache-LOAD section (GetDataDuckDB) is serialized via
+  //     g_cache_load_mutex: the first thread loads partitions for all GPUs
+  //     (Phase 1's per-GPU split runs inside GetDataDuckDB); subsequent
+  //     threads see already_cached=true on every column and short-circuit.
+  //   - The READ side (GetData) is reentrant: each thread reads only its
+  //     own GPU's tables_per_gpu[g] entries.
+  //   - Each per-GPU ResultCollector accumulates into its own
+  //     ResultCollectorRuntimeState::result_collection (Phase B2).
+  //     GetResult concatenates them at the end.
+  //   - cuda_streams on TableScan are touched only inside the
+  //     mutex-protected cache load, so they don't need to be per-thread.
+  const int num_gpus_for_exec = static_cast<int>(gpuBufferManager->tables_per_gpu.size());
 
-  for (const auto& pipeline : scheduled) {
+  std::vector<std::thread> workers;
+  std::vector<std::exception_ptr> errors(num_gpus_for_exec);
+  workers.reserve(num_gpus_for_exec);
+
+  // Capture state needed by worker lambdas.
+  auto& scheduled_ref = this->scheduled;
+  auto& executor_ref  = this->executor;
+  auto& context_ref   = this->context;
+  int initial_idx_w   = initial_idx;
+  auto* gpu_bm        = gpuBufferManager;
+
+  for (int gpu_iter = 0; gpu_iter < num_gpus_for_exec; ++gpu_iter) {
+    workers.emplace_back([gpu_iter,
+                          &scheduled_ref,
+                          &executor_ref,
+                          &context_ref,
+                          initial_idx_w,
+                          gpu_bm,
+                          &errors]() {
+      try {
+        gpu_bm->set_gpu_for_thread(gpu_iter);
+        SIRIUS_LOG_DEBUG("Per-GPU worker thread: GPU {}", gpu_iter);
+
+        for (const auto& pipeline : scheduled_ref) {
     // TODO: This is temporary solution
     // if (pipeline->source->type == PhysicalOperatorType::HASH_JOIN || pipeline->source->type ==
     // PhysicalOperatorType::RESULT_COLLECTOR) { 	continue;
@@ -143,10 +186,14 @@ void GPUExecutor::Execute()
     auto source_type = pipeline->source.get()->type;
     SIRIUS_LOG_DEBUG("pipeline source type {}", PhysicalOperatorToString(source_type));
     if (source_type == PhysicalOperatorType::TABLE_SCAN) {
-      // initialize pipeline
-      Pipeline duckdb_pipeline(*executor);
-      ThreadContext thread_context(context);
-      ExecutionContext exec_context(context, thread_context, &duckdb_pipeline);
+      // Cache load is serialized across worker threads. Phase 1's per-GPU
+      // partitioning runs INSIDE GetDataDuckDB, so the first thread to grab
+      // this mutex loads partitions for all GPUs. Subsequent threads see
+      // already_cached=true on every column and short-circuit cheaply.
+      std::lock_guard<std::mutex> lk(g_cache_load_mutex);
+      Pipeline duckdb_pipeline(*executor_ref);
+      ThreadContext thread_context(context_ref);
+      ExecutionContext exec_context(context_ref, thread_context, &duckdb_pipeline);
       auto& table_scan = pipeline->source->Cast<GPUPhysicalTableScan>();
       table_scan.GetDataDuckDB(exec_context);
     }
@@ -173,7 +220,7 @@ void GPUExecutor::Execute()
                                     : intermediate_relations[current_intermediate];
       // current_chunk.Reset();
 
-      auto& prev_relation    = current_intermediate == initial_idx + 1
+      auto& prev_relation    = current_intermediate == initial_idx_w + 1
                                  ? source_relation
                                  : intermediate_relations[current_intermediate - 1];
       auto operator_idx      = current_idx - 1;
@@ -209,9 +256,20 @@ void GPUExecutor::Execute()
       // interrupt_state}; pipeline->sink->Sink(exec_context, *sink_relation, sink_input);
       pipeline->sink->Sink(*sink_relation);
     }
+  }  // end for-pipeline
+      } catch (...) {
+        errors[gpu_iter] = std::current_exception();
+      }
+    });  // end worker lambda
+  }      // end per-GPU spawn loop
+
+  // Wait for all workers and propagate the first non-null exception, if any.
+  for (auto& w : workers) { w.join(); }
+  for (auto& e : errors) {
+    if (e) std::rethrow_exception(e);
   }
-  }  // end per-GPU loop
-  // Restore default GPU after the per-GPU loop so any subsequent code on this
+
+  // Restore the main thread's GPU binding so any subsequent code on this
   // thread (e.g., the duckdb shell formatting the result) runs on GPU 0.
   gpuBufferManager->set_gpu_for_thread(0);
 }
