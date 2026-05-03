@@ -28,7 +28,7 @@
 #include <rmm/aligned.hpp>
 #include <rmm/cuda_stream_view.hpp>
 
-#define NUM_GPUS 1
+#define NUM_GPUS 2
 
 namespace duckdb {
 
@@ -191,13 +191,28 @@ GPUBufferManager::GPUBufferManager(size_t cache_size_per_gpu,
   cpuCachingPointer    = new size_t[NUM_GPUS];
   cpuProcessingPointer = 0;
   available_gpu_cache_size.resize(NUM_GPUS);
+  tables_per_gpu.resize(NUM_GPUS);
 
-  cuda_mr = new rmm::mr::cuda_memory_resource();
-  mr = make_gpu_pool_memory_resource(cuda_mr, processing_size_per_gpu, processing_size_per_gpu);
+  // Phase 2: per-GPU processing pools. Each pool lives on its own device so
+  // kernels launched from a thread bound to GPU g allocate intermediate
+  // buffers on GPU g (no cross-GPU pointers).
+  cuda_mr_per_gpu.assign(NUM_GPUS, nullptr);
+  mr_per_gpu.assign(NUM_GPUS, nullptr);
+  for (int g = 0; g < NUM_GPUS; ++g) {
+    cudaSetDevice(g);
+    cuda_mr_per_gpu[g] = new rmm::mr::cuda_memory_resource();
+    mr_per_gpu[g]      = make_gpu_pool_memory_resource(
+      cuda_mr_per_gpu[g], processing_size_per_gpu, processing_size_per_gpu);
+    SIRIUS_LOG_INFO("Allocated processing size {} on GPU {}", processing_size_per_gpu, g);
+  }
+  cudaSetDevice(0);
+  // Backwards-compatible aliases: code that hasn't been taught about the
+  // per-thread current GPU still sees GPU 0's pool.
+  cuda_mr = cuda_mr_per_gpu[0];
+  mr      = mr_per_gpu[0];
   set_current_gpu_resource(*mr);
   allocation_table.resize(NUM_GPUS);
   locked_allocation_table.resize(NUM_GPUS);
-  SIRIUS_LOG_INFO("Allocated processing size {} in GPU 0", processing_size_per_gpu);
 
   for (int gpu = 0; gpu < NUM_GPUS; gpu++) {
     if (Config::USE_PIN_MEM_FOR_CACHING) {
@@ -258,40 +273,55 @@ GPUBufferManager::~GPUBufferManager()
   delete[] gpuCachingPointer;
   delete[] cpuCachingPointer;
   rmm_stored_buffers.clear();
-  delete mr;
-  delete cuda_mr;
+  for (int g = 0; g < NUM_GPUS; ++g) {
+    cudaSetDevice(g);
+    delete mr_per_gpu[g];
+    delete cuda_mr_per_gpu[g];
+  }
+  cudaSetDevice(0);
+  // `mr` and `cuda_mr` were aliases — already freed above.
+  mr      = nullptr;
+  cuda_mr = nullptr;
+}
+
+void GPUBufferManager::set_gpu_for_thread(int g)
+{
+  auto err = cudaSetDevice(g);
+  if (err != cudaSuccess) {
+    SIRIUS_LOG_ERROR("set_gpu_for_thread({}): cudaSetDevice failed: {}", g, cudaGetErrorString(err));
+  }
+  sirius_current_gpu = g;
+  set_current_gpu_resource(*mr_per_gpu[g]);
 }
 
 void GPUBufferManager::ResetBuffer()
 {
-  set_current_gpu_resource(*mr);
   for (int gpu = 0; gpu < NUM_GPUS; gpu++) {
     SIRIUS_LOG_DEBUG("Resetting buffer for GPU {}", gpu);
+    cudaSetDevice(gpu);
+    set_current_gpu_resource(*mr_per_gpu[gpu]);
+    auto* gpu_mr              = mr_per_gpu[gpu];
     gpuProcessingPointer[gpu] = 0;
     // write a program to free all allocation in the allocation table
     for (auto it = allocation_table[gpu].begin(); it != allocation_table[gpu].end(); ++it) {
       auto ptr  = it->first;
       auto size = it->second;
       if (ptr != nullptr) {
-        // customCudaFree<uint8_t>(reinterpret_cast<uint8_t*>(ptr), size, 0);
-        mr->deallocate(rmm::cuda_stream_view{}, (void*)ptr, size, rmm::CUDA_ALLOCATION_ALIGNMENT);
-        // SIRIUS_LOG_DEBUG("Deallocating Pointer {} size {}", static_cast<void*>(ptr), size);
-        // allocation_table[gpu].erase(it);
+        gpu_mr->deallocate(
+          rmm::cuda_stream_view{}, (void*)ptr, size, rmm::CUDA_ALLOCATION_ALIGNMENT);
       }
     }
     allocation_table[gpu].clear();
     if (!allocation_table[gpu].empty()) {
       throw InvalidInputException("Allocation table is not empty");
     }
-    // SIRIUS_LOG_DEBUG("Locked allocation table size {}", locked_allocation_table[gpu].size());
     for (auto it = locked_allocation_table[gpu].begin(); it != locked_allocation_table[gpu].end();
          ++it) {
       auto ptr  = it->first;
       auto size = it->second;
       if (ptr != nullptr) {
-        // SIRIUS_LOG_DEBUG("Deallocating Locked Pointer {} size {}", static_cast<void*>(ptr),
-        // size);
-        mr->deallocate(rmm::cuda_stream_view{}, (void*)ptr, size, rmm::CUDA_ALLOCATION_ALIGNMENT);
+        gpu_mr->deallocate(
+          rmm::cuda_stream_view{}, (void*)ptr, size, rmm::CUDA_ALLOCATION_ALIGNMENT);
       }
     }
     locked_allocation_table[gpu].clear();
@@ -307,12 +337,14 @@ void GPUBufferManager::ResetBuffer()
     // mr->deallocate(ptr, allocated_size);
   }
   cpuProcessingPointer = 0;
-  for (auto it = tables.begin(); it != tables.end(); it++) {
-    shared_ptr<GPUIntermediateRelation> table = it->second;
-    for (int col = 0; col < table->columns.size(); col++) {
-      if (table->columns[col] != nullptr) {
-        table->columns[col]->row_ids      = nullptr;
-        table->columns[col]->row_id_count = 0;
+  for (auto& tables : tables_per_gpu) {
+    for (auto it = tables.begin(); it != tables.end(); it++) {
+      shared_ptr<GPUIntermediateRelation> table = it->second;
+      for (int col = 0; col < table->columns.size(); col++) {
+        if (table->columns[col] != nullptr) {
+          table->columns[col]->row_ids      = nullptr;
+          table->columns[col]->row_id_count = 0;
+        }
       }
     }
   }
@@ -325,13 +357,15 @@ void GPUBufferManager::ResetCache()
     gpuCachingPointer[gpu] = 0;
     cpuCachingPointer[gpu] = 0;
   }
-  for (auto it = tables.begin(); it != tables.end(); it++) {
-    shared_ptr<GPUIntermediateRelation> table = it->second;
-    for (int col = 0; col < table->columns.size(); col++) {
-      table->columns[col] = nullptr;
+  for (auto& tables : tables_per_gpu) {
+    for (auto it = tables.begin(); it != tables.end(); it++) {
+      shared_ptr<GPUIntermediateRelation> table = it->second;
+      for (int col = 0; col < table->columns.size(); col++) {
+        table->columns[col] = nullptr;
+      }
+      table->column_names.clear();
+      table->column_names.resize(table->column_count);
     }
-    table->column_names.clear();
-    table->column_names.resize(table->column_count);
   }
 }
 
@@ -344,6 +378,8 @@ T* GPUBufferManager::customCudaMalloc(size_t size, int gpu, bool caching)
   size_t alignment = rmm::CUDA_ALLOCATION_ALIGNMENT;
   alloc += (alignment - (alloc % alignment)) % alignment;
   if (caching) {
+    // Caching path keeps the explicit `gpu` argument (used by the scan to
+    // write per-GPU partitions of cached tables).
     size_t start = __atomic_fetch_add(&gpuCachingPointer[gpu], alloc, __ATOMIC_RELAXED);
     T* ptr       = nullptr;
     if (start + alloc <= available_gpu_cache_size[gpu]) {
@@ -362,14 +398,17 @@ T* GPUBufferManager::customCudaMalloc(size_t size, int gpu, bool caching)
     }
     return ptr;
   } else {
-    set_current_gpu_resource(*mr);
-    void* ptr = mr->allocate(rmm::cuda_stream_view{}, alloc, rmm::CUDA_ALLOCATION_ALIGNMENT);
-    // SIRIUS_LOG_DEBUG("Allocating Pointer {} size {}", static_cast<void*>(ptr), alloc);
+    // Processing path ignores the (legacy) `gpu` argument and routes to the
+    // per-thread current GPU's pool. The thread's caller (executor worker)
+    // is expected to have called set_gpu_for_thread() already.
+    int t_gpu  = sirius_current_gpu;
+    auto* gmr  = mr_per_gpu[t_gpu];
+    void* ptr  = gmr->allocate(rmm::cuda_stream_view{}, alloc, rmm::CUDA_ALLOCATION_ALIGNMENT);
     if (ptr == nullptr) throw InvalidInputException("Pointer is nullptr");
-    if (allocation_table[gpu].find(ptr) != allocation_table[gpu].end()) {
+    if (allocation_table[t_gpu].find(ptr) != allocation_table[t_gpu].end()) {
       throw InvalidInputException("Pointer already exists in allocation table");
     }
-    allocation_table[gpu][ptr] = alloc;
+    allocation_table[t_gpu][ptr] = alloc;
     return reinterpret_cast<T*>(ptr);
   }
 }
@@ -387,36 +426,51 @@ void GPUBufferManager::lockAllocation(void* ptr, int gpu)
 
 void GPUBufferManager::customCudaFree(uint8_t* ptr, int gpu)
 {
-  // check if ptr is not in gpuCaching
-  set_current_gpu_resource(*mr);
+  // The legacy callers pass `gpu` as the cache GPU (matters for the
+  // gpuCache/cpuCache range checks), but processing-pool allocations are
+  // tracked by the per-thread current GPU (where they were recorded at
+  // alloc time in customCudaMalloc). Search both:
+  //   1) the caller's `gpu` table  (covers single-thread legacy usage)
+  //   2) the current thread's GPU table  (covers Phase 2 multi-GPU)
+  // Whichever owns the pointer wins.
   if (ptr == nullptr) { return; }
-  if (ptr >= gpuCache[gpu] && ptr < gpuCache[gpu] + available_gpu_cache_size[gpu]) { return; }
-  if (cpuCache[gpu] != nullptr && ptr >= cpuCache[gpu] &&
-      ptr < cpuCache[gpu] + cache_size_per_gpu - available_gpu_cache_size[gpu]) {
-    return;
-  }
-  auto it = allocation_table[gpu].find(reinterpret_cast<void*>(ptr));
-  if (it != allocation_table[gpu].end()) {
-    // SIRIUS_LOG_DEBUG("Deallocating Pointer {} size {}", static_cast<void*>(ptr), it->second);
-    mr->deallocate(rmm::cuda_stream_view{}, (void*)ptr, it->second, rmm::CUDA_ALLOCATION_ALIGNMENT);
-    allocation_table[gpu].erase(it);
-  } else {
-    auto locked_it = locked_allocation_table[gpu].find(reinterpret_cast<void*>(ptr));
-    if (locked_it == locked_allocation_table[gpu].end()) {
-      // check if in rmm_stored_buffer
-      bool found = 0;
-      for (int it = 0; it < rmm_stored_buffers.size(); it++) {
-        if (ptr == reinterpret_cast<uint8_t*>(rmm_stored_buffers[it]->data())) {
-          found = 1;
-          break;
-        }
-      }
-      if (!found) {
-        SIRIUS_LOG_DEBUG("Invalid Pointer {}", static_cast<void*>(ptr));
-        throw InvalidInputException("Pointer not found in allocation table");
-      }
+  // Cache range check is per-GPU (caching slabs are owned per-GPU).
+  for (int g = 0; g < static_cast<int>(mr_per_gpu.size()); ++g) {
+    if (ptr >= gpuCache[g] && ptr < gpuCache[g] + available_gpu_cache_size[g]) { return; }
+    if (cpuCache[g] != nullptr && ptr >= cpuCache[g] &&
+        ptr < cpuCache[g] + cache_size_per_gpu - available_gpu_cache_size[g]) {
+      return;
     }
   }
+
+  auto try_dealloc = [&](int g) -> bool {
+    auto it = allocation_table[g].find(reinterpret_cast<void*>(ptr));
+    if (it != allocation_table[g].end()) {
+      mr_per_gpu[g]->deallocate(
+        rmm::cuda_stream_view{}, (void*)ptr, it->second, rmm::CUDA_ALLOCATION_ALIGNMENT);
+      allocation_table[g].erase(it);
+      return true;
+    }
+    return false;
+  };
+
+  // Try caller-provided gpu first, then per-thread current GPU.
+  if (try_dealloc(gpu)) return;
+  if (gpu != sirius_current_gpu && try_dealloc(sirius_current_gpu)) return;
+
+  // Not in any allocation_table — check locked tables and rmm_stored_buffers.
+  for (int g = 0; g < static_cast<int>(mr_per_gpu.size()); ++g) {
+    if (locked_allocation_table[g].find(reinterpret_cast<void*>(ptr)) !=
+        locked_allocation_table[g].end()) {
+      return;  // locked, do not free
+    }
+  }
+  for (auto& buf : rmm_stored_buffers) {
+    if (ptr == reinterpret_cast<uint8_t*>(buf->data())) { return; }
+  }
+
+  SIRIUS_LOG_DEBUG("Invalid Pointer {}", static_cast<void*>(ptr));
+  throw InvalidInputException("Pointer not found in allocation table");
 }
 
 template <typename T>
@@ -434,10 +488,14 @@ T* GPUBufferManager::customCudaHostAlloc(size_t size)
 void GPUBufferManager::createTableAndColumnInGPU(Catalog& catalog,
                                                  ClientContext& context,
                                                  string table_name,
-                                                 string column_name)
+                                                 string column_name,
+                                                 int gpu)
 {
   SIRIUS_LOG_DEBUG(
-    "CreateTable and Column called for table {} and col {}", table_name, column_name);
+    "CreateTable and Column called for table {} and col {} on GPU {}",
+    table_name,
+    column_name,
+    gpu);
   TableCatalogEntry& table =
     catalog.GetEntry(context, CatalogType::TABLE_ENTRY, DEFAULT_SCHEMA, table_name)
       .Cast<TableCatalogEntry>();
@@ -473,34 +531,37 @@ void GPUBufferManager::createTableAndColumnInGPU(Catalog& catalog,
     size_t column_id     = table.GetColumnIndex(column_name, false).index;
     string up_table_name = table_name;
     transform(up_table_name.begin(), up_table_name.end(), up_table_name.begin(), ::toupper);
-    createTable(up_table_name, table.GetTypes().size());
+    createTable(up_table_name, table.GetTypes().size(), gpu);
     GPUColumnType column_type =
       convertLogicalTypeToColumnType(table.GetColumn(column_name).GetType());
     SIRIUS_LOG_DEBUG("Creating column {}", up_column_name);
-    createColumn(up_table_name, up_column_name, column_type, column_id, unique_columns);
+    createColumn(up_table_name, up_column_name, column_type, column_id, unique_columns, gpu);
   } else {
     throw InvalidInputException("Column does not exists");
   }
-  SIRIUS_LOG_DEBUG("Table and column created in GPU");
+  SIRIUS_LOG_DEBUG("Table and column created in GPU {}", gpu);
 }
 
-void GPUBufferManager::createTable(string up_table_name, size_t column_count)
+void GPUBufferManager::createTable(string up_table_name, size_t column_count, int gpu)
 {
   // we will update the length later
   // check if table already exists
-  SIRIUS_LOG_DEBUG("Crate Table called for table {} with {} cols", up_table_name, column_count);
+  SIRIUS_LOG_DEBUG(
+    "Crate Table called for table {} with {} cols on GPU {}", up_table_name, column_count, gpu);
+  auto& tables = tables_per_gpu[gpu];
   if (tables.find(up_table_name) == tables.end()) {
     tables[up_table_name]        = make_shared_ptr<GPUIntermediateRelation>(column_count);
     tables[up_table_name]->names = up_table_name;
   }
 }
 
-bool GPUBufferManager::checkIfColumnCached(string table_name, string column_name)
+bool GPUBufferManager::checkIfColumnCached(string table_name, string column_name, int gpu)
 {
   string up_column_name = column_name;
   string up_table_name  = table_name;
   transform(up_table_name.begin(), up_table_name.end(), up_table_name.begin(), ::toupper);
   transform(up_column_name.begin(), up_column_name.end(), up_column_name.begin(), ::toupper);
+  auto& tables  = tables_per_gpu[gpu];
   auto table_it = tables.find(up_table_name);
   if (table_it == tables.end()) { return false; }
   const auto& table = table_it->second;
@@ -513,9 +574,10 @@ void GPUBufferManager::createColumn(string up_table_name,
                                     string up_column_name,
                                     GPUColumnType column_type,
                                     size_t column_id,
-                                    vector<size_t> unique_columns)
+                                    vector<size_t> unique_columns,
+                                    int gpu)
 {
-  shared_ptr<GPUIntermediateRelation> table = tables[up_table_name];
+  shared_ptr<GPUIntermediateRelation> table = tables_per_gpu[gpu][up_table_name];
   table->column_names[column_id]            = up_column_name;
   if (find(unique_columns.begin(), unique_columns.end(), column_id) != unique_columns.end()) {
     table->columns[column_id] = make_shared_ptr<GPUColumn>(0, column_type, nullptr, nullptr);

@@ -33,6 +33,11 @@ using gpu_pool_memory_resource = rmm::mr::pool_memory_resource;
 using gpu_pool_memory_resource = rmm::mr::pool_memory_resource<rmm::mr::cuda_memory_resource>;
 #endif
 
+// Per-thread "current GPU" for the legacy execution path. Set by
+// GPUBufferManager::set_gpu_for_thread(g) at the start of a per-GPU worker.
+// Processing-pool allocations and table reads in that thread observe it.
+inline thread_local int sirius_current_gpu = 0;
+
 // Declaration of the CUDA kernel
 template <typename T>
 T* callCudaMalloc(size_t size, int gpu);
@@ -122,10 +127,25 @@ class GPUBufferManager {
   rmm::mr::cuda_memory_resource* cuda_mr;
   gpu_pool_memory_resource* mr;
 
+  // Per-GPU RMM resources (Phase 2). mr_per_gpu[g] is a pool sitting on top of
+  // cuda_mr_per_gpu[g], both bound to GPU g. The `mr` member above aliases
+  // mr_per_gpu[0] for backwards compatibility with code that hasn't been
+  // taught about the per-thread current GPU yet.
+  vector<rmm::mr::cuda_memory_resource*> cuda_mr_per_gpu;
+  vector<gpu_pool_memory_resource*> mr_per_gpu;
+
   [[nodiscard]] rmm::device_async_resource_ref get_mr_ref() const
   {
-    return rmm::device_async_resource_ref{*mr};
+    // Returns the per-thread current GPU's resource. cudf operations issued
+    // from a worker thread will use the right device's pool.
+    return rmm::device_async_resource_ref{*mr_per_gpu[sirius_current_gpu]};
   }
+
+  // Bind the calling thread to a specific GPU for the rest of its lifetime
+  // (or until called again). Sets cudaSetDevice, sirius_current_gpu, and
+  // cudf's thread-local default device resource so all subsequent kernel
+  // launches and intermediate allocations land on `g`.
+  void set_gpu_for_thread(int g);
 
   template <typename T>
   T* customCudaMalloc(size_t size, int gpu, bool caching);
@@ -137,21 +157,36 @@ class GPUBufferManager {
 
   void Print();
 
-  map<string, shared_ptr<GPUIntermediateRelation>> tables;
+  // Per-GPU table catalogs. Each GPU keeps its own slice of every cached table.
+  // tables_per_gpu[g][name] holds the GPU g partition of table `name`.
+  // Phase 1: cache loading partitions rows by even row range across GPUs;
+  // executor still reads from tables_per_gpu[0] only (Phase 2 will fan out).
+  vector<map<string, shared_ptr<GPUIntermediateRelation>>> tables_per_gpu;
+
+  // Backwards-compatible alias for the GPU-0 catalog. Existing read sites use
+  // this until the executor is taught about per-GPU partitions in Phase 2.
+  map<string, shared_ptr<GPUIntermediateRelation>>& tables() { return tables_per_gpu[0]; }
+  const map<string, shared_ptr<GPUIntermediateRelation>>& tables() const
+  {
+    return tables_per_gpu[0];
+  }
 
   void lockAllocation(void* ptr, int gpu);
 
+  // Cache writes are now per-GPU. Pass the destination GPU index explicitly.
   void createTableAndColumnInGPU(Catalog& catalog,
                                  ClientContext& context,
                                  string table_name,
-                                 string column_name);
-  void createTable(string table_name, size_t column_count);
+                                 string column_name,
+                                 int gpu);
+  void createTable(string table_name, size_t column_count, int gpu);
   void createColumn(string table_name,
                     string column_name,
                     GPUColumnType column_type,
                     size_t column_id,
-                    vector<size_t> unique_columns);
-  bool checkIfColumnCached(string table_name, string column_name);
+                    vector<size_t> unique_columns,
+                    int gpu);
+  bool checkIfColumnCached(string table_name, string column_name, int gpu);
 
   std::vector<std::unique_ptr<rmm::device_buffer>> rmm_stored_buffers;
 

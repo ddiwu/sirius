@@ -355,9 +355,17 @@ SinkResultType GPUPhysicalMaterializedCollector::ConvertGPUTableToCPUCollection(
             static_cast<int>(materialized_relation.columns[col]->data_wrapper.type.id()));
         }
       } else {
+        SIRIUS_LOG_DEBUG("DBG: about to host-alloc {} bytes for col {}", size_bytes, col);
         host_data[col] = gpuBufferManager->customCudaHostAlloc<uint8_t>(size_bytes);
-        callCudaMemcpyDeviceToHost<uint8_t>(
-          host_data[col], materialized_relation.columns[col]->data_wrapper.data, size_bytes, 0);
+        SIRIUS_LOG_DEBUG("DBG: host-alloc done, host_data[{}]={} ; src device ptr={}",
+                         col,
+                         (void*)host_data[col],
+                         (void*)materialized_relation.columns[col]->data_wrapper.data);
+        callCudaMemcpyDeviceToHost<uint8_t>(host_data[col],
+                                            materialized_relation.columns[col]->data_wrapper.data,
+                                            size_bytes,
+                                            sirius_current_gpu);
+        SIRIUS_LOG_DEBUG("DBG: device-to-host memcpy done for col {}", col);
       }
 
       if (materialized_relation.columns[col]->data_wrapper.validity_mask == nullptr) {
@@ -369,15 +377,21 @@ SinkResultType GPUPhysicalMaterializedCollector::ConvertGPUTableToCPUCollection(
         memset(host_mask_data[col], 0xFF, padded_bytes);  // All bits set to 1 (valid)
       } else {
         // Copy the existing validity mask
-        SIRIUS_LOG_DEBUG("Copying validity mask for column {}\n", col);
+        SIRIUS_LOG_DEBUG("DBG: about to host-alloc mask {} bytes for col {}",
+                         materialized_relation.columns[col]->data_wrapper.mask_bytes,
+                         col);
         host_mask_data[col] = gpuBufferManager->customCudaHostAlloc<uint8_t>(
           materialized_relation.columns[col]->data_wrapper.mask_bytes);
+        SIRIUS_LOG_DEBUG("DBG: mask host-alloc done {}; src ptr={}",
+                         (void*)host_mask_data[col],
+                         (void*)materialized_relation.columns[col]->data_wrapper.validity_mask);
         callCudaMemcpyDeviceToHost<uint8_t>(
           host_mask_data[col],
           reinterpret_cast<uint8_t*>(
             materialized_relation.columns[col]->data_wrapper.validity_mask),
           materialized_relation.columns[col]->data_wrapper.mask_bytes,
-          0);
+          sirius_current_gpu);
+        SIRIUS_LOG_DEBUG("DBG: mask memcpy done for col {}", col);
       }
     } else {
       // Use the helper method to materialize the string on the GPU
@@ -423,6 +437,9 @@ SinkResultType GPUPhysicalMaterializedCollector::ConvertGPUTableToCPUCollection(
   auto chunk_start_time = std::chrono::high_resolution_clock::now();
   size_t num_records    = materialized_relation.columns[0]->column_length;
   size_t total_vector   = (num_records + STANDARD_VECTOR_SIZE - 1) / STANDARD_VECTOR_SIZE;
+  // Phase 2: SetCapacity now appends to existing capacity (see
+  // GPUResultCollection::SetCapacity); each per-GPU iteration asks for room
+  // for its own chunks without discarding earlier writes.
   result_collection->SetCapacity(total_vector);
   SIRIUS_LOG_DEBUG(
     "Result Collector: Num Records - {}, Total vectors - {}", num_records, total_vector);

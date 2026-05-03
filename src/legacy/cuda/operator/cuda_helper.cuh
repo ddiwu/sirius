@@ -83,6 +83,11 @@ inline void gpuAssert(cudaError_t code, const char* file, int line, bool abort =
 {
   if (code != cudaSuccess) {
     SIRIUS_LOG_ERROR("GPUassert: {} {} {}\n", cudaGetErrorString(code), file, line);
+    // Print to stderr too with explicit flush so the diagnostic survives the
+    // exit() call below (spdlog's async sink may otherwise drop the line).
+    fprintf(
+      stderr, "GPUassert: code=%d %s at %s:%d\n", (int)code, cudaGetErrorString(code), file, line);
+    fflush(stderr);
     if (abort) exit(code);
   }
 }

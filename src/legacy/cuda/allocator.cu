@@ -62,6 +62,8 @@ template <typename T>
 T* callCudaMalloc(size_t size, int gpu)
 {
   T* ptr;
+  int prev_device;
+  cudaGetDevice(&prev_device);
   cudaError_t err = cudaSetDevice(gpu);
   if (err != cudaSuccess) {
     SIRIUS_LOG_ERROR("CUDA initialization error for gpu {}: {}", gpu, cudaGetErrorString(err));
@@ -81,7 +83,7 @@ T* callCudaMalloc(size_t size, int gpu)
   SIRIUS_LOG_DEBUG("Allocating {} bytes on GPU {}", size * sizeof(T), gpu);
   gpuErrchk(cudaMalloc((void**)&ptr, size * sizeof(T)));
   cudaDeviceSynchronize();
-  cudaSetDevice(0);
+  cudaSetDevice(prev_device);
   return ptr;
 }
 
@@ -115,18 +117,22 @@ void freePageableCPUMemory(uint8_t* ptr) { free(ptr); }
 template <typename T>
 void callCudaFree(T* ptr, int gpu)
 {
+  int prev_device;
+  cudaGetDevice(&prev_device);
   cudaSetDevice(gpu);
   gpuErrchk(cudaFree(ptr));
   cudaDeviceSynchronize();
-  cudaSetDevice(gpu);
+  cudaSetDevice(prev_device);
 }
 
 size_t getFreeGPUMemorySize(int gpu)
 {
+  int prev_device;
+  cudaGetDevice(&prev_device);
   gpuErrchk(cudaSetDevice(gpu));
   size_t free, total;
   gpuErrchk(cudaMemGetInfo(&free, &total));
-  gpuErrchk(cudaSetDevice(0));
+  gpuErrchk(cudaSetDevice(prev_device));
   return free;
 }
 

@@ -74,6 +74,18 @@ void GPUExecutor::Execute()
 
   SIRIUS_LOG_DEBUG("Total meta pipelines {}", scheduled.size());
 
+  // Phase 2: run the entire pipeline graph once per GPU. The first iteration
+  // (g=0) populates the cache for every GPU via Phase 1's partitioned scan;
+  // subsequent iterations short-circuit the load (already_cached) and only
+  // run the read+compute side on tables_per_gpu[g]. The result_collector
+  // accumulates rows from each GPU's partition, giving a concat-style merge.
+  // (Sequential, not concurrent — true parallelism comes later.)
+  const int num_gpus_for_exec =
+    static_cast<int>(gpuBufferManager->tables_per_gpu.size());
+  for (int gpu_iter = 0; gpu_iter < num_gpus_for_exec; ++gpu_iter) {
+    gpuBufferManager->set_gpu_for_thread(gpu_iter);
+    SIRIUS_LOG_DEBUG("Per-GPU iteration: GPU {}", gpu_iter);
+
   for (const auto& pipeline : scheduled) {
     // TODO: This is temporary solution
     // if (pipeline->source->type == PhysicalOperatorType::HASH_JOIN || pipeline->source->type ==
@@ -198,6 +210,10 @@ void GPUExecutor::Execute()
       pipeline->sink->Sink(*sink_relation);
     }
   }
+  }  // end per-GPU loop
+  // Restore default GPU after the per-GPU loop so any subsequent code on this
+  // thread (e.g., the duckdb shell formatting the result) runs on GPU 0.
+  gpuBufferManager->set_gpu_for_thread(0);
 }
 
 void GPUExecutor::InitializeInternal(GPUPhysicalOperator& plan)

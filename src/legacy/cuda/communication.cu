@@ -85,6 +85,10 @@ template void callCudaMemcpyDeviceToDevice<float>(float* dest, float* src, size_
 
 template void callCudaMemcpyDeviceToDevice<double>(double* dest, double* src, size_t size, int gpu);
 
+// Phase 2: these helpers used to hardcode `cudaSetDevice(0)` after the op,
+// which corrupts a worker thread's device binding. Save/restore instead so
+// callers that have already set their thread to a particular GPU keep that
+// binding across the call.
 template <typename T>
 void callCudaMemcpyHostToDevice(T* dest, T* src, size_t size, int gpu)
 {
@@ -93,11 +97,13 @@ void callCudaMemcpyHostToDevice(T* dest, T* src, size_t size, int gpu)
     SIRIUS_LOG_DEBUG("Input size is 0");
     return;
   }
+  int prev_device;
+  cudaGetDevice(&prev_device);
   SIRIUS_LOG_DEBUG("Send data to GPU");
   cudaSetDevice(gpu);
   gpuErrchk(cudaMemcpy(dest, src, size * sizeof(T), cudaMemcpyHostToDevice));
   gpuErrchk(cudaDeviceSynchronize());
-  cudaSetDevice(0);
+  cudaSetDevice(prev_device);
   SIRIUS_LOG_DEBUG("Done sending data to GPU");
 }
 
@@ -111,6 +117,8 @@ void callCudaMemcpyDeviceToHost(T* dest, T* src, size_t size, int gpu)
   }
   SETUP_TIMING();
   START_TIMER();
+  int prev_device;
+  cudaGetDevice(&prev_device);
   SIRIUS_LOG_DEBUG("Send data to CPU");
   cudaSetDevice(gpu);
   SIRIUS_LOG_DEBUG("Transferred bytes: {}", size * sizeof(T));
@@ -119,7 +127,7 @@ void callCudaMemcpyDeviceToHost(T* dest, T* src, size_t size, int gpu)
   gpuErrchk(cudaMemcpy(dest, src, size * sizeof(T), cudaMemcpyDeviceToHost));
   CHECK_ERROR();
   gpuErrchk(cudaDeviceSynchronize());
-  cudaSetDevice(0);
+  cudaSetDevice(prev_device);
   SIRIUS_LOG_DEBUG("Done sending data to CPU");
   STOP_TIMER();
 }
@@ -134,6 +142,8 @@ void callCudaMemcpyDeviceToDevice(T* dest, T* src, size_t size, int gpu)
   }
   SETUP_TIMING();
   START_TIMER();
+  int prev_device;
+  cudaGetDevice(&prev_device);
   SIRIUS_LOG_DEBUG("Send data within GPU");
   cudaSetDevice(gpu);
   SIRIUS_LOG_DEBUG("Transferred bytes: {}", size * sizeof(T));
@@ -142,7 +152,7 @@ void callCudaMemcpyDeviceToDevice(T* dest, T* src, size_t size, int gpu)
   gpuErrchk(cudaMemcpy(dest, src, size * sizeof(T), cudaMemcpyDeviceToDevice));
   CHECK_ERROR();
   gpuErrchk(cudaDeviceSynchronize());
-  cudaSetDevice(0);
+  cudaSetDevice(prev_device);
   SIRIUS_LOG_DEBUG("Done sending data to GPU");
   STOP_TIMER();
 }
@@ -156,12 +166,14 @@ void callCudaMemset(void* ptr, int value, size_t size, int gpu)
   }
   SETUP_TIMING();
   START_TIMER();
+  int prev_device;
+  cudaGetDevice(&prev_device);
   SIRIUS_LOG_DEBUG("Setting memory on GPU");
   cudaSetDevice(gpu);
   gpuErrchk(cudaMemset(ptr, value, size));
   CHECK_ERROR();
   gpuErrchk(cudaDeviceSynchronize());
-  cudaSetDevice(0);
+  cudaSetDevice(prev_device);
   SIRIUS_LOG_DEBUG("Done setting memory on GPU");
   STOP_TIMER();
 }

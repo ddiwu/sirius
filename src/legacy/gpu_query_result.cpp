@@ -21,7 +21,20 @@
 
 namespace duckdb {
 
-void GPUResultCollection::SetCapacity(size_t capacity) { data_chunks = new DataChunk[capacity]; }
+void GPUResultCollection::SetCapacity(size_t additional)
+{
+  // Phase 2: callers (per-GPU iterations) ask for room for `additional` more
+  // chunks. Grow the underlying array, preserving already-written chunks.
+  size_t needed = write_idx + additional;
+  if (needed <= capacity) { return; }
+  DataChunk* new_chunks = new DataChunk[needed];
+  for (size_t i = 0; i < write_idx; ++i) {
+    new_chunks[i].Move(data_chunks[i]);
+  }
+  delete[] data_chunks;
+  data_chunks = new_chunks;
+  capacity    = needed;
+}
 
 void GPUResultCollection::AddChunk(DataChunk& chunk)
 {

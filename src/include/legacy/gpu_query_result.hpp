@@ -25,9 +25,16 @@ namespace duckdb {
 
 class GPUResultCollection {
  public:
-  GPUResultCollection() : read_idx(0), write_idx(0), num_rows(0), data_chunks(nullptr) {}
+  GPUResultCollection()
+    : read_idx(0), write_idx(0), num_rows(0), data_chunks(nullptr), capacity(0)
+  {
+  }
 
-  void SetCapacity(size_t capacity);
+  // Ensure room for at least `additional` more chunks beyond what's already
+  // written. Phase 2 calls this once per per-GPU iteration (each iteration
+  // appends its partition's chunks); the previous "always allocate fresh"
+  // behaviour discarded earlier iterations' rows.
+  void SetCapacity(size_t additional);
   void AddChunk(DataChunk& chunk);
   unique_ptr<DataChunk> GetNext();
 
@@ -42,6 +49,7 @@ class GPUResultCollection {
   size_t num_rows;
   size_t write_idx;
   size_t read_idx;
+  size_t capacity;  // size of the data_chunks array
 };
 
 // The reason we need to implement our own QueryResult is that duckdb's MaterializedQueryResult
