@@ -30,6 +30,14 @@ void cudf_aggregate(vector<shared_ptr<GPUColumn>>& column,
                     uint64_t num_aggregates,
                     AggregationType* agg_mode);
 
+// Per-GPU runtime state for ungrouped aggregate. Each GPU worker thread runs
+// the same UNGROUPED_AGGREGATE op on its own partition; the partial 1-row
+// result is staged here. The cross-GPU final reduce happens later in
+// GPUPhysicalMaterializedCollector::GetResult.
+struct UngroupedAggregateRuntimeState : OpRuntimeState {
+  shared_ptr<GPUIntermediateRelation> aggregation_result;
+};
+
 class GPUPhysicalUngroupedAggregate : public GPUPhysicalOperator {
  public:
   static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::UNGROUPED_AGGREGATE;
@@ -44,7 +52,6 @@ class GPUPhysicalUngroupedAggregate : public GPUPhysicalOperator {
   vector<unique_ptr<Expression>> aggregates;
   unique_ptr<DistinctAggregateData> distinct_data;
   unique_ptr<DistinctAggregateCollectionInfo> distinct_collection_info;
-  shared_ptr<GPUIntermediateRelation> aggregation_result;
 
   SourceResultType GetData(GPUIntermediateRelation& output_relation) const override;
 

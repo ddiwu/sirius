@@ -1016,6 +1016,18 @@ SourceResultType GPUPhysicalTableScan::GetDataDuckDBOpt(ExecutionContext& exec_c
   }
 
   auto num_columns = column_ids.size() - gen_row_id_column;
+
+  // Phase B short-circuit: if a prior worker thread already scanned the table
+  // and populated `num_rows` (and we're not loading any new columns), there's
+  // nothing for this thread to do. Without this guard, num_rows is a `+=`
+  // accumulator and a second call would double it — which then propagates to
+  // COUNT(*) and the row_id generator (both read the operator's num_rows
+  // member directly).
+  if (num_columns == 0 && num_rows > 0) {
+    SIRIUS_LOG_DEBUG("Early terminating from GetDataDuckdbOpt: COUNT(*) and num_rows already set");
+    return SourceResultType::FINISHED;
+  }
+
   bool all_cached  = num_columns > 0;
   SIRIUS_LOG_DEBUG("Checking if all of the {}/{} columns of table {} are cached",
                    num_columns,
@@ -2113,7 +2125,18 @@ SourceResultType GPUPhysicalTableScan::GetData(GPUIntermediateRelation& output_r
     auto num_out_rows = 0;
     if (output_relation.column_count <
         2) {  // In this case fallback to using the number of rows record by the GetDataDuckDBOpt
-      num_out_rows = num_rows;
+      // Phase 1 multi-GPU: `num_rows` is the *full* table row count. Each
+      // worker thread runs on its own GPU partition, so use the per-GPU
+      // row count here (same partitioning as ScanDataDuckDBOpt). Without
+      // this, COUNT(*) sums num_rows across all GPUs (e.g., 2N instead of N).
+      const size_t NUM_G                  = GPUBufferManager::GetMaxGpus();
+      const size_t per_gpu_rows_unaligned = (num_rows + NUM_G - 1) / NUM_G;
+      const size_t per_gpu_rows           = ((per_gpu_rows_unaligned + 7) / 8) * 8;
+      const size_t lo                     = std::min(
+        static_cast<size_t>(sirius_current_gpu) * per_gpu_rows, static_cast<size_t>(num_rows));
+      const size_t hi = std::min(
+        static_cast<size_t>(sirius_current_gpu + 1) * per_gpu_rows, static_cast<size_t>(num_rows));
+      num_out_rows = static_cast<int>(hi - lo);
     } else {
       num_out_rows = output_relation.columns[0]->column_length;
     }

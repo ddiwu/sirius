@@ -125,7 +125,8 @@ GPUPhysicalUngroupedAggregate::GPUPhysicalUngroupedAggregate(
     aggregates(std::move(expressions))
 {
   distinct_collection_info = DistinctAggregateCollectionInfo::Create(aggregates);
-  aggregation_result       = make_shared_ptr<GPUIntermediateRelation>(aggregates.size());
+  // Per-GPU aggregation_result lives in UngroupedAggregateRuntimeState and is
+  // lazy-initialised on first Sink for each GPU.
   if (!distinct_collection_info) { return; }
   distinct_data = make_uniq<DistinctAggregateData>(*distinct_collection_info, distinct_validity);
 }
@@ -209,6 +210,14 @@ SinkResultType GPUPhysicalUngroupedAggregate::Sink(GPUIntermediateRelation& inpu
     HandleAggregateExpressionCuDF(aggregate_column, gpuBufferManager, aggregates);
   }
 
+  // Stage the partial 1-row aggregate into per-GPU runtime state. Cross-GPU
+  // reduce of partials happens later in GPUPhysicalMaterializedCollector::GetResult.
+  auto& rstate = runtime_state<UngroupedAggregateRuntimeState>(sirius_current_gpu);
+  if (!rstate.aggregation_result) {
+    rstate.aggregation_result = make_shared_ptr<GPUIntermediateRelation>(aggregates.size());
+  }
+  auto& aggregation_result = rstate.aggregation_result;
+
   for (int aggr_idx = 0; aggr_idx < aggregates.size(); aggr_idx++) {
     // TODO: has to fix this for columns with partially NULL values
     if (aggregation_result->columns[aggr_idx] == nullptr) {
@@ -244,12 +253,14 @@ SourceResultType GPUPhysicalUngroupedAggregate::GetData(
   GPUIntermediateRelation& output_relation) const
 {
   auto start = std::chrono::high_resolution_clock::now();
+  // Read this GPU's partial aggregate from per-GPU runtime state.
+  auto& rstate = runtime_state<UngroupedAggregateRuntimeState>(sirius_current_gpu);
+  if (!rstate.aggregation_result) {
+    throw NotImplementedException("UngroupedAggregate::GetData called before Sink");
+  }
+  auto& aggregation_result = rstate.aggregation_result;
   for (int col = 0; col < aggregation_result->columns.size(); col++) {
     SIRIUS_LOG_DEBUG("Writing aggregation result to column {}", col);
-    // output_relation.columns[col] =
-    // make_shared_ptr<GPUColumn>(aggregation_result->columns[col]->column_length,
-    // aggregation_result->columns[col]->data_wrapper.type,
-    // aggregation_result->columns[col]->data_wrapper.data);
     output_relation.columns[col] = make_shared_ptr<GPUColumn>(aggregation_result->columns[col]);
   }
 

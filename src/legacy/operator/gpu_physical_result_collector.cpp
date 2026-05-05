@@ -17,8 +17,10 @@
 #include "operator/gpu_physical_result_collector.hpp"
 
 #include "cudf/cudf_utils.hpp"
+#include "duckdb/common/hugeint.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/prepared_statement_data.hpp"
+#include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "gpu_buffer_manager.hpp"
 #include "gpu_context.hpp"
 #include "gpu_meta_pipeline.hpp"
@@ -26,6 +28,7 @@
 #include "gpu_pipeline.hpp"
 #include "log/logging.hpp"
 #include "operator/gpu_materialize.hpp"
+#include "operator/gpu_physical_ungrouped_aggregate.hpp"
 #include "utils.hpp"
 
 namespace duckdb {
@@ -521,6 +524,108 @@ unique_ptr<LocalSinkState> GPUPhysicalMaterializedCollector::GetLocalSinkState(
   return std::move(state);
 }
 
+namespace {
+
+// Add a single source value at row `row` of `vsrc` into `dst` (which is the
+// running accumulator for this column). Used for COUNT/SUM cross-GPU merge.
+void AddValueInPlace(PhysicalType pt, uint8_t* dst, Vector& vsrc, idx_t row)
+{
+  switch (pt) {
+    case PhysicalType::INT32:
+      *reinterpret_cast<int32_t*>(dst) += FlatVector::GetData<int32_t>(vsrc)[row];
+      break;
+    case PhysicalType::INT64:
+      *reinterpret_cast<int64_t*>(dst) += FlatVector::GetData<int64_t>(vsrc)[row];
+      break;
+    case PhysicalType::INT128:
+      *reinterpret_cast<hugeint_t*>(dst) += FlatVector::GetData<hugeint_t>(vsrc)[row];
+      break;
+    case PhysicalType::FLOAT:
+      *reinterpret_cast<float*>(dst) += FlatVector::GetData<float>(vsrc)[row];
+      break;
+    case PhysicalType::DOUBLE:
+      *reinterpret_cast<double*>(dst) += FlatVector::GetData<double>(vsrc)[row];
+      break;
+    default:
+      throw NotImplementedException(
+        "Cross-GPU SUM/COUNT not supported for PhysicalType %s",
+        TypeIdToString(pt));
+  }
+}
+
+// Cross-GPU final reduce of an UNGROUPED_AGGREGATE. Each per-GPU pipeline
+// produced a 1-row partial. Collapse those N rows into a single row by
+// applying each aggregate's reducer (SUM-merge for COUNT/COUNT_STAR/SUM/
+// SUM_NO_OVERFLOW). Other functions throw — re-evaluating MIN/MAX/AVG across
+// partials needs more thought (AVG is not associative, MIN/MAX would work
+// trivially but aren't wired up yet).
+unique_ptr<GPUResultCollection> ReduceUngroupedAcrossGpus(
+  GPUResultCollection& combined,
+  const GPUPhysicalUngroupedAggregate& agg,
+  const vector<LogicalType>& types,
+  GPUBufferManager* gbm)
+{
+  const size_t num_gpus = combined.write_idx;
+  D_ASSERT(num_gpus > 1);
+  // All chunks are 1 row each (ungrouped agg per GPU). Sanity check.
+  for (size_t g = 0; g < num_gpus; ++g) {
+    if (combined.data_chunks[g].size() != 1) {
+      throw NotImplementedException(
+        "Cross-GPU ungrouped aggregate expected 1 row per GPU, got %zu",
+        combined.data_chunks[g].size());
+    }
+  }
+
+  auto reduced = make_uniq<GPUResultCollection>();
+  reduced->SetCapacity(1);
+
+  DataChunk merged;
+  merged.InitializeEmpty(types);
+
+  // Persistent host buffers for the merged row's columns. We Reference these
+  // into the merged chunk via Vector, matching the pattern used in
+  // ConvertGPUTableToCPUCollection.
+  for (size_t col = 0; col < types.size(); ++col) {
+    auto& expr        = agg.aggregates[col]->Cast<BoundAggregateExpression>();
+    const auto fname  = expr.function.name;
+    PhysicalType pt   = types[col].InternalType();
+    size_t value_size = GetTypeIdSize(pt);
+
+    uint8_t* dst_data = gbm->customCudaHostAlloc<uint8_t>(value_size);
+    uint8_t* dst_mask = gbm->customCudaHostAlloc<uint8_t>(getMaskBytesSize(1));
+    memset(dst_data, 0, value_size);
+    *dst_mask = 0xFF;  // assume valid; flip if all partials are NULL below
+
+    if (fname == "count" || fname == "count_star" || fname == "sum" ||
+        fname == "sum_no_overflow") {
+      bool any_valid = false;
+      for (size_t g = 0; g < num_gpus; ++g) {
+        auto& vsrc = combined.data_chunks[g].data[col];
+        if (!FlatVector::Validity(vsrc).RowIsValid(0)) continue;
+        AddValueInPlace(pt, dst_data, vsrc, 0);
+        any_valid = true;
+      }
+      // SUM over an empty input is NULL; COUNT is 0 (always valid).
+      if (!any_valid && (fname == "sum" || fname == "sum_no_overflow")) {
+        *dst_mask = 0x00;
+      }
+    } else {
+      throw NotImplementedException(
+        "Cross-GPU ungrouped aggregate not supported for function: %s", fname);
+    }
+
+    Vector v(types[col], dst_data);
+    ValidityMask vmask(reinterpret_cast<validity_t*>(dst_mask), 1);
+    FlatVector::SetValidity(v, vmask);
+    merged.data[col].Reference(v);
+  }
+  merged.SetCardinality(1);
+  reduced->AddChunk(merged);
+  return reduced;
+}
+
+}  // namespace
+
 unique_ptr<QueryResult> GPUPhysicalMaterializedCollector::GetResult(GlobalSinkState& state)
 {
   auto& gstate = state.Cast<GPUMaterializedCollectorGlobalState>();
@@ -544,6 +649,14 @@ unique_ptr<QueryResult> GPUPhysicalMaterializedCollector::GetResult(GlobalSinkSt
     }
     // Release the per-GPU collection now that we've moved its content.
     rstate.result_collection.reset();
+  }
+
+  // Cross-GPU final reduce: each per-GPU run of an UNGROUPED_AGGREGATE
+  // produced a 1-row partial. Without this, COUNT(*) on an N-GPU partition
+  // would return N rows instead of one.
+  if (combined->write_idx > 1 && plan.type == PhysicalOperatorType::UNGROUPED_AGGREGATE) {
+    combined = ReduceUngroupedAcrossGpus(
+      *combined, plan.Cast<GPUPhysicalUngroupedAggregate>(), types, gpuBufferManager);
   }
 
   auto result = make_uniq<GPUQueryResult>(
