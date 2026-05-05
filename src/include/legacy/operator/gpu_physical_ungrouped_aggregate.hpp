@@ -36,6 +36,11 @@ void cudf_aggregate(vector<shared_ptr<GPUColumn>>& column,
 // GPUPhysicalMaterializedCollector::GetResult.
 struct UngroupedAggregateRuntimeState : OpRuntimeState {
   shared_ptr<GPUIntermediateRelation> aggregation_result;
+  // For AVG aggregates: per-aggregate non-null row count on this GPU's
+  // partition. Sized aggregates.size(); 0 for non-AVG indices. Cross-GPU
+  // reduce uses this to compute a count-weighted average from the per-GPU
+  // means (cuDF MEAN reduction discards the count after producing the mean).
+  vector<uint64_t> avg_valid_counts;
 };
 
 class GPUPhysicalUngroupedAggregate : public GPUPhysicalOperator {

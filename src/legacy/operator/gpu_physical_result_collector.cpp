@@ -553,12 +553,54 @@ void AddValueInPlace(PhysicalType pt, uint8_t* dst, Vector& vsrc, idx_t row)
   }
 }
 
+// Replace `dst` with min(dst, src) when take_min, else max(dst, src).
+// On is_first the destination is uninitialised; just copy the source.
+template <typename T>
+inline void min_or_max_into(uint8_t* dst, T src, bool is_first, bool take_min)
+{
+  T* d = reinterpret_cast<T*>(dst);
+  if (is_first) { *d = src; return; }
+  if (take_min ? src < *d : src > *d) *d = src;
+}
+
+void MinOrMaxValueInPlace(
+  PhysicalType pt, uint8_t* dst, Vector& vsrc, idx_t row, bool is_first, bool take_min)
+{
+  switch (pt) {
+    case PhysicalType::INT32:
+      min_or_max_into(dst, FlatVector::GetData<int32_t>(vsrc)[row], is_first, take_min);
+      break;
+    case PhysicalType::INT64:
+      min_or_max_into(dst, FlatVector::GetData<int64_t>(vsrc)[row], is_first, take_min);
+      break;
+    case PhysicalType::INT128:
+      min_or_max_into(dst, FlatVector::GetData<hugeint_t>(vsrc)[row], is_first, take_min);
+      break;
+    case PhysicalType::FLOAT:
+      min_or_max_into(dst, FlatVector::GetData<float>(vsrc)[row], is_first, take_min);
+      break;
+    case PhysicalType::DOUBLE:
+      min_or_max_into(dst, FlatVector::GetData<double>(vsrc)[row], is_first, take_min);
+      break;
+    default:
+      throw NotImplementedException(
+        "Cross-GPU MIN/MAX not supported for PhysicalType %s",
+        TypeIdToString(pt));
+  }
+}
+
 // Cross-GPU final reduce of an UNGROUPED_AGGREGATE. Each per-GPU pipeline
 // produced a 1-row partial. Collapse those N rows into a single row by
-// applying each aggregate's reducer (SUM-merge for COUNT/COUNT_STAR/SUM/
-// SUM_NO_OVERFLOW). Other functions throw — re-evaluating MIN/MAX/AVG across
-// partials needs more thought (AVG is not associative, MIN/MAX would work
-// trivially but aren't wired up yet).
+// applying each aggregate's reducer:
+//   COUNT/COUNT_STAR/SUM/SUM_NO_OVERFLOW -> sum across GPUs
+//   MIN/MAX                              -> min/max across GPUs (skip NULL)
+//   AVG                                  -> count-weighted average; uses
+//                                           UngroupedAggregateRuntimeState::
+//                                           avg_valid_counts populated by
+//                                           the upstream Sink
+// FIRST and COUNT_DISTINCT still throw NotImplementedException; FIRST is
+// order-dependent (and partition order isn't preserved) and COUNT_DISTINCT
+// can't be merged from per-partition counts without rehashing the values.
 unique_ptr<GPUResultCollection> ReduceUngroupedAcrossGpus(
   GPUResultCollection& combined,
   const GPUPhysicalUngroupedAggregate& agg,
@@ -591,6 +633,16 @@ unique_ptr<GPUResultCollection> ReduceUngroupedAcrossGpus(
     PhysicalType pt   = types[col].InternalType();
     size_t value_size = GetTypeIdSize(pt);
 
+    // COUNT(DISTINCT x) / SUM(DISTINCT x) etc. cannot be merged from per-GPU
+    // partial counts -- the partials don't carry the underlying distinct
+    // values, only the per-partition distinct count -- and our SUM-merge
+    // would silently double-count overlaps. Refuse and let sirius fall back
+    // to CPU.
+    if (expr.IsDistinct()) {
+      throw NotImplementedException(
+        "Cross-GPU DISTINCT aggregate not supported (function: %s)", fname);
+    }
+
     uint8_t* dst_data = gbm->customCudaHostAlloc<uint8_t>(value_size);
     uint8_t* dst_mask = gbm->customCudaHostAlloc<uint8_t>(getMaskBytesSize(1));
     memset(dst_data, 0, value_size);
@@ -607,6 +659,52 @@ unique_ptr<GPUResultCollection> ReduceUngroupedAcrossGpus(
       }
       // SUM over an empty input is NULL; COUNT is 0 (always valid).
       if (!any_valid && (fname == "sum" || fname == "sum_no_overflow")) {
+        *dst_mask = 0x00;
+      }
+    } else if (fname == "min" || fname == "max") {
+      const bool take_min = (fname == "min");
+      bool any_valid      = false;
+      for (size_t g = 0; g < num_gpus; ++g) {
+        auto& vsrc = combined.data_chunks[g].data[col];
+        if (!FlatVector::Validity(vsrc).RowIsValid(0)) continue;
+        MinOrMaxValueInPlace(pt, dst_data, vsrc, 0, /*is_first=*/!any_valid, take_min);
+        any_valid = true;
+      }
+      if (!any_valid) *dst_mask = 0x00;
+    } else if (fname == "avg") {
+      // Weighted average across GPUs: total = SUM(mean_g * count_g);
+      // result  = total / SUM(count_g). cuDF's MEAN reducer returns the
+      // mean cast to FLOAT64 for int/decimal inputs and preserves the
+      // input float type otherwise. Handle DOUBLE and FLOAT result types.
+      if (pt != PhysicalType::DOUBLE && pt != PhysicalType::FLOAT) {
+        throw NotImplementedException(
+          "Cross-GPU AVG result type %s not supported", TypeIdToString(pt));
+      }
+      double total          = 0.0;
+      uint64_t grand_count  = 0;
+      for (size_t g = 0; g < num_gpus; ++g) {
+        auto& vsrc = combined.data_chunks[g].data[col];
+        if (!FlatVector::Validity(vsrc).RowIsValid(0)) continue;
+        if (!agg.per_gpu_state[g]) continue;
+        const auto& rstate =
+          static_cast<const UngroupedAggregateRuntimeState&>(*agg.per_gpu_state[g]);
+        if (col >= rstate.avg_valid_counts.size()) continue;
+        const uint64_t cnt = rstate.avg_valid_counts[col];
+        if (cnt == 0) continue;
+        const double mean = (pt == PhysicalType::DOUBLE)
+                              ? FlatVector::GetData<double>(vsrc)[0]
+                              : static_cast<double>(FlatVector::GetData<float>(vsrc)[0]);
+        total += mean * static_cast<double>(cnt);
+        grand_count += cnt;
+      }
+      if (grand_count > 0) {
+        const double result = total / static_cast<double>(grand_count);
+        if (pt == PhysicalType::DOUBLE) {
+          *reinterpret_cast<double*>(dst_data) = result;
+        } else {
+          *reinterpret_cast<float*>(dst_data) = static_cast<float>(result);
+        }
+      } else {
         *dst_mask = 0x00;
       }
     } else {

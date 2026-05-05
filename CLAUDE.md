@@ -49,6 +49,74 @@ Build outputs:
 - Loadable extension: `build/release/extension/sirius/sirius_loadable.duckdb_extension`
 - Unit test binary: `build/release/extension/sirius/test/cpp/sirius_unittest`
 
+### Build pitfalls (learned the hard way on the firlfs / fc10xxx slurm cluster)
+
+1. **`make` only builds Super Sirius. The legacy `gpu_processing` path is OFF by default.**
+   Use `make legacy-release` to build with `ENABLE_LEGACY_SIRIUS=ON`. The
+   resulting artifacts go to `build/legacy-release/...`, not `build/release/...`.
+   Symptom if you forget: `Catalog Error: Table Function with name gpu_processing
+   does not exist`.
+
+2. **`CMAKE_CUDA_ARCHITECTURES` defaults to `native` but configures wrong on a
+   GPU-less host.** If you `cmake --preset` from the login node (no NVIDIA
+   driver) it silently falls back to sm_75 (Turing). Running on H100 then
+   crashes with `cudaErrorUnsupportedPtxVersion` (exit 222).
+   Fix: always pass `-DCMAKE_CUDA_ARCHITECTURES=90` (Hopper) explicitly when
+   configuring, or run the configure step from the slurm-allocated GPU node.
+
+3. **Don't `module load cuda ucx-cuda` for *building*.** The system module is
+   CUDA 12.6 and conflicts with the pixi env's CUDA 13 headers — you'll get
+   nonsense errors in `cuda_fp6.hpp` / rapids `attributes.h` (e.g.
+   `cudaDevAttrHostNumaMemoryPoolsSupported has not been declared`).
+   Only load the system cuda module when *running* (the runtime needs the
+   driver, the headers don't matter at runtime).
+
+4. **`pixi shell-hook` can hang on a futex** if a previous `pixi` died holding
+   internal locks. If it doesn't print anything for >30 s, kill it
+   (`pkill -9 -u $USER pixi`) and bypass pixi entirely by exporting the env
+   manually in your build script:
+   ```bash
+   PIXI_ENV=/path/to/repo/.pixi/envs/default
+   export PATH="$PIXI_ENV/bin:$PATH"
+   export CMAKE_PREFIX_PATH="$PIXI_ENV"
+   export CONDA_PREFIX="$PIXI_ENV"
+   export LD_LIBRARY_PATH="$PIXI_ENV/lib:$LD_LIBRARY_PATH"
+   ```
+
+5. **`cmake` is not in the pixi env's `bin/`** even though everything else is.
+   It lives at `~/.cache/rattler/cache/pkgs/cmake-<ver>/bin/cmake` and needs
+   the pixi env's `lib/` on `LD_LIBRARY_PATH` (otherwise `libbz2.so.1.0` is
+   missing). After a fresh checkout, symlink it:
+   ```bash
+   ln -sf ~/.cache/rattler/cache/pkgs/cmake-<ver>/bin/{cmake,ctest,cpack} \
+          .pixi/envs/default/bin/
+   ```
+
+6. **`git worktree add` does NOT init submodules.** Always run
+   `git submodule update --init --recursive` after creating a worktree, or
+   the build configure step will fail mid-way.
+
+7. **The duckdb shell built into `build/<preset>/duckdb` statically links
+   sirius.** Loading the extension explicitly (`LOAD '/path/sirius.duckdb_extension'`)
+   throws `Table Function with name "gpu_buffer_init" already exists` — this
+   is harmless: just call `gpu_buffer_init` directly, the extension is
+   already loaded.
+
+8. **The `/home` filesystem on this cluster is small (50 GB quota).** A full
+   sirius checkout with `.pixi` and `build/` is ~11 GB. Put extra worktrees
+   under `/scratch/$USER/` (Lustre, plenty of space, visible from compute
+   nodes) and symlink `.pixi` from the original checkout to save another
+   3 GB per worktree.
+
+9. **TPC-H data should live on `/dev/shm` for benchmarking.** The compute
+   nodes have ~1 TB of tmpfs there; `/scratch` is Lustre and adds I/O noise
+   that swamps the GPU compute time you're trying to measure. Generate to
+   `/scratch` once, then `cp` to `/dev/shm` on the target node.
+
+10. **Benchmark numbers from the login node are meaningless** — there's no
+    NVIDIA driver. Always `ssh fc10xxx` (the slurm-allocated node) before
+    running anything that touches GPU.
+
 ### Building Python API
 
 ```bash

@@ -206,8 +206,6 @@ SinkResultType GPUPhysicalUngroupedAggregate::Sink(GPUIntermediateRelation& inpu
 
   if (aggregate_column[0]->column_length > INT32_MAX) {
     throw NotImplementedException("Column length greater than INT32_MAX is not supported");
-  } else {
-    HandleAggregateExpressionCuDF(aggregate_column, gpuBufferManager, aggregates);
   }
 
   // Stage the partial 1-row aggregate into per-GPU runtime state. Cross-GPU
@@ -217,6 +215,22 @@ SinkResultType GPUPhysicalUngroupedAggregate::Sink(GPUIntermediateRelation& inpu
     rstate.aggregation_result = make_shared_ptr<GPUIntermediateRelation>(aggregates.size());
   }
   auto& aggregation_result = rstate.aggregation_result;
+
+  // AVG cross-GPU merge needs each partition's non-null row count: cuDF's
+  // MEAN reducer (called inside HandleAggregateExpressionCuDF below) returns
+  // only the mean and discards the count. Snapshot it now while we still
+  // have the input column.
+  rstate.avg_valid_counts.assign(aggregates.size(), 0);
+  for (idx_t aggr_idx = 0; aggr_idx < aggregates.size(); ++aggr_idx) {
+    auto& aggregate = aggregates[aggr_idx]->Cast<BoundAggregateExpression>();
+    if (aggregate.function.name != "avg") continue;
+    auto& col = aggregate_column[aggr_idx];
+    if (!col || col->data_wrapper.data == nullptr) continue;
+    auto cudf_col = col->convertToCudfColumn();
+    rstate.avg_valid_counts[aggr_idx] = col->column_length - cudf_col.null_count();
+  }
+
+  HandleAggregateExpressionCuDF(aggregate_column, gpuBufferManager, aggregates);
 
   for (int aggr_idx = 0; aggr_idx < aggregates.size(); aggr_idx++) {
     // TODO: has to fix this for columns with partially NULL values
