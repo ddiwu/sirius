@@ -1233,7 +1233,7 @@ void GPUPhysicalTableScan::ScanDataDuckDBOpt(ExecutionContext& exec_context,
       scanned_types = orig_scanned_types;
     }
 
-    // ----- Phase 1: per-GPU partitioned upload (fixed-width columns only) -----
+    // ----- Phase 1: per-GPU partitioned upload -----
     //
     // The HOST buffers `data_ptr[col]` / `mask_ptr[col]` were filled by the
     // multi-threaded scan above and contain the WHOLE column. We split the
@@ -1241,13 +1241,22 @@ void GPUPhysicalTableScan::ScanDataDuckDBOpt(ExecutionContext& exec_context,
     // cache slab. Each GPU's catalog entry (created earlier in
     // GetDataDuckDBOpt for every g) gets its slice attached below.
     //
-    // Limitations (will revisit):
-    //   * VARCHAR is left on a single-GPU path (still goes to GPU 0). The
-    //     prefix-sum + variable-length offsets need a per-GPU split that we
-    //     haven't implemented yet.
-    //   * Per-GPU row count is rounded up to a multiple of 8 so each GPU's
-    //     mask slice starts on a byte boundary. The last GPU may end up with
-    //     fewer rows.
+    // VARCHAR handling:
+    //   * Host `offset_ptr[col][i]` came back from the scan as the LENGTH of
+    //     row i's string (not a cumulative offset). We do a CPU prefix sum
+    //     to convert it to cumulative byte offsets in-place, so we know each
+    //     row's byte range in the chars buffer and can slice per partition.
+    //   * For each GPU g, we compute byte_lo / byte_hi from the cumulative
+    //     offsets, allocate a chars slice and a (rows_g+1)-entry offset
+    //     buffer, copy the chars slice as-is, and emit a rebased offsets
+    //     slice (offsets[lo..hi] - offsets[lo]) so the per-GPU offsets
+    //     start at 0.
+    //   * Skips the GPU-side prefix sum block below for VARCHAR (we
+    //     already did it on host).
+    //
+    // Limitations:
+    //   * Per-GPU row count rounded up to a multiple of 8 so each GPU's mask
+    //     slice starts on a byte boundary. Last GPU may end up with fewer rows.
     //   * scan_duckdb_storage_row_ids reorder branch is not partitioned.
     const int NUM_G = static_cast<int>(gpuBufferManager->tables_per_gpu.size());
     bool any_varchar = false;
@@ -1255,6 +1264,25 @@ void GPUPhysicalTableScan::ScanDataDuckDBOpt(ExecutionContext& exec_context,
       if (!already_cached[col] && scanned_types[col].id() == LogicalTypeId::VARCHAR) {
         any_varchar = true;
         break;
+      }
+    }
+
+    // CPU prefix sum on each VARCHAR column's lengths so they become
+    // cumulative byte offsets in-place. The scan task wrote
+    //   offset_ptr[col][0]   = 0   (set up before the scan)
+    //   offset_ptr[col][i+1] = length of row i  (i in 0..num_rows-1)
+    // After this loop:
+    //   offset_ptr[col][0]        = 0
+    //   offset_ptr[col][i+1]      = sum of lengths[0..i]
+    //   offset_ptr[col][num_rows] = total chars in this column
+    if (any_varchar) {
+      for (int col = 0; col < column_ids.size() - gen_row_id_column; col++) {
+        if (already_cached[col]) continue;
+        if (scanned_types[col].id() != LogicalTypeId::VARCHAR) continue;
+        uint64_t* ofs = offset_ptr[col];
+        for (uint64_t i = 1; i <= num_rows; ++i) {
+          ofs[i] += ofs[i - 1];
+        }
       }
     }
 
@@ -1272,28 +1300,40 @@ void GPUPhysicalTableScan::ScanDataDuckDBOpt(ExecutionContext& exec_context,
     // Per-GPU device pointer arrays, indexed [gpu][col].
     vector<vector<uint8_t*>> d_data_per_gpu(NUM_G, vector<uint8_t*>(scanned_types.size(), nullptr));
     vector<vector<uint8_t*>> d_mask_per_gpu(NUM_G, vector<uint8_t*>(scanned_types.size(), nullptr));
-    // VARCHAR fallback (single GPU 0 path) — kept for completeness until we
-    // implement variable-length partitioning.
-    uint8_t** d_data_ptr = gpuBufferManager->customCudaHostAlloc<uint8_t*>(scanned_types.size());
-    uint8_t** d_mask_ptr = gpuBufferManager->customCudaHostAlloc<uint8_t*>(scanned_types.size());
-    uint64_t** d_offset_ptr =
-      gpuBufferManager->customCudaHostAlloc<uint64_t*>(scanned_types.size());
-    std::fill(d_data_ptr, d_data_ptr + scanned_types.size(), nullptr);
-    std::fill(d_mask_ptr, d_mask_ptr + scanned_types.size(), nullptr);
-    std::fill(d_offset_ptr, d_offset_ptr + scanned_types.size(), nullptr);
+    // VARCHAR per-GPU offsets (rows_g + 1 entries each, rebased to start at 0).
+    vector<vector<uint64_t*>> d_offset_per_gpu(NUM_G,
+                                               vector<uint64_t*>(scanned_types.size(), nullptr));
+    // Per-GPU char-buffer byte size for VARCHAR (precomputed from cumulative
+    // host offsets, used both for alloc and for column_size in the attach
+    // loop).
+    vector<vector<size_t>> data_bytes_per_gpu(NUM_G,
+                                              vector<size_t>(scanned_types.size(), 0));
 
     // Allocate device buffers
     for (int col = 0; col < scanned_types.size(); col++) {
       if (already_cached[col]) continue;
       if (scanned_types[col].id() == LogicalTypeId::VARCHAR) {
-        // VARCHAR: single-GPU fallback into GPU 0 (Phase 1 limitation).
-        d_data_ptr[col]   = gpuBufferManager->customCudaMalloc<uint8_t>(column_size[col], 0, 1);
-        d_mask_ptr[col]   = gpuBufferManager->customCudaMalloc<uint8_t>(mask_size[col], 0, 1);
-        d_offset_ptr[col] = gpuBufferManager->customCudaMalloc<uint64_t>(num_rows + 1, 0, 1);
-        // Mirror into per-GPU GPU 0 slot so the attach loop below can use a
-        // unified path.
-        d_data_per_gpu[0][col] = d_data_ptr[col];
-        d_mask_per_gpu[0][col] = d_mask_ptr[col];
+        // VARCHAR: per-GPU partition. Use the cumulative host offsets we
+        // produced above to compute each partition's byte slice.
+        const uint64_t* ofs = offset_ptr[col];
+        for (int g = 0; g < NUM_G; ++g) {
+          size_t rows_g = gpu_row_hi[g] - gpu_row_lo[g];
+          if (rows_g == 0) continue;
+          uint64_t byte_lo = ofs[gpu_row_lo[g]];
+          uint64_t byte_hi = ofs[gpu_row_hi[g]];
+          size_t  data_bytes_g     = byte_hi - byte_lo;
+          size_t  mask_bytes_g     = getMaskBytesSize(rows_g);
+          size_t  num_offsets_g    = rows_g + 1;
+          data_bytes_per_gpu[g][col] = data_bytes_g;
+          // Allocate at least 1 byte for the chars buffer even if all rows in
+          // this partition are empty strings, so the cudf column has a valid
+          // non-null data pointer.
+          d_data_per_gpu[g][col] = gpuBufferManager->customCudaMalloc<uint8_t>(
+            std::max<size_t>(data_bytes_g, 1), g, 1);
+          d_mask_per_gpu[g][col] = gpuBufferManager->customCudaMalloc<uint8_t>(mask_bytes_g, g, 1);
+          d_offset_per_gpu[g][col] =
+            gpuBufferManager->customCudaMalloc<uint64_t>(num_offsets_g, g, 1);
+        }
       } else {
         const size_t bytes_per_row = column_size[col] / num_rows;
         for (int g = 0; g < NUM_G; ++g) {
@@ -1317,30 +1357,59 @@ void GPUPhysicalTableScan::ScanDataDuckDBOpt(ExecutionContext& exec_context,
       cudaSetDevice(g);
       for (int col = 0; col < column_ids.size() - gen_row_id_column; col++) {
         if (already_cached[col]) continue;
-        if (scanned_types[col].id() == LogicalTypeId::VARCHAR) {
-          // Only the GPU 0 path issues the (full) VARCHAR copy below.
-          continue;
-        }
-        const size_t bytes_per_row = column_size[col] / num_rows;
-        size_t lo_bytes            = gpu_row_lo[g] * bytes_per_row;
-        size_t rows_g              = gpu_row_hi[g] - gpu_row_lo[g];
-        size_t data_bytes_g        = rows_g * bytes_per_row;
-        size_t mask_byte_offset    = gpu_row_lo[g] / 8;  // safe: lo aligned to 8
-        size_t mask_bytes_g        = getMaskBytesSize(rows_g);
-        // Don't over-read the host mask buffer: cap the copy at the bytes
-        // remaining after our offset. The GPU mask is over-allocated for
-        // cudf's 64-byte padding; trailing bytes are uninitialised but
-        // unused since column_length bounds reads.
+        size_t rows_g           = gpu_row_hi[g] - gpu_row_lo[g];
+        size_t mask_byte_offset = gpu_row_lo[g] / 8;  // safe: lo aligned to 8
+        size_t mask_bytes_g     = getMaskBytesSize(rows_g);
+        // Don't over-read the host mask buffer.
         size_t mask_copy_bytes =
           (mask_byte_offset < mask_size[col])
             ? std::min(mask_bytes_g, mask_size[col] - mask_byte_offset)
             : 0;
-        cudaMemcpyAsync(
-          d_data_per_gpu[g][col],
-          data_ptr[col] + lo_bytes,
-          data_bytes_g,
-          cudaMemcpyHostToDevice,
-          cuda_streams[num_cuda_memcpy++ % Config::OPT_TABLE_SCAN_NUM_CUDA_STREAMS]);
+
+        if (scanned_types[col].id() == LogicalTypeId::VARCHAR) {
+          // Per-GPU VARCHAR slice: chars and rebased offsets.
+          const uint64_t* ofs       = offset_ptr[col];
+          uint64_t        byte_lo   = ofs[gpu_row_lo[g]];
+          size_t          data_bytes_g = data_bytes_per_gpu[g][col];
+          // Chars slice: copy as-is (no rebase needed; just the byte range).
+          if (data_bytes_g > 0) {
+            cudaMemcpyAsync(
+              d_data_per_gpu[g][col],
+              data_ptr[col] + byte_lo,
+              data_bytes_g,
+              cudaMemcpyHostToDevice,
+              cuda_streams[num_cuda_memcpy++ % Config::OPT_TABLE_SCAN_NUM_CUDA_STREAMS]);
+          }
+          // Offsets slice: build a rebased copy on host (subtract byte_lo
+          // from each entry so the per-GPU offsets start at 0), then copy.
+          // The temp host buffer comes from the pinned pool so it's safe to
+          // use as a cudaMemcpyAsync source.
+          size_t num_offsets_g = rows_g + 1;
+          uint64_t* host_ofs_g =
+            gpuBufferManager->customCudaHostAlloc<uint64_t>(num_offsets_g);
+          for (size_t i = 0; i < num_offsets_g; ++i) {
+            host_ofs_g[i] = ofs[gpu_row_lo[g] + i] - byte_lo;
+          }
+          cudaMemcpyAsync(
+            reinterpret_cast<uint8_t*>(d_offset_per_gpu[g][col]),
+            reinterpret_cast<uint8_t*>(host_ofs_g),
+            sizeof(uint64_t) * num_offsets_g,
+            cudaMemcpyHostToDevice,
+            cuda_streams[num_cuda_memcpy++ % Config::OPT_TABLE_SCAN_NUM_CUDA_STREAMS]);
+        } else {
+          // Fixed-width: byte slice computed from row-range × type size.
+          const size_t bytes_per_row = column_size[col] / num_rows;
+          size_t       lo_bytes      = gpu_row_lo[g] * bytes_per_row;
+          size_t       data_bytes_g  = rows_g * bytes_per_row;
+          cudaMemcpyAsync(
+            d_data_per_gpu[g][col],
+            data_ptr[col] + lo_bytes,
+            data_bytes_g,
+            cudaMemcpyHostToDevice,
+            cuda_streams[num_cuda_memcpy++ % Config::OPT_TABLE_SCAN_NUM_CUDA_STREAMS]);
+        }
+
+        // Mask: same byte-aligned slice for all column types.
         if (mask_copy_bytes > 0) {
           cudaMemcpyAsync(
             d_mask_per_gpu[g][col],
@@ -1348,51 +1417,6 @@ void GPUPhysicalTableScan::ScanDataDuckDBOpt(ExecutionContext& exec_context,
             mask_copy_bytes,
             cudaMemcpyHostToDevice,
             cuda_streams[num_cuda_memcpy++ % Config::OPT_TABLE_SCAN_NUM_CUDA_STREAMS]);
-        }
-      }
-    }
-
-    // VARCHAR: full single-GPU copy into GPU 0 (Phase 1 limitation).
-    if (any_varchar) {
-      cudaSetDevice(0);
-      for (int col = 0; col < column_ids.size() - gen_row_id_column; col++) {
-        if (already_cached[col]) continue;
-        if (scanned_types[col].id() != LogicalTypeId::VARCHAR) continue;
-        uint64_t write_offset = 0;
-        while (write_offset < column_size[col]) {
-          uint64_t write_len =
-            std::min(Config::OPT_TABLE_SCAN_CUDA_MEMCPY_SIZE, column_size[col] - write_offset);
-          cudaMemcpyAsync(
-            d_data_ptr[col] + write_offset,
-            data_ptr[col] + write_offset,
-            write_len,
-            cudaMemcpyHostToDevice,
-            cuda_streams[num_cuda_memcpy++ % Config::OPT_TABLE_SCAN_NUM_CUDA_STREAMS]);
-          write_offset += write_len;
-        }
-        write_offset = 0;
-        while (write_offset < mask_size[col]) {
-          uint64_t write_len =
-            std::min(Config::OPT_TABLE_SCAN_CUDA_MEMCPY_SIZE, mask_size[col] - write_offset);
-          cudaMemcpyAsync(
-            d_mask_ptr[col] + write_offset,
-            mask_ptr[col] + write_offset,
-            write_len,
-            cudaMemcpyHostToDevice,
-            cuda_streams[num_cuda_memcpy++ % Config::OPT_TABLE_SCAN_NUM_CUDA_STREAMS]);
-          write_offset += write_len;
-        }
-        write_offset = 0;
-        while (write_offset < sizeof(uint64_t) * (num_rows + 1)) {
-          uint64_t write_len = std::min(Config::OPT_TABLE_SCAN_CUDA_MEMCPY_SIZE,
-                                        sizeof(uint64_t) * (num_rows + 1) - write_offset);
-          cudaMemcpyAsync(
-            reinterpret_cast<uint8_t*>(d_offset_ptr[col]) + write_offset,
-            reinterpret_cast<uint8_t*>(offset_ptr[col]) + write_offset,
-            write_len,
-            cudaMemcpyHostToDevice,
-            cuda_streams[num_cuda_memcpy++ % Config::OPT_TABLE_SCAN_NUM_CUDA_STREAMS]);
-          write_offset += write_len;
         }
       }
     }
@@ -1415,30 +1439,15 @@ void GPUPhysicalTableScan::ScanDataDuckDBOpt(ExecutionContext& exec_context,
     }
     cudaDeviceSynchronize();
 
-    // Perform prefix sum on gpu to form string offsets
-    int num_prefix_sum = 0;
-    for (int col = 0; col < column_ids.size() - gen_row_id_column; col++) {
-      if (!already_cached[col]) {
-        if (scanned_types[col].id() == LogicalTypeId::VARCHAR) {
-          callCubPrefixSum(
-            d_offset_ptr[col],
-            d_offset_ptr[col],
-            num_rows + 1,
-            true,
-            cuda_streams[num_prefix_sum++ % Config::OPT_TABLE_SCAN_NUM_CUDA_STREAMS],
-            [&](size_t size) { return gpuBufferManager->customCudaMalloc<uint8_t>(size, 0, 0); });
-        }
-      }
-    }
-    cudaDeviceSynchronize();
+    // (No GPU prefix sum needed — VARCHAR offsets were prefix-summed on host
+    // before partitioning so that each GPU's slice could be computed in
+    // byte space.)
 
-    // Phase 1: attach per-GPU buffers to per-GPU catalogs.
-    //
-    // For fixed-width columns: each GPU's table->columns[col] gets its slice
-    // pointer + slice row count.
-    // For VARCHAR (single-GPU fallback): GPU 0 gets the full data; other GPUs
-    // get a zero-row entry (column_length=0, data=nullptr) so the executor on
-    // a non-GPU-0 path won't see a stale pointer if it ever fans out.
+    // Attach per-GPU buffers to per-GPU catalogs.
+    //   - fixed-width: column_length = rows_g, data = d_data_per_gpu[g][col]
+    //   - VARCHAR:     column_length = rows_g, data = chars slice,
+    //                  offset = rebased per-GPU offsets,
+    //                  num_bytes = data_bytes_per_gpu[g][col]
     for (int g = 0; g < NUM_G; ++g) {
       auto& table_g = gpuBufferManager->tables_per_gpu[g][up_table_name];
       size_t rows_g = gpu_row_hi[g] - gpu_row_lo[g];
@@ -1454,27 +1463,18 @@ void GPUPhysicalTableScan::ScanDataDuckDBOpt(ExecutionContext& exec_context,
         }
         int column_idx            = column_it - table_g->column_names.begin();
         GPUColumnType column_type = convertLogicalTypeToColumnType(scanned_types[col]);
+        cudf::bitmask_type* validity_mask =
+          reinterpret_cast<cudf::bitmask_type*>(d_mask_per_gpu[g][col]);
         if (scanned_types[col] == LogicalType::VARCHAR) {
-          // VARCHAR fallback: only GPU 0 carries the actual data.
-          if (g == 0) {
-            cudf::bitmask_type* validity_mask =
-              reinterpret_cast<cudf::bitmask_type*>(d_mask_ptr[col]);
-            table_g->columns[column_idx]->column_length = num_rows;
-            table_g->columns[column_idx]->data_wrapper  = DataWrapper(column_type,
-                                                                     d_data_ptr[col],
-                                                                     d_offset_ptr[col],
-                                                                     num_rows,
-                                                                     column_size[col],
-                                                                     true,
-                                                                     validity_mask);
-          } else {
-            table_g->columns[column_idx]->column_length = 0;
-            table_g->columns[column_idx]->data_wrapper =
-              DataWrapper(column_type, nullptr, nullptr, 0, 0, true, nullptr);
-          }
+          table_g->columns[column_idx]->column_length = rows_g;
+          table_g->columns[column_idx]->data_wrapper  = DataWrapper(column_type,
+                                                                   d_data_per_gpu[g][col],
+                                                                   d_offset_per_gpu[g][col],
+                                                                   rows_g,
+                                                                   data_bytes_per_gpu[g][col],
+                                                                   true,
+                                                                   validity_mask);
         } else {
-          cudf::bitmask_type* validity_mask =
-            reinterpret_cast<cudf::bitmask_type*>(d_mask_per_gpu[g][col]);
           table_g->columns[column_idx]->column_length = rows_g;
           table_g->columns[column_idx]->data_wrapper =
             DataWrapper(column_type, d_data_per_gpu[g][col], rows_g, validity_mask);
@@ -1484,7 +1484,7 @@ void GPUPhysicalTableScan::ScanDataDuckDBOpt(ExecutionContext& exec_context,
                          up_column_name,
                          g,
                          column_idx,
-                         scanned_types[col] == LogicalType::VARCHAR && g != 0 ? 0 : rows_g);
+                         rows_g);
       }
     }
 
