@@ -15,6 +15,10 @@
  */
 
 #include "duckdb/main/database.hpp"
+#include <algorithm>
+#ifdef SIRIUS_ENABLE_MAGI_TPCH
+#include "operator/magi_q1.hpp"
+#endif
 #define DUCKDB_EXTENSION_MAIN
 
 #include "config.hpp"
@@ -384,6 +388,18 @@ static void RegisterLegacyGPUFunctions(CatalogTransaction& transaction, Catalog&
   gpu_processing.named_parameters["enable_optimizer"] = LogicalType::BOOLEAN;
   CreateTableFunctionInfo gpu_processing_info(gpu_processing);
   catalog.CreateTableFunction(transaction, gpu_processing_info);
+
+#ifdef SIRIUS_ENABLE_MAGI_TPCH
+  // Magi-backed cross-GPU TPC-H Q1. No arguments yet (the stub just returns
+  // a sentinel row from the Magi build/link probe). The full version will
+  // take the same SQL string shape as gpu_processing.
+  TableFunction magi_q1("magi_q1",
+                        {},
+                        SiriusExtension::MagiQ1Function,
+                        SiriusExtension::MagiQ1Bind);
+  CreateTableFunctionInfo magi_q1_info(magi_q1);
+  catalog.CreateTableFunction(transaction, magi_q1_info);
+#endif
 }
 #endif  // SIRIUS_ENABLE_LEGACY
 
@@ -633,6 +649,110 @@ void SiriusExtension::GPUBufferInitFunction(ClientContext& context,
   }
   data.finished = true;
 }
+
+#ifdef SIRIUS_ENABLE_MAGI_TPCH
+// (header included at top of file outside namespace duckdb to avoid a
+//  duckdb::duckdb::magi_q1 nested-namespace lookup error)
+
+struct MagiQ1FunctionData : public TableFunctionData {
+  bool finished = false;
+};
+
+unique_ptr<FunctionData> SiriusExtension::MagiQ1Bind(ClientContext& context,
+                                                    TableFunctionBindInput& input,
+                                                    vector<LogicalType>& return_types,
+                                                    vector<string>& names)
+{
+  // 7-column shape matching TPC-H Q1 (without the avg_* columns derived
+  // post-aggregation; caller can compute them as sum/count if needed).
+  return_types.push_back(LogicalType::VARCHAR); names.push_back("l_returnflag");
+  return_types.push_back(LogicalType::VARCHAR); names.push_back("l_linestatus");
+  return_types.push_back(LogicalType::DOUBLE);  names.push_back("sum_qty");
+  return_types.push_back(LogicalType::DOUBLE);  names.push_back("sum_base_price");
+  return_types.push_back(LogicalType::DOUBLE);  names.push_back("sum_disc_price");
+  return_types.push_back(LogicalType::DOUBLE);  names.push_back("sum_charge");
+  return_types.push_back(LogicalType::UBIGINT); names.push_back("count_order");
+  return make_uniq<MagiQ1FunctionData>();
+}
+
+void SiriusExtension::MagiQ1Function(ClientContext& context,
+                                     TableFunctionInput& data_p,
+                                     DataChunk& output)
+{
+  auto& data = data_p.bind_data->CastNoConst<MagiQ1FunctionData>();
+  if (data.finished) return;
+  data.finished = true;
+
+  // Sanity stub for diagnostics — also confirms the magi build/link path.
+  magi_q1::Q1MagiHello();
+
+  if (!buffer_is_initialized) {
+    throw InvalidInputException(
+      "magi_q1: gpu_buffer_init must be called first");
+  }
+  GPUBufferManager* gbm = &GPUBufferManager::GetInstance();
+
+  // Pull lineitem partition columns from each GPU's cache. The user is
+  // expected to have populated a table named LINEITEM_Q1 with the 6
+  // columns (DOUBLE l_quantity/l_extendedprice/l_discount/l_tax,
+  // VARCHAR(1) l_returnflag/l_linestatus) and triggered a gpu_processing
+  // query that caused sirius to cache it per-GPU.
+  std::vector<magi_q1::PerGpuInputs> inputs(magi_q1::NUM_GPUS);
+  for (int g = 0; g < magi_q1::NUM_GPUS; ++g) {
+    auto it = gbm->tables_per_gpu[g].find("LINEITEM_Q1");
+    if (it == gbm->tables_per_gpu[g].end()) {
+      throw InvalidInputException(
+        "magi_q1: LINEITEM_Q1 not cached on GPU " + std::to_string(g) +
+        ". Run `CALL gpu_processing('SELECT * FROM lineitem_q1 LIMIT 1')`"
+        " first to load it.");
+    }
+    auto& tbl = it->second;
+    auto col_by_name = [&](const string& name) -> shared_ptr<GPUColumn> {
+      string up = name;
+      std::transform(up.begin(), up.end(), up.begin(), ::toupper);
+      for (size_t i = 0; i < tbl->column_names.size(); ++i) {
+        string have = tbl->column_names[i];
+        std::transform(have.begin(), have.end(), have.begin(), ::toupper);
+        if (have == up) return tbl->columns[i];
+      }
+      throw InvalidInputException("magi_q1: column not found in LINEITEM_Q1: "
+                                  + name);
+    };
+    auto qcol  = col_by_name("L_QUANTITY");
+    auto epcol = col_by_name("L_EXTENDEDPRICE");
+    auto dcol  = col_by_name("L_DISCOUNT");
+    auto tcol  = col_by_name("L_TAX");
+    auto rfcol = col_by_name("L_RETURNFLAG");
+    auto lscol = col_by_name("L_LINESTATUS");
+    inputs[g].n_filtered = qcol->column_length;
+    inputs[g].d_quantity = reinterpret_cast<const double*>(qcol->data_wrapper.data);
+    inputs[g].d_ep       = reinterpret_cast<const double*>(epcol->data_wrapper.data);
+    inputs[g].d_disc     = reinterpret_cast<const double*>(dcol->data_wrapper.data);
+    inputs[g].d_tax      = reinterpret_cast<const double*>(tcol->data_wrapper.data);
+    inputs[g].rf_chars   = rfcol->data_wrapper.data;
+    inputs[g].rf_offsets = rfcol->data_wrapper.offset;
+    inputs[g].ls_chars   = lscol->data_wrapper.data;
+    inputs[g].ls_offsets = lscol->data_wrapper.offset;
+  }
+
+  std::vector<magi_q1::AggResultRow> results;
+  magi_q1::Q1MagiRun(inputs, results);
+
+  output.SetCardinality(results.size());
+  for (size_t i = 0; i < results.size(); ++i) {
+    char rf_c = static_cast<char>(results[i].rf);
+    char ls_c = static_cast<char>(results[i].ls);
+    output.SetValue(0, i, Value(string(1, rf_c)));
+    output.SetValue(1, i, Value(string(1, ls_c)));
+    output.SetValue(2, i, Value::DOUBLE(results[i].sum_qty));
+    output.SetValue(3, i, Value::DOUBLE(results[i].sum_ep));
+    output.SetValue(4, i, Value::DOUBLE(results[i].sum_disc_price));
+    output.SetValue(5, i, Value::DOUBLE(results[i].sum_charge));
+    output.SetValue(6, i, Value::UBIGINT(results[i].count));
+  }
+}
+#endif  // SIRIUS_ENABLE_MAGI_TPCH
+
 #endif  // SIRIUS_ENABLE_LEGACY
 
 static unique_ptr<FunctionData> ProfilerBind(ClientContext& context,

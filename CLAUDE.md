@@ -49,6 +49,30 @@ Build outputs:
 - Loadable extension: `build/release/extension/sirius/sirius_loadable.duckdb_extension`
 - Unit test binary: `build/release/extension/sirius/test/cpp/sirius_unittest`
 
+### Magi cross-GPU backend (optional)
+
+The `Magi-Dev/` submodule (branch `magi_for_sirius`) backs cross-GPU TPC-H queries via NVLink shuffle. Only Q1 is wired through (`CALL magi_q1()`), reading sirius's per-GPU partitioned cache.
+
+Enabled via `-DENABLE_MAGI_TPCH=ON` (default `OFF`):
+```bash
+cd duckdb && cmake --preset legacy-release -DENABLE_MAGI_TPCH=ON \
+                   -DCMAKE_CUDA_ARCHITECTURES=90
+cd .. && CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) make legacy-release
+```
+
+Extra deps: `Magi-Dev/include` (header-only) + `libgdrapi.so` (auto-detected: `SIRIUS_GDRCOPY_PREFIX` / `$EBROOTGDRCOPY` / cvmfs / `/usr/local`). UCX is **not** required — the in-process NVLink path doesn't touch `network/ucx.cuh`.
+
+Usage:
+```sql
+CALL gpu_buffer_init('30 GB', '8 GB');
+ATTACH '/path/to/lineitem_q1.duckdb' AS bench; USE bench;
+CALL gpu_processing('SELECT l_quantity, l_extendedprice, l_discount, l_tax,
+                            l_returnflag, l_linestatus FROM LINEITEM_Q1 LIMIT 1');
+CALL magi_q1();
+```
+
+Magi runtime inits lazily on the first `magi_q1` call (~1.3 s); subsequent calls reuse it.
+
 ### Build pitfalls (learned the hard way on the firlfs / fc10xxx slurm cluster)
 
 1. **`make` only builds Super Sirius. The legacy `gpu_processing` path is OFF by default.**

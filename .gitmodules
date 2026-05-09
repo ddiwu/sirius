@@ -25,3 +25,7 @@
 [submodule "vcpkg"]
 	path = vcpkg
 	url = https://github.com/Microsoft/vcpkg.git
+[submodule "Magi-Dev"]
+	path = Magi-Dev
+	url = https://github.com/fardatalab/Magi-Dev.git
+	branch = magi_for_sirius

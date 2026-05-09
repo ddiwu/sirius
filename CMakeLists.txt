@@ -296,14 +296,35 @@ foreach(_target sirius_extension sirius_loadable_extension)
       $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>
       $<$<BOOL:${SIRIUS_LEGACY_INCLUDE_DIR}>:$<BUILD_INTERFACE:${SIRIUS_LEGACY_INCLUDE_DIR}>>
   )
+  # Magi includes are a list — handle each entry separately, otherwise the
+  # `$<BUILD_INTERFACE:list>` wrapping mangles the first entry by stripping
+  # its leading slash and re-rooting it under the target's source dir.
+  if(SIRIUS_MAGI_INCLUDE_DIRS)
+    foreach(_magi_inc IN LISTS SIRIUS_MAGI_INCLUDE_DIRS)
+      target_include_directories(${_target} PRIVATE
+                                 $<BUILD_INTERFACE:${_magi_inc}>)
+    endforeach()
+  endif()
 
   if(SIRIUS_LEGACY_COMPILE_DEFINITIONS)
     target_compile_definitions(${_target}
                                PRIVATE ${SIRIUS_LEGACY_COMPILE_DEFINITIONS})
   endif()
 
+  if(SIRIUS_MAGI_COMPILE_DEFINITIONS)
+    target_compile_definitions(${_target}
+                               PRIVATE ${SIRIUS_MAGI_COMPILE_DEFINITIONS})
+  endif()
+
   target_link_libraries(${_target} cudf::cudf rmm::rmm spdlog::spdlog
                         cuCascade::cucascade yaml-cpp::yaml-cpp)
+
+  if(SIRIUS_MAGI_LINK_DIRS)
+    target_link_directories(${_target} PRIVATE ${SIRIUS_MAGI_LINK_DIRS})
+  endif()
+  if(SIRIUS_MAGI_LINK_LIBS)
+    target_link_libraries(${_target} ${SIRIUS_MAGI_LINK_LIBS})
+  endif()
 
   add_dependencies(${_target} duckdb_static)
 endforeach()

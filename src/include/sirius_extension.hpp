@@ -64,6 +64,16 @@ class SiriusExtension : public Extension {
 #ifdef SIRIUS_ENABLE_LEGACY
   static bool buffer_is_initialized;
 #endif
+
+#ifdef SIRIUS_ENABLE_MAGI_TPCH
+  static void MagiQ1Function(ClientContext& context,
+                             TableFunctionInput& data_p,
+                             DataChunk& output);
+  static unique_ptr<FunctionData> MagiQ1Bind(ClientContext& context,
+                                             TableFunctionBindInput& input,
+                                             vector<LogicalType>& return_types,
+                                             vector<string>& names);
+#endif
 };
 
 }  // namespace duckdb
