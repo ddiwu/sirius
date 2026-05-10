@@ -93,13 +93,18 @@ void combineMasks(
   } else {
     auto offset_after_a        = (N_a + 31) / 32;
     auto offset_remain_after_a = 32 - (N_a % 32);
-    auto N                     = N_b - offset_remain_after_a;
-    copy_mask<<<(N + BLOCK_THREADS - 1) / BLOCK_THREADS,
-                BLOCK_THREADS,
-                0,
-                rmm::cuda_stream_default.value()>>>(
-      b, c + offset_after_a, offset_remain_after_a, N);
-    CHECK_ERROR();
+    // Only launch the bulk-copy kernel if there are bits in b past the
+    // partial last-word merge below. Otherwise N would underflow as uint64_t
+    // and cudaError_t would explode at launch (cudaErrorInvalidConfiguration).
+    if (N_b > offset_remain_after_a) {
+      auto N = N_b - offset_remain_after_a;
+      copy_mask<<<(N + BLOCK_THREADS - 1) / BLOCK_THREADS,
+                  BLOCK_THREADS,
+                  0,
+                  rmm::cuda_stream_default.value()>>>(
+        b, c + offset_after_a, offset_remain_after_a, N);
+      CHECK_ERROR();
+    }
     uint32_t temp  = 0;
     uint32_t temp2 = 0;
     cudaDeviceSynchronize();  // Need sync before Host memory copy

@@ -110,6 +110,7 @@ GPUColumn::GPUColumn(size_t _column_length,
   column_length          = _column_length;
   data_wrapper           = DataWrapper(type, data, _column_length, validity_mask);
   row_ids                = nullptr;
+  row_id_count           = 0;
   data_wrapper.offset    = nullptr;
   data_wrapper.num_bytes = column_length * data_wrapper.getColumnTypeSize();
   is_unique              = false;
@@ -126,7 +127,8 @@ GPUColumn::GPUColumn(size_t _column_length,
   column_length = _column_length;
   data_wrapper =
     DataWrapper(type, data, offset, _column_length, num_bytes, is_string_data, validity_mask);
-  row_ids = nullptr;
+  row_ids      = nullptr;
+  row_id_count = 0;
   if (is_string_data) {
     data_wrapper.num_bytes = num_bytes;
   } else {
