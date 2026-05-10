@@ -16,11 +16,14 @@
 
 #include "operator/gpu_physical_grouped_aggregate.hpp"
 
+#include <mutex>
+
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "gpu_buffer_manager.hpp"
 #include "log/logging.hpp"
 #include "operator/gpu_materialize.hpp"
+#include "operator/magi_groupby.hpp"
 #include "utils.hpp"
 
 namespace duckdb {
@@ -187,12 +190,17 @@ void HandleGroupByAggregateCuDF(vector<shared_ptr<GPUColumn>>& group_by_keys,
     }
   }
 
-  cudf_groupby(group_by_keys,
-               aggregate_keys,
-               num_group_keys,
-               aggregates.size(),
-               agg_mode,
-               estimated_output_groups);
+  // Magi NVLink-shuffle backend: each per-GPU worker thread enters
+  // magi_groupby::Run on its own GPU's input partition; threads
+  // coordinate internally via std::barrier. On return, group_by_keys /
+  // aggregate_keys hold this GPU's hash-partitioned result slice, which
+  // sirius's existing CombineColumns concat finalises across threads.
+  magi_groupby::Run(/*gpu_id=*/sirius_current_gpu,
+                    group_by_keys,
+                    aggregate_keys,
+                    num_group_keys,
+                    static_cast<int>(aggregates.size()),
+                    agg_mode);
 }
 
 void HandleDistinctGroupByCuDF(vector<shared_ptr<GPUColumn>>& group_by_keys,
@@ -492,6 +500,17 @@ SinkResultType GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_
       }
     }
   }
+
+  // group_by_result is shared across legacy worker threads (one per GPU);
+  // each thread's Sink merges its own slice into the shared accumulator.
+  // The cudf path tolerated this race because the cudf calls were slow
+  // enough that thread 0 finished assigning all columns before thread 1
+  // hit the combine branch. Magi's Sink is ~50ms vs cudf's hundreds of ms,
+  // so the race is exposed: thread 1 can see keys at length=4 (combined)
+  // while aggs are still at length=3 (not yet combined). cudf's table_view
+  // then rejects the table with "Column size mismatch" on the next pipeline.
+  static std::mutex group_by_result_mutex;
+  std::lock_guard<std::mutex> _gbr_lock(group_by_result_mutex);
 
   // Reading groupby columns based on the grouping set
   for (idx_t i = 0; i < groupings.size(); i++) {

@@ -14,6 +14,8 @@
 //
 // Build is gated by ENABLE_MAGI_TPCH; this TU is not compiled when off.
 
+#include <array>
+#include <barrier>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -21,6 +23,7 @@
 #include <cstring>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -421,6 +424,107 @@ size_t Q1MagiRun(const std::vector<PerGpuInputs>& inputs,
     });
   }
   return out.size();
+}
+
+// ── Per-GPU entry: each worker thread runs its own GPU's part ─────────────
+// Sirius's legacy executor spawns NUM_GPUS worker threads, one per GPU.
+// They all enter Sink in parallel, so the existing serial-from-one-thread
+// `Q1MagiRun` can't be reused as-is. We coordinate via a singleton
+// std::barrier that gathers inputs, lets all threads launch their own
+// GPU's kernel concurrently, and joins on session sync. After return,
+// each thread reads only its own GPU's agg_dev — those are already
+// hash-partitioned by (rf<<8)|ls % NUM_GPUS, so no cross-GPU merge is
+// needed; sirius concatenates each thread's slice for the final output.
+struct PerGpuExchange {
+  std::barrier<>             begin{NUM_GPUS};
+  std::barrier<>             after_session_start{NUM_GPUS};
+  std::barrier<>             end{NUM_GPUS};
+  std::array<PerGpuInputs, NUM_GPUS> inputs{};
+  uint64_t                   session_id = 0;
+};
+static PerGpuExchange& exchange()
+{
+  static PerGpuExchange e;
+  return e;
+}
+static std::mutex g_init_mu;
+
+size_t Q1MagiRunPerGpu(int                                gpu_id,
+                       const PerGpuInputs&                my_inputs,
+                       std::vector<AggResultRow>&         my_slice)
+{
+  // Init under a mutex so only one thread runs the lazy setup; the rest
+  // wait for it to finish before proceeding.
+  {
+    std::lock_guard<std::mutex> lk(g_init_mu);
+    Q1MagiInitOnce();
+  }
+  auto& s  = state();
+  auto& xc = exchange();
+
+  if (gpu_id < 0 || gpu_id >= NUM_GPUS) {
+    std::fprintf(stderr,
+                 "[magi-q1] Q1MagiRunPerGpu: bad gpu_id=%d (NUM_GPUS=%d)\n",
+                 gpu_id, NUM_GPUS);
+    return 0;
+  }
+
+  // Stash my input + decide the new session id.
+  xc.inputs[gpu_id] = my_inputs;
+  xc.begin.arrive_and_wait();
+
+  int gpu = s.gpu_ids[gpu_id];
+  CHECK_CUDA_ERR(cudaSetDevice(gpu));
+  CHECK_CUDA_ERR(cudaMemset(s.agg_dev[gpu], 0,
+                            ::q1::Q1_AGG_SLOTS * sizeof(::q1::Q1AggSlot)));
+  s.channels[gpu_id].set_tuple_size(sizeof(::q1::Q1Tuple));
+
+  // Bump the session counter once (thread 0 only) so all threads share
+  // the same session_id when calling sync_after_session below.
+  if (gpu_id == 0) {
+    s.sessions_done++;
+    xc.session_id = s.sessions_done;
+  }
+  xc.after_session_start.arrive_and_wait();
+
+  const auto& in = xc.inputs[gpu_id];
+  auto*       row_ids = GetIdentityRowIds(s, gpu, in.n_filtered);
+  ::q1::q1_kernel<Q1_BLOCK_SIZE,
+                  KBUFFERING_INTRA_PARTITION_SIZE,
+                  KBUFFERING_INTER_PARTITION_SIZE>
+      <<<USER_KERNEL_GRID_SIZE, Q1_BLOCK_SIZE, 0,
+         s.streams[gpu]>>>(row_ids,
+                           in.n_filtered,
+                           in.d_quantity, in.d_ep, in.d_disc, in.d_tax,
+                           in.rf_chars,   in.rf_offsets,
+                           in.ls_chars,   in.ls_offsets,
+                           s.agg_dev[gpu],
+                           /*just_load=*/false);
+  CHECK_CUDA_ERR(cudaStreamSynchronize(s.streams[gpu]));
+  s.channels[gpu_id].sync_after_session(s.endpoints[gpu], xc.session_id);
+
+  // Read my GPU's agg slice (hash-partitioned, no overlap with peers).
+  std::vector<::q1::Q1AggSlot> host(::q1::Q1_AGG_SLOTS);
+  CHECK_CUDA_ERR(cudaMemcpy(host.data(),
+                            s.agg_dev[gpu],
+                            ::q1::Q1_AGG_SLOTS * sizeof(::q1::Q1AggSlot),
+                            cudaMemcpyDeviceToHost));
+  my_slice.clear();
+  for (int j = 0; j < ::q1::Q1_AGG_SLOTS; ++j) {
+    if (host[j].count == 0) continue;
+    my_slice.push_back(AggResultRow{
+        /*rf=*/             j >> 8,
+        /*ls=*/             j & 0xff,
+        /*sum_qty=*/        host[j].sum_qty,
+        /*sum_ep=*/         host[j].sum_ep,
+        /*sum_disc=*/       host[j].sum_disc,
+        /*sum_disc_price=*/ host[j].sum_disc_price,
+        /*sum_charge=*/     host[j].sum_charge,
+        /*count=*/          host[j].count,
+    });
+  }
+  xc.end.arrive_and_wait();
+  return my_slice.size();
 }
 
 }  // namespace magi_q1

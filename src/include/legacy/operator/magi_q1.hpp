@@ -45,6 +45,16 @@ struct AggResultRow {
 size_t Q1MagiRun(const std::vector<PerGpuInputs>& inputs,
                  std::vector<AggResultRow>&        out);
 
+// Per-GPU entry. Each worker thread (one per legacy GPU) calls this with
+// its own partition's input pointers. Threads coordinate via a singleton
+// barrier; all NUM_GPUS threads must enter for any to make progress. On
+// return, `my_slice` holds only the (rf,ls) groups that hashed to this
+// GPU's partition — sirius's per-thread group_by_result concat then yields
+// the full result. Lazy-initialises the magi runtime on first call.
+size_t Q1MagiRunPerGpu(int                                gpu_id,
+                       const PerGpuInputs&                my_inputs,
+                       std::vector<AggResultRow>&         my_slice);
+
 // Diagnostic: prints sizeof(Q1Tuple), sizeof(Q1AggSlot), Q1_AGG_SLOTS
 // to stdout. Used by the original "smoke-test" path of CALL magi_q1().
 void Q1MagiHello();
