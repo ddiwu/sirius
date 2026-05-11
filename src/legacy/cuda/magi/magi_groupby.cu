@@ -114,21 +114,34 @@ void WriteSliceToColumns(int                                gpu_id,
 
   // ── Group keys (2 × VARCHAR(1)) ────────────────────────────────────────
   for (int kcol = 0; kcol < 2; ++kcol) {
-    auto* d_chars   = gbm->customCudaMalloc<uint8_t> (N == 0 ? 1 : N,     gpu_id, false);
-    auto* d_offsets = gbm->customCudaMalloc<uint64_t>(N + 1,              gpu_id, false);
-    std::vector<uint8_t>  h_chars(N == 0 ? 1 : N);
+    if (N == 0) {
+      // Empty slice: hand sirius a column with data=nullptr so the operator's
+      // combine branch picks the peer thread's non-empty column (instead of
+      // falling into combineMasks with garbage on N=0). At 4 GPUs with Q1's 4
+      // hash buckets some workers regularly get zero rows.
+      keys[kcol] = make_shared_ptr<GPUColumn>(0,
+                                              GPUColumnType(GPUColumnTypeId::VARCHAR),
+                                              /*data=*/nullptr,
+                                              /*offset=*/nullptr,
+                                              /*num_bytes=*/0,
+                                              /*is_string_data=*/true,
+                                              /*validity_mask=*/nullptr);
+      keys[kcol]->row_id_count = 0;
+      continue;
+    }
+    auto* d_chars   = gbm->customCudaMalloc<uint8_t> (N,     gpu_id, false);
+    auto* d_offsets = gbm->customCudaMalloc<uint64_t>(N + 1, gpu_id, false);
+    std::vector<uint8_t>  h_chars(N);
     std::vector<uint64_t> h_offsets(N + 1);
     for (size_t i = 0; i < N; ++i) {
       h_chars[i]   = static_cast<uint8_t>(kcol == 0 ? slice[i].rf : slice[i].ls);
       h_offsets[i] = i;
     }
     h_offsets[N] = N;
-    if (N > 0) {
-      cudaMemcpy(d_chars,   h_chars.data(),   N,                 cudaMemcpyHostToDevice);
-    }
+    cudaMemcpy(d_chars,   h_chars.data(),   N,                 cudaMemcpyHostToDevice);
     cudaMemcpy(d_offsets, h_offsets.data(), (N + 1) * sizeof(uint64_t),
                cudaMemcpyHostToDevice);
-    auto* mask = createNullMask(N == 0 ? 1 : N);  // ALL_VALID
+    auto* mask = createNullMask(N);  // ALL_VALID
     keys[kcol] = make_shared_ptr<GPUColumn>(N,
                                             GPUColumnType(GPUColumnTypeId::VARCHAR),
                                             d_chars,
@@ -136,33 +149,43 @@ void WriteSliceToColumns(int                                gpu_id,
                                             /*num_bytes=*/N,
                                             /*is_string_data=*/true,
                                             mask);
-    // GPUColumn ctor leaves row_id_count uninitialised; sirius downstream
-    // (PROJECTION's HandleMaterializeExpression) reads it. Force-zero here.
     keys[kcol]->row_id_count = 0;
   }
 
   // ── Aggregates: 4 SUM doubles (in planner-emit order) + COUNT_STAR ─────
   // Helper: write a vector of doubles to device and replace the column.
   auto write_double_col = [&](int agg_idx, const std::vector<double>& host) {
-    auto* d_buf = gbm->customCudaMalloc<double>(N == 0 ? 1 : N, gpu_id, false);
-    if (N > 0) {
-      cudaMemcpy(d_buf, host.data(), N * sizeof(double), cudaMemcpyHostToDevice);
+    if (N == 0) {
+      aggs[agg_idx] = make_shared_ptr<GPUColumn>(0,
+                                                 GPUColumnType(GPUColumnTypeId::FLOAT64),
+                                                 /*data=*/nullptr,
+                                                 /*validity_mask=*/nullptr);
+      aggs[agg_idx]->row_id_count = 0;
+      return;
     }
+    auto* d_buf = gbm->customCudaMalloc<double>(N, gpu_id, false);
+    cudaMemcpy(d_buf, host.data(), N * sizeof(double), cudaMemcpyHostToDevice);
     aggs[agg_idx] = make_shared_ptr<GPUColumn>(N,
                                                GPUColumnType(GPUColumnTypeId::FLOAT64),
                                                reinterpret_cast<uint8_t*>(d_buf),
-                                               createNullMask(N == 0 ? 1 : N));
+                                               createNullMask(N));
     aggs[agg_idx]->row_id_count = 0;
   };
   auto write_int64_col = [&](int agg_idx, const std::vector<uint64_t>& host) {
-    auto* d_buf = gbm->customCudaMalloc<uint64_t>(N == 0 ? 1 : N, gpu_id, false);
-    if (N > 0) {
-      cudaMemcpy(d_buf, host.data(), N * sizeof(uint64_t), cudaMemcpyHostToDevice);
+    if (N == 0) {
+      aggs[agg_idx] = make_shared_ptr<GPUColumn>(0,
+                                                 GPUColumnType(GPUColumnTypeId::INT64),
+                                                 /*data=*/nullptr,
+                                                 /*validity_mask=*/nullptr);
+      aggs[agg_idx]->row_id_count = 0;
+      return;
     }
+    auto* d_buf = gbm->customCudaMalloc<uint64_t>(N, gpu_id, false);
+    cudaMemcpy(d_buf, host.data(), N * sizeof(uint64_t), cudaMemcpyHostToDevice);
     aggs[agg_idx] = make_shared_ptr<GPUColumn>(N,
                                                GPUColumnType(GPUColumnTypeId::INT64),
                                                reinterpret_cast<uint8_t*>(d_buf),
-                                               createNullMask(N == 0 ? 1 : N));
+                                               createNullMask(N));
     aggs[agg_idx]->row_id_count = 0;
   };
 

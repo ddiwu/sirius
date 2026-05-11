@@ -456,9 +456,17 @@ void GPUBufferManager::customCudaFree(uint8_t* ptr, int gpu)
     return false;
   };
 
-  // Try caller-provided gpu first, then per-thread current GPU.
+  // Try caller-provided gpu first, then per-thread current GPU, then scan
+  // every allocation_table. The scan covers the cross-GPU free pattern
+  // introduced by magi_groupby — its per-thread output columns can be
+  // allocated on any GPU but get freed inside CombineColumns from a
+  // thread whose hint is GPU 0.
   if (try_dealloc(gpu)) return;
   if (gpu != sirius_current_gpu && try_dealloc(sirius_current_gpu)) return;
+  for (int g = 0; g < static_cast<int>(allocation_table.size()); ++g) {
+    if (g == gpu || g == sirius_current_gpu) continue;
+    if (try_dealloc(g)) return;
+  }
 
   // Not in any allocation_table — check locked tables and rmm_stored_buffers.
   for (int g = 0; g < static_cast<int>(mr_per_gpu.size()); ++g) {
