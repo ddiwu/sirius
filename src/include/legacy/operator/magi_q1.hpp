@@ -6,6 +6,8 @@
 #include <cstdint>
 #include <vector>
 
+#include "legacy/gpu_buffer_manager.hpp"  // kSiriusLegacyNumGpus
+
 namespace duckdb {
 namespace magi_q1 {
 
@@ -55,13 +57,11 @@ size_t Q1MagiRunPerGpu(int                                gpu_id,
                        const PerGpuInputs&                my_inputs,
                        std::vector<AggResultRow>&         my_slice);
 
-// Diagnostic: prints sizeof(Q1Tuple), sizeof(Q1AggSlot), Q1_AGG_SLOTS
-// to stdout. Used by the original "smoke-test" path of CALL magi_q1().
-void Q1MagiHello();
-
 // Number of GPUs the dispatcher expects, exposed so the sirius-side
-// driver can size its PerGpuInputs vector. Mirrored from q1_dispatcher.cu.
-constexpr int NUM_GPUS = 2;
+// driver can size its PerGpuInputs vector. Mirrored from q1_dispatcher.cu
+// which uses kSiriusLegacyNumGpus (set at cmake configure time via
+// -DSIRIUS_LEGACY_NUM_GPUS=N).
+constexpr int NUM_GPUS = kSiriusLegacyNumGpus;
 
 }  // namespace magi_q1
 }  // namespace duckdb

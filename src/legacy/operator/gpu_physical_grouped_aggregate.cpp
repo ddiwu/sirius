@@ -501,82 +501,38 @@ SinkResultType GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_
     }
   }
 
-  // group_by_result is shared across legacy worker threads (one per GPU);
-  // each thread's Sink merges its own slice into the shared accumulator.
-  // The cudf path tolerated this race because the cudf calls were slow
-  // enough that thread 0 finished assigning all columns before thread 1
-  // hit the combine branch. Magi's Sink is ~50ms vs cudf's hundreds of ms,
-  // so the race is exposed: thread 1 can see keys at length=4 (combined)
-  // while aggs are still at length=3 (not yet combined). cudf's table_view
-  // then rejects the table with "Column size mismatch" on the next pipeline.
-  static std::mutex group_by_result_mutex;
-  std::lock_guard<std::mutex> _gbr_lock(group_by_result_mutex);
-
-  // Reading groupby columns based on the grouping set
-  for (idx_t i = 0; i < groupings.size(); i++) {
-    for (int idx = 0; idx < grouping_sets[i].size(); idx++) {
-      // TODO: has to fix this for columns with partially NULL values
-      if (group_by_result->columns[idx] == nullptr) {
-        SIRIUS_LOG_DEBUG("Passing group by column {} to group by result column {}", idx, idx);
-        group_by_result->columns[idx]               = group_by_column[idx];
-        group_by_result->columns[idx]->row_ids      = nullptr;
-        group_by_result->columns[idx]->row_id_count = 0;
-      } else if (group_by_result->columns[idx] != nullptr) {
-        if (group_by_column[idx]->data_wrapper.data != nullptr &&
-            group_by_result->columns[idx]->data_wrapper.data != nullptr) {
-          SIRIUS_LOG_DEBUG("Combining group by column {} with group by result column {}", idx, idx);
-          group_by_result->columns[idx] =
-            CombineColumns(group_by_result->columns[idx], group_by_column[idx], gpuBufferManager);
-        } else if (group_by_column[idx]->data_wrapper.data != nullptr &&
-                   group_by_result->columns[idx]->data_wrapper.data == nullptr) {
-          SIRIUS_LOG_DEBUG("Passing group by column {} to group by result column {}", idx, idx);
-          group_by_result->columns[idx]               = group_by_column[idx];
-          group_by_result->columns[idx]->row_ids      = nullptr;
-          group_by_result->columns[idx]->row_id_count = 0;
-        } else {
-          SIRIUS_LOG_DEBUG("Group by column {} is null, skipping", idx);
-        }
-      }
-    }
+  // Per-worker slice storage (magi shuffles into disjoint partitions, so
+  // each worker has a non-overlapping (key, agg) slice). Storing it in
+  // per-GPU runtime state lets GetData emit each worker's slice directly
+  // — no shared accumulator, no Sink-side combine, no Sink/Source ordering
+  // race. The previous shared-`group_by_result` + per-worker re-emit path
+  // produced N_workers copies of the (partial) combined result downstream;
+  // the new path emits the magi partition once per worker, which together
+  // form the full result with no duplicates and full pipeline parallelism.
+  auto& rstate = runtime_state<GroupedAggregateRuntimeState>(sirius_current_gpu);
+  if (!rstate.slice) {
+    rstate.slice = make_shared_ptr<GPUIntermediateRelation>(
+        grouped_aggregate_data.groups.size() + aggregates.size());
   }
+  auto& slice = rstate.slice;
 
+  // Per-worker assignment (no cross-worker merge): magi has already
+  // partitioned the input so this worker's group_by_column[] /
+  // aggregate_column[] are its disjoint share of the final result.
+  // GetData below emits these directly. Each Sink call replaces the
+  // per-worker slice; in the current legacy flow Sink is invoked once per
+  // worker per query (one chunk = the worker's whole partition), so the
+  // overwrite is harmless.
+  for (idx_t i = 0; i < grouping_sets[0].size(); i++) {
+    slice->columns[i]                = group_by_column[i];
+    slice->columns[i]->row_ids       = nullptr;
+    slice->columns[i]->row_id_count  = 0;
+  }
   for (int aggr_idx = 0; aggr_idx < aggregates.size(); aggr_idx++) {
-    // TODO: has to fix this for columns with partially NULL values
-    if (group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx] == nullptr) {
-      SIRIUS_LOG_DEBUG("Passing aggregate column {} to group by result column {}",
-                       aggr_idx,
-                       grouped_aggregate_data.groups.size() + aggr_idx);
-      group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx] =
-        aggregate_column[aggr_idx];
-      group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx]->row_ids = nullptr;
-      group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx]->row_id_count = 0;
-    } else if (group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx] !=
-               nullptr) {
-      if (aggregate_column[aggr_idx]->data_wrapper.data != nullptr &&
-          group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx]
-              ->data_wrapper.data != nullptr) {
-        SIRIUS_LOG_DEBUG("Combining aggregate column {} with group by result column {}",
-                         aggr_idx,
-                         grouped_aggregate_data.groups.size() + aggr_idx);
-        group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx] =
-          CombineColumns(group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx],
-                         aggregate_column[aggr_idx],
-                         gpuBufferManager);
-      } else if (aggregate_column[aggr_idx]->data_wrapper.data != nullptr &&
-                 group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx]
-                     ->data_wrapper.data == nullptr) {
-        SIRIUS_LOG_DEBUG("Passing aggregate column {} to group by result column {}",
-                         aggr_idx,
-                         grouped_aggregate_data.groups.size() + aggr_idx);
-        group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx] =
-          aggregate_column[aggr_idx];
-        group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx]->row_ids =
-          nullptr;
-        group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx]->row_id_count = 0;
-      } else {
-        SIRIUS_LOG_DEBUG("Aggregate column {} is null, skipping", aggr_idx);
-      }
-    }
+    size_t col = grouped_aggregate_data.groups.size() + aggr_idx;
+    slice->columns[col]              = aggregate_column[aggr_idx];
+    slice->columns[col]->row_ids     = nullptr;
+    slice->columns[col]->row_id_count= 0;
   }
 
   auto end      = std::chrono::high_resolution_clock::now();
@@ -591,28 +547,19 @@ SourceResultType GPUPhysicalGroupedAggregate::GetData(
 {
   if (groupings.size() > 1) throw NotImplementedException("Multiple groupings not supported yet");
 
-  for (int col = 0; col < group_by_result->columns.size(); col++) {
-    SIRIUS_LOG_DEBUG("Writing group by result to column {}", col);
-    // output_relation.columns[col] = group_by_result->columns[col];
-    bool old_unique = group_by_result->columns[col]->is_unique;
-    if (group_by_result->columns[col]->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR) {
-      // output_relation.columns[col] = make_shared_ptr<GPUColumn>(
-      // 	group_by_result->columns[col]->column_length,
-      // group_by_result->columns[col]->data_wrapper.type,
-      // 	group_by_result->columns[col]->data_wrapper.data,
-      // group_by_result->columns[col]->data_wrapper.offset,
-      // 	group_by_result->columns[col]->data_wrapper.num_bytes, true,
-      // group_by_result->columns[col]->data_wrapper.validity_mask);
-      output_relation.columns[col] = make_shared_ptr<GPUColumn>(group_by_result->columns[col]);
-    } else {
-      // output_relation.columns[col] = make_shared_ptr<GPUColumn>(
-      // 	group_by_result->columns[col]->column_length,
-      // group_by_result->columns[col]->data_wrapper.type,
-      // 	group_by_result->columns[col]->data_wrapper.data, nullptr,
-      // group_by_result->columns[col]->data_wrapper.num_bytes, 	false,
-      // group_by_result->columns[col]->data_wrapper.validity_mask);
-      output_relation.columns[col] = make_shared_ptr<GPUColumn>(group_by_result->columns[col]);
-    }
+  // Per-worker emit: this worker emits only its own disjoint slice (magi
+  // partitions input by hash, so peers hold non-overlapping keys). Across
+  // all workers the union is the full result; downstream pipelines run in
+  // parallel per worker. See F1 note in M3 plan + GroupedAggregateRuntimeState.
+  auto& rstate = runtime_state<GroupedAggregateRuntimeState>(sirius_current_gpu);
+  if (!rstate.slice) {
+    throw NotImplementedException("GroupedAggregate::GetData called before Sink");
+  }
+  auto& slice = rstate.slice;
+  for (int col = 0; col < slice->columns.size(); col++) {
+    SIRIUS_LOG_DEBUG("Writing group by slice to column {}", col);
+    bool old_unique             = slice->columns[col]->is_unique;
+    output_relation.columns[col] = make_shared_ptr<GPUColumn>(slice->columns[col]);
     output_relation.columns[col]->is_unique = old_unique;
   }
 

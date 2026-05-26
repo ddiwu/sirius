@@ -58,6 +58,17 @@ void combineMasks(
 
 class ClientContext;
 
+// Per-GPU runtime state for grouped aggregate. Magi shuffles input rows
+// into per-GPU hash-disjoint partitions, so each worker thread's Sink
+// produces a disjoint slice of (key, agg) output rows. Storing the slice
+// per-worker (instead of merging into a shared `group_by_result`) lets
+// GetData emit each worker's slice independently — no Sink-side mutex,
+// no shared-state read race, full downstream pipeline parallelism across
+// workers.
+struct GroupedAggregateRuntimeState : OpRuntimeState {
+  shared_ptr<GPUIntermediateRelation> slice;
+};
+
 class GPUPhysicalGroupedAggregate : public GPUPhysicalOperator {
  public:
   GPUPhysicalGroupedAggregate(ClientContext& context,

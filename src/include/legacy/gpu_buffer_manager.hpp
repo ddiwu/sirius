@@ -38,7 +38,10 @@ using gpu_pool_memory_resource = rmm::mr::pool_memory_resource<rmm::mr::cuda_mem
 // in gpu_buffer_manager.cpp; exposed in the header so other layers
 // (operators, executor) can size per-GPU containers without taking a
 // runtime dependency on the singleton.
-constexpr int kSiriusLegacyNumGpus = 2;
+#ifndef SIRIUS_LEGACY_NUM_GPUS
+#define SIRIUS_LEGACY_NUM_GPUS 4
+#endif
+constexpr int kSiriusLegacyNumGpus = SIRIUS_LEGACY_NUM_GPUS;
 
 // Per-thread "current GPU" for the legacy execution path. Set by
 // GPUBufferManager::set_gpu_for_thread(g) at the start of a per-GPU worker.

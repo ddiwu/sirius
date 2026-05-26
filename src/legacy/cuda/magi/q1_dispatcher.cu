@@ -29,6 +29,8 @@
 
 #include <gdrapi.h>
 
+#include "gpu_buffer_manager.hpp"  // for kSiriusLegacyNumGpus
+#include "legacy/operator/magi_runtime_shared.hpp"  // ensures decl/def of magi_phys_gpu etc. match
 #include "data_plane/queries/q1.cuh"
 #include "data_plane/channel/channel_runtime.cuh"
 #include "data_plane/infra/endpoint.cuh"
@@ -50,7 +52,8 @@
 // in __shared__ CachedInputs at producer entry — those are uniform across
 // the block, so per-thread regs go down by ~16. With that fix, 1024 fits.
 namespace duckdb { namespace magi_q1 {
-constexpr int NUM_GPUS         = 2;
+// NUM_GPUS already declared in magi_q1.hpp (= kSiriusLegacyNumGpus); just
+// add the dispatcher-private partition + block size here.
 constexpr int PARTITIONS_COUNT = NUM_GPUS;
 constexpr int Q1_BLOCK_SIZE    = 1024;
 }}  // namespace duckdb::magi_q1
@@ -99,26 +102,25 @@ struct MagiState {
   uint64_t                          sessions_done = 0;
 };
 
-static MagiState& state()
+// Process-wide singleton. Exposed (non-static) so Q5/Q9/... dispatchers in
+// sibling .cu files share the same magi runtime (Endpoint, ChannelRuntime,
+// P2P, streams) instead of each query allocating its own ~18GB-per-GPU
+// staging — at 4-GPU SF=100 the second per-query runtime wouldn't fit.
+// Each query's own agg_dev still lives in that query's dispatcher TU.
+MagiState& magi_state()
 {
   static MagiState s;
   return s;
 }
 
-// ── Diagnostic stub kept for the original `CALL magi_q1()` smoke-test ──────
-void Q1MagiHello()
-{
-  std::printf("[magi-q1] tuple=%zuB slot=%zuB n_slots=%d num_gpus=%d\n",
-              sizeof(::q1::Q1Tuple),
-              sizeof(::q1::Q1AggSlot),
-              ::q1::Q1_AGG_SLOTS,
-              NUM_GPUS);
-}
-
 // ── One-shot init: builds Endpoints, paths, ChannelRuntimes ────────────────
-static void Q1MagiInitOnce()
+// Shared one-shot magi runtime init. Idempotent; first call from any
+// query's dispatcher builds Endpoints/Channels/P2P, subsequent calls
+// are no-ops. Per-query state (agg_dev) is allocated separately in the
+// caller's dispatcher TU.
+void MagiInitOnce()
 {
-  auto& s = state();
+  auto& s = magi_state();
   if (s.initialised) return;
 
   s.gdr = gdr_open_safe();  // GDR_COPY=0 in our build → returns nullptr (ok)
@@ -308,36 +310,23 @@ static uint64_t* GetIdentityRowIds(MagiState& s, int gpu, size_t n)
   return s.row_ids_dev[gpu];
 }
 
-// ── Public input/output structs (sirius side passes these in) ──────────────
-struct PerGpuInputs {
-  size_t          n_filtered;
-  const double*   d_quantity;
-  const double*   d_ep;
-  const double*   d_disc;
-  const double*   d_tax;
-  const uint8_t*  rf_chars;
-  const uint64_t* rf_offsets;
-  const uint8_t*  ls_chars;
-  const uint64_t* ls_offsets;
-};
+// Non-static wrapper for Q5/Q9/... dispatchers that need the same
+// identity row_ids on each GPU (sirius's per-GPU TableScan output is
+// already dense, so row_ids[i] = i works for every query).
+uint64_t* GetIdentityRowIdsShared(int gpu, size_t n)
+{
+  return GetIdentityRowIds(magi_state(), gpu, n);
+}
 
-struct AggResultRow {
-  int      rf;        // l_returnflag char value
-  int      ls;        // l_linestatus char value
-  double   sum_qty;
-  double   sum_ep;
-  double   sum_disc;
-  double   sum_disc_price;
-  double   sum_charge;
-  uint64_t count;
-};
+// PerGpuInputs / AggResultRow are now declared in magi_q1.hpp (pulled in
+// via magi_runtime_shared.hpp at the top). Removed local duplicates.
 
 // ── Run one Q1 query on the given per-GPU partitions ────────────────────────
 size_t Q1MagiRun(const std::vector<PerGpuInputs>& inputs,
                  std::vector<AggResultRow>&        out)
 {
-  Q1MagiInitOnce();
-  auto& s = state();
+  MagiInitOnce();
+  auto& s = magi_state();
 
   if (static_cast<int>(inputs.size()) != NUM_GPUS) {
     std::fprintf(stderr,
@@ -457,9 +446,9 @@ size_t Q1MagiRunPerGpu(int                                gpu_id,
   // wait for it to finish before proceeding.
   {
     std::lock_guard<std::mutex> lk(g_init_mu);
-    Q1MagiInitOnce();
+    MagiInitOnce();
   }
-  auto& s  = state();
+  auto& s  = magi_state();
   auto& xc = exchange();
 
   if (gpu_id < 0 || gpu_id >= NUM_GPUS) {
@@ -469,15 +458,28 @@ size_t Q1MagiRunPerGpu(int                                gpu_id,
     return 0;
   }
 
+  // ── Phase timing instrumentation (SIRIUS_MAGI_PROFILE=1 to enable) ─────
+  const bool profile = std::getenv("SIRIUS_MAGI_PROFILE") != nullptr;
+  auto T0 = std::chrono::high_resolution_clock::now();
+  auto tick = [&](const char* tag) {
+    if (!profile) return;
+    auto now = std::chrono::high_resolution_clock::now();
+    double us = std::chrono::duration<double, std::micro>(now - T0).count();
+    std::printf("[magi-prof gpu=%d] %-32s +%8.1f us\n", gpu_id, tag, us);
+    T0 = now;
+  };
+
   // Stash my input + decide the new session id.
   xc.inputs[gpu_id] = my_inputs;
   xc.begin.arrive_and_wait();
+  tick("phase B/begin barrier");
 
   int gpu = s.gpu_ids[gpu_id];
   CHECK_CUDA_ERR(cudaSetDevice(gpu));
   CHECK_CUDA_ERR(cudaMemset(s.agg_dev[gpu], 0,
                             ::q1::Q1_AGG_SLOTS * sizeof(::q1::Q1AggSlot)));
   s.channels[gpu_id].set_tuple_size(sizeof(::q1::Q1Tuple));
+  tick("phase C/cudaMemset+set_tuple");
 
   // Bump the session counter once (thread 0 only) so all threads share
   // the same session_id when calling sync_after_session below.
@@ -486,6 +488,7 @@ size_t Q1MagiRunPerGpu(int                                gpu_id,
     xc.session_id = s.sessions_done;
   }
   xc.after_session_start.arrive_and_wait();
+  tick("phase C/session barrier");
 
   const auto& in = xc.inputs[gpu_id];
   auto*       row_ids = GetIdentityRowIds(s, gpu, in.n_filtered);
@@ -501,7 +504,9 @@ size_t Q1MagiRunPerGpu(int                                gpu_id,
                            s.agg_dev[gpu],
                            /*just_load=*/false);
   CHECK_CUDA_ERR(cudaStreamSynchronize(s.streams[gpu]));
+  tick("phase D/q1_kernel + streamSync");
   s.channels[gpu_id].sync_after_session(s.endpoints[gpu], xc.session_id);
+  tick("phase E/sync_after_session");
 
   // Read my GPU's agg slice (hash-partitioned, no overlap with peers).
   std::vector<::q1::Q1AggSlot> host(::q1::Q1_AGG_SLOTS);
@@ -509,6 +514,7 @@ size_t Q1MagiRunPerGpu(int                                gpu_id,
                             s.agg_dev[gpu],
                             ::q1::Q1_AGG_SLOTS * sizeof(::q1::Q1AggSlot),
                             cudaMemcpyDeviceToHost));
+  tick("phase F/agg_dev D2H");
   my_slice.clear();
   for (int j = 0; j < ::q1::Q1_AGG_SLOTS; ++j) {
     if (host[j].count == 0) continue;
@@ -523,8 +529,46 @@ size_t Q1MagiRunPerGpu(int                                gpu_id,
         /*count=*/          host[j].count,
     });
   }
+  tick("phase F/scan non-empty slots");
   xc.end.arrive_and_wait();
+  tick("phase G/end barrier");
   return my_slice.size();
+}
+
+// ── Shared-runtime accessors (declared in magi_runtime_shared.hpp) ────────
+// These let q5_dispatcher.cu / future qN_dispatcher.cu reach into the
+// magi runtime singleton without seeing MagiState's full definition or
+// the magi template headers.
+
+int magi_phys_gpu(int gpu_id)
+{
+  auto& s = magi_state();
+  return s.gpu_ids[gpu_id];
+}
+
+cudaStream_t magi_stream(int gpu_id)
+{
+  auto& s = magi_state();
+  return s.streams[s.gpu_ids[gpu_id]];
+}
+
+void magi_set_tuple_size(int gpu_id, std::size_t tuple_bytes)
+{
+  auto& s = magi_state();
+  s.channels[gpu_id].set_tuple_size(tuple_bytes);
+}
+
+std::uint64_t magi_bump_session()
+{
+  auto& s = magi_state();
+  return ++s.sessions_done;
+}
+
+void magi_sync_after_session(int gpu_id, std::uint64_t session_id)
+{
+  auto& s = magi_state();
+  int gpu = s.gpu_ids[gpu_id];
+  s.channels[gpu_id].sync_after_session(s.endpoints[gpu], session_id);
 }
 
 }  // namespace magi_q1

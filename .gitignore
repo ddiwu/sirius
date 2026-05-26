@@ -35,3 +35,9 @@ compile_commands.json
 
 # Zed editor settings
 .zed
+
+# Local-only design / benchmark reports — not for the public repo
+docs/magi_q1_m2_report.md
+docs/M2_magi_ops_report.md
+docs/M3_plan.md
+docs/Q5_checkpoint.md
