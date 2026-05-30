@@ -92,6 +92,8 @@ option(ENABLE_MAGI_TPCH
 if(ENABLE_MAGI_TPCH)
   list(APPEND SIRIUS_LEGACY_CUDA_SOURCES
        ${CMAKE_CURRENT_LIST_DIR}/cuda/magi/q1_dispatcher.cu
+       ${CMAKE_CURRENT_LIST_DIR}/cuda/magi/q5_dispatcher.cu
+       ${CMAKE_CURRENT_LIST_DIR}/cuda/magi/magi_groupby_runtime.cu
        ${CMAKE_CURRENT_LIST_DIR}/cuda/magi/magi_groupby.cu)
 
   # Magi data-plane header tree (data_plane/api, data_plane/queries, ...).

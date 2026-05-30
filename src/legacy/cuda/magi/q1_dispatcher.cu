@@ -118,8 +118,16 @@ MagiState& magi_state()
 // query's dispatcher builds Endpoints/Channels/P2P, subsequent calls
 // are no-ops. Per-query state (agg_dev) is allocated separately in the
 // caller's dispatcher TU.
+//
+// Thread-safe: the per-GPU sirius worker threads all call this on the
+// first magi query, and earlier versions relied on the caller wrapping
+// in a mutex. Internal locking lets Q5/Q9/... dispatchers call without
+// duplicating the boilerplate (and without each constructing its own
+// Endpoint set under a race).
 void MagiInitOnce()
 {
+  static std::mutex s_init_mu;
+  std::lock_guard<std::mutex> lk(s_init_mu);
   auto& s = magi_state();
   if (s.initialised) return;
 
