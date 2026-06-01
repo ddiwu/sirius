@@ -8,7 +8,16 @@
 option(ENABLE_LEGACY_SIRIUS
        "Enable legacy Sirius code path (gpu_processing table function)" OFF)
 
+# How many GPUs the legacy magi runtime is built for. Compile-time so the
+# barrier / endpoint template sizes are constant. Pass `-DSIRIUS_LEGACY_NUM_GPUS=N`
+# at configure time; defaults to the header's #define when unset. The actual
+# `target_compile_definitions` happens in the parent CMakeLists.txt after
+# `build_static_extension(sirius …)` creates the sirius_extension target.
+set(SIRIUS_LEGACY_NUM_GPUS "" CACHE STRING
+    "Number of GPUs the legacy magi runtime targets (empty = header default)")
+
 if(ENABLE_LEGACY_SIRIUS)
+
   # Sources compiled only when the legacy entry point is enabled.
   # cmake-format: off
 set(SIRIUS_LEGACY_SOURCES

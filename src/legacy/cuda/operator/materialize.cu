@@ -297,6 +297,40 @@ template __global__ void materialize_expression_with_null<uint8_t, BLOCK_THREADS
   uint32_t* out_mask,
   uint64_t* row_ids,
   uint64_t N);
+// int64_t (BIGINT + DECIMAL(width ≤ 18) source) was missing — under
+// CUDA_SEPARABLE_COMPILATION the kernel template needs explicit
+// instantiation in the TU that defines it, otherwise the launch resolves
+// to a no-op at device-link time, leaving the result buffer at RMM pool
+// init state (typically 0xFF…FF, surfaces as -1 sentinel garbage). This
+// broke Q11-class queries (filter on BIGINT key) which fell through to
+// the with_null path because the source column carries a validity mask.
+template __global__ void materialize_expression_with_null<int64_t, BLOCK_THREADS, ITEMS_PER_THREAD>(
+  const int64_t* a,
+  int64_t* result,
+  uint32_t* mask,
+  uint32_t* out_mask,
+  uint64_t* row_ids,
+  uint64_t N);
+// int16_t (INT16 source) — same story; instantiate to keep the helper
+// matrix complete for all integer column types sirius materializes.
+template __global__ void materialize_expression_with_null<int16_t, BLOCK_THREADS, ITEMS_PER_THREAD>(
+  const int16_t* a,
+  int16_t* result,
+  uint32_t* mask,
+  uint32_t* out_mask,
+  uint64_t* row_ids,
+  uint64_t N);
+// __int128_t (DECIMAL width > 18) — kernel uses the type only via store;
+// instantiate so DECIMAL(38, *) columns also materialize correctly when
+// they carry a validity mask.
+template __global__ void
+materialize_expression_with_null<__int128_t, BLOCK_THREADS, ITEMS_PER_THREAD>(
+  const __int128_t* a,
+  __int128_t* result,
+  uint32_t* mask,
+  uint32_t* out_mask,
+  uint64_t* row_ids,
+  uint64_t N);
 
 template <typename T>
 void materializeWithoutNull(T* a, T*& result, uint64_t* row_ids, uint64_t result_len)

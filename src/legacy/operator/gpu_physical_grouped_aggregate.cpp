@@ -469,35 +469,34 @@ SinkResultType GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_
     aggr_idx++;
   }
 
-  // Execute only if input is not empty
-  if (column_size > 0) {
-    // bool can_use_sirius_impl = CheckGroupKeyTypesForSiriusImpl(group_by_column);
-    if (aggregates.size() == 0) {
-      // if (can_use_sirius_impl) {
-      // 	HandleDuplicateElimination(group_by_column, gpuBufferManager, num_group_keys);
-      // } else {
-      // HandleGroupByAggregateCuDF(group_by_column, aggregate_column, gpuBufferManager, aggregates,
-      // num_group_keys);
-      // }
+  if (aggregates.size() == 0) {
+    // Distinct-only path (no aggregates). Pure-local cudf — gate on
+    // column_size > 0; no cross-GPU coordination needed.
+    if (column_size > 0) {
       if (group_by_column[0]->column_length > INT32_MAX) {
         throw NotImplementedException(
           "Group by column length or aggregate column length is too large for CuDF");
       } else {
         HandleDuplicateEliminationCuDF(group_by_column, gpuBufferManager, num_group_keys);
       }
+    }
+  } else {
+    // Aggregate path goes through magi's distributed groupby. ALL per-GPU
+    // workers must enter even when this GPU's partition is empty —
+    // magi_groupby::Run's NUM_GPUS-way barrier needs every worker present
+    // or it deadlocks. The kernel handles n_filtered=0 (Stage 1 trivially
+    // skips; Stage 2/3 still send EOF so peers can complete).
+    if (group_by_column[0]->column_length > INT32_MAX ||
+        (aggregate_column[0] && aggregate_column[0]->column_length > INT32_MAX)) {
+      throw NotImplementedException(
+        "Group by column length or aggregate column length is too large for CuDF");
     } else {
-      if (group_by_column[0]->column_length > INT32_MAX ||
-          aggregate_column[0]->column_length > INT32_MAX) {
-        throw NotImplementedException(
-          "Group by column length or aggregate column length is too large for CuDF");
-      } else {
-        HandleGroupByAggregateCuDF(group_by_column,
-                                   aggregate_column,
-                                   gpuBufferManager,
-                                   aggregates,
-                                   num_group_keys,
-                                   estimated_cardinality);
-      }
+      HandleGroupByAggregateCuDF(group_by_column,
+                                 aggregate_column,
+                                 gpuBufferManager,
+                                 aggregates,
+                                 num_group_keys,
+                                 estimated_cardinality);
     }
   }
 

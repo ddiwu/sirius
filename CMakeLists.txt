@@ -268,6 +268,15 @@ build_loadable_extension(sirius CPP ${EXTENSION_SOURCES} ${CUDA_SOURCES})
 
 # Shared configuration for both extension targets
 foreach(_target sirius_extension sirius_loadable_extension)
+  # Pipe legacy/CMakeLists.txt's `SIRIUS_LEGACY_NUM_GPUS` cache var into the
+  # preprocessor so `#define SIRIUS_LEGACY_NUM_GPUS N` is consistent across
+  # all TUs in this build directory. The header's #ifndef fallback (= 4)
+  # still wins if the cache var is empty.
+  if(SIRIUS_LEGACY_NUM_GPUS)
+    target_compile_definitions(${_target}
+      PRIVATE SIRIUS_LEGACY_NUM_GPUS=${SIRIUS_LEGACY_NUM_GPUS})
+  endif()
+
   set_target_properties(
     ${_target}
     PROPERTIES CXX_STANDARD 20
