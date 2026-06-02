@@ -1268,6 +1268,7 @@ void GPUPhysicalTableScan::ScanDataDuckDBOpt(ExecutionContext& exec_context,
     // is a dense permutation of [0, num_rows) (true for base tables without
     // deletes; the previous GPU reorder kernel made the same assumption).
     bool reorder_ids_dense = true;
+    auto reorder_t0        = std::chrono::high_resolution_clock::now();
     if (scan_duckdb_storage_row_ids) {
       const int64_t* ids = duckdb_storage_row_ids_ptr;
       {
@@ -1347,6 +1348,18 @@ void GPUPhysicalTableScan::ScanDataDuckDBOpt(ExecutionContext& exec_context,
           data_ptr[col] = dst;
         }
       }
+    }
+    if (scan_duckdb_storage_row_ids) {
+      auto reorder_ms = std::chrono::duration_cast<std::chrono::microseconds>(
+                          std::chrono::high_resolution_clock::now() - reorder_t0)
+                          .count() /
+                        1000.0;
+      SIRIUS_LOG_DEBUG("TableScan host reorder to storage order: table={} num_rows={} cols={} "
+                       "took {:.2f} ms",
+                       table_name,
+                       num_rows,
+                       static_cast<int>(column_ids.size() - gen_row_id_column),
+                       reorder_ms);
     }
 
     // ----- Phase 1: per-GPU partitioned upload -----
