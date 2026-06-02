@@ -436,7 +436,8 @@ magi_generic::PerGpuInputs BuildGenericInputs(
     const vector<shared_ptr<GPUColumn>>& keys,
     const vector<shared_ptr<GPUColumn>>& aggs,
     int                                  num_group_keys,
-    int                                  num_aggregates)
+    int                                  num_aggregates,
+    sirius::AggregationType*             agg_mode)
 {
   magi_generic::PerGpuInputs in{};
   in.n_filtered = keys[0]->column_length;
@@ -479,28 +480,46 @@ magi_generic::PerGpuInputs BuildGenericInputs(
           ? reinterpret_cast<const uint32_t*>(keys[0]->data_wrapper.validity_mask)
           : nullptr;
 
-  // Aggregate input columns. FLOAT64 → d_cols[] (SUM_DOUBLE source);
-  // INT64 (incl. DECIMAL with width ≤ 18, stored as int64) → i64_agg_cols[]
-  // (SUM_INT64 source). COUNT_STAR has no backing column (nullptr in aggs[]).
-  // Other types throw at BuildAggOpsTable so this stays quiet.
-  int d_idx   = 0;
+  // Aggregate input columns, assigned in lockstep with BuildAggOpsTable so the
+  // AggOpEntry.src_col_idx values line up on EVERY GPU — including one whose
+  // post-filter slice is empty (the column object still exists with its type,
+  // but data == nullptr). We keep the typed slot for such a column (pointer
+  // left null); Stage-1 producer reads 0 local rows there and never
+  // dereferences it. Skipping empties (as the old code did) desynchronised the
+  // per-GPU ops tables, so keys shuffled to an empty-input GPU were never
+  // merged (they came back as 0). We key off the column TYPE, not its data
+  // pointer, since the type survives an empty slice.
+  //   SUM(FLOAT64) → d_cols[];  SUM(INT64/DECIMAL≤18) → i64_agg_cols[];
+  //   MIN/MAX      → d_cols[];  COUNT_STAR/COUNT       → no source column.
+  int d_idx    = 0;
   int i64a_idx = 0;
   for (int a = 0; a < num_aggregates; ++a) {
-    if (!aggs[a] || aggs[a]->data_wrapper.data == nullptr) continue;
-    const auto id = aggs[a]->data_wrapper.type.id();
-    if (id == GPUColumnTypeId::FLOAT64) {
-      in.cols.d_cols[d_idx++] =
-          reinterpret_cast<const double*>(aggs[a]->data_wrapper.data);
-    } else if (id == GPUColumnTypeId::INT64 || id == GPUColumnTypeId::DECIMAL) {
-      // DECIMAL with width ≤ 18 is stored as int64 (× 10^scale); the int64
-      // cast is sound. Wider DECIMAL (int128 storage) would alias as bad
-      // pointer arithmetic — reject at BuildAggOpsTable below.
-      in.cols.i64_agg_cols[i64a_idx++] =
-          reinterpret_cast<const int64_t*>(aggs[a]->data_wrapper.data);
+    switch (agg_mode[a]) {
+      case sirius::AggregationType::SUM: {
+        const auto  id   = aggs[a] ? aggs[a]->data_wrapper.type.id()
+                                   : GPUColumnTypeId::FLOAT64;
+        const void* data = aggs[a] ? aggs[a]->data_wrapper.data : nullptr;
+        if (id == GPUColumnTypeId::INT64 || id == GPUColumnTypeId::DECIMAL) {
+          in.cols.i64_agg_cols[i64a_idx++] = reinterpret_cast<const int64_t*>(data);
+        } else {
+          in.cols.d_cols[d_idx++] = reinterpret_cast<const double*>(data);
+        }
+        break;
+      }
+      case sirius::AggregationType::MIN:
+      case sirius::AggregationType::MAX: {
+        const void* data = aggs[a] ? aggs[a]->data_wrapper.data : nullptr;
+        in.cols.d_cols[d_idx++] = reinterpret_cast<const double*>(data);
+        break;
+      }
+      case sirius::AggregationType::COUNT_STAR:
+      case sirius::AggregationType::COUNT:
+        // No source column (AggOpEntry.src_col_idx == -1).
+        break;
+      default:
+        // Unsupported modes throw in BuildAggOpsTable; nothing to assign here.
+        break;
     }
-    // Other types (INT32, FLOAT32, etc.) silently skipped here; the
-    // corresponding entry in BuildAggOpsTable will throw with a clear
-    // message.
   }
   in.cols.n_doubles    = d_idx;
   in.cols.n_int64_aggs = i64a_idx;
@@ -527,8 +546,12 @@ std::vector<magi_ops::AggOpEntry> BuildAggOpsTable(
     magi_ops::AggOpEntry e{};
     switch (agg_mode[a]) {
       case sirius::AggregationType::SUM: {
-        if (!aggs[a] || aggs[a]->data_wrapper.data == nullptr) continue;
-        const auto id = aggs[a]->data_wrapper.type.id();
+        // Build the op from the column TYPE (preserved even when this GPU's
+        // post-filter slice is empty / data == nullptr) so dst_slot_idx and
+        // src_col_idx stay identical across GPUs. Skipping empties here would
+        // desync the consumer ops table and zero out shuffled groups.
+        const auto id = aggs[a] ? aggs[a]->data_wrapper.type.id()
+                                : GPUColumnTypeId::FLOAT64;
         if (id == GPUColumnTypeId::FLOAT64) {
           e.kind         = magi_ops::AggKind::SUM_DOUBLE;
           e.src_col_idx  = static_cast<int8_t>(d_idx++);
@@ -565,13 +588,11 @@ std::vector<magi_ops::AggOpEntry> BuildAggOpsTable(
         e.dst_slot_idx = static_cast<int8_t>(dst_idx++);
         break;
       case sirius::AggregationType::MIN:
-        if (!aggs[a] || aggs[a]->data_wrapper.data == nullptr) continue;
         e.kind         = magi_ops::AggKind::MIN_DOUBLE;
         e.src_col_idx  = static_cast<int8_t>(d_idx++);
         e.dst_slot_idx = static_cast<int8_t>(dst_idx++);
         break;
       case sirius::AggregationType::MAX:
-        if (!aggs[a] || aggs[a]->data_wrapper.data == nullptr) continue;
         e.kind         = magi_ops::AggKind::MAX_DOUBLE;
         e.src_col_idx  = static_cast<int8_t>(d_idx++);
         e.dst_slot_idx = static_cast<int8_t>(dst_idx++);
@@ -803,18 +824,28 @@ void WriteGenericSliceToColumns(int                                             
       case sirius::AggregationType::SUM:
       case sirius::AggregationType::MIN:
       case sirius::AggregationType::MAX: {
+        // Derive the output type from the input column's *type*, not its data
+        // pointer: on a GPU whose post-filter slice is empty the input column
+        // has data == nullptr but its type (e.g. DECIMAL) is still set. Keying
+        // off the data pointer here would wrongly fall back to FLOAT64 and
+        // emit a column whose type disagrees with the other GPUs / the DuckDB
+        // plan. Capture the DECIMAL {width, scale} now, because EmitInt64AggCol
+        // replaces aggs[a] (out_col is by-reference) with a fresh INT64 column.
         const auto in_id =
-            (aggs[a] && aggs[a]->data_wrapper.data)
-                ? aggs[a]->data_wrapper.type.id()
-                : GPUColumnTypeId::FLOAT64;
+            aggs[a] ? aggs[a]->data_wrapper.type.id() : GPUColumnTypeId::FLOAT64;
+        const auto* in_dti =
+            (in_id == GPUColumnTypeId::DECIMAL && aggs[a])
+                ? aggs[a]->data_wrapper.type.GetDecimalTypeInfo()
+                : nullptr;
+        const int dti_w = in_dti ? in_dti->width_ : 0;
+        const int dti_s = in_dti ? in_dti->scale_ : 0;
         if (in_id == GPUColumnTypeId::INT64 || in_id == GPUColumnTypeId::DECIMAL) {
           EmitInt64AggCol(gpu_id, N, slice, dst_idx++, aggs[a], gbm);
-          // Preserve DECIMAL {width, scale} metadata on the output column.
-          if (in_id == GPUColumnTypeId::DECIMAL && aggs[a] &&
-              aggs[a]->data_wrapper.type.GetDecimalTypeInfo()) {
-            const auto* dti = aggs[a]->data_wrapper.type.GetDecimalTypeInfo();
+          // Re-tag the (freshly emitted) output column with the input's DECIMAL
+          // {width, scale} so result_collector treats it as DECIMAL, not INT64.
+          if (in_id == GPUColumnTypeId::DECIMAL && in_dti && aggs[a]) {
             aggs[a]->data_wrapper.type = GPUColumnType(GPUColumnTypeId::DECIMAL);
-            aggs[a]->data_wrapper.type.SetDecimalTypeInfo(dti->width_, dti->scale_);
+            aggs[a]->data_wrapper.type.SetDecimalTypeInfo(dti_w, dti_s);
           }
         } else {
           EmitDoubleAggCol(gpu_id, N, slice, dst_idx++, aggs[a], gbm);
@@ -891,7 +922,7 @@ void Run(int                                gpu_id,
       PickTableSize(group_by_keys, num_group_keys);
 
   auto in   = BuildGenericInputs(group_by_keys, aggregate_keys,
-                                  num_group_keys, num_aggregates);
+                                  num_group_keys, num_aggregates, agg_mode);
   auto ops  = BuildAggOpsTable(aggregate_keys, num_aggregates, agg_mode);
   std::vector<magi_generic::AggResultRow> slice;
   magi_generic::distributed_hash_groupby_run_per_gpu(
