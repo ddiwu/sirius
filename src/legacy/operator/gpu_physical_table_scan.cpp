@@ -1245,6 +1245,110 @@ void GPUPhysicalTableScan::ScanDataDuckDBOpt(ExecutionContext& exec_context,
       scanned_types = orig_scanned_types;
     }
 
+    // ----- Reorder host buffers from parallel-scan arrival order into DuckDB
+    // storage-row order, BEFORE partitioning. -----
+    //
+    // The multi-threaded coalesce scan above appended each chunk at an
+    // arbitrary arrival offset (whichever thread grabbed the atomic row
+    // counter first), so data_ptr / mask_ptr / offset_ptr are in "arrival
+    // order". Different scans of the same table produce different arrival
+    // orders, so to keep separately-cached columns row-aligned we rewrite every
+    // freshly scanned column into one canonical order: the DuckDB storage row
+    // id.
+    //
+    // We do this here, on the full host buffer, instead of with a GPU gather
+    // after the per-GPU partition. The partition below then merely slices a
+    // storage-ordered buffer by row range, so each GPU owns a contiguous
+    // storage-row range and no GPU ever needs the whole column. (The old
+    // GPU-side reorder gathered global storage indices against a per-GPU slice,
+    // reading out of bounds; it also only ran on one GPU, leaving the others in
+    // arrival order.)
+    //
+    // duckdb_storage_row_ids_ptr[k] = storage id of arrival row k. We assume it
+    // is a dense permutation of [0, num_rows) (true for base tables without
+    // deletes; the previous GPU reorder kernel made the same assumption).
+    bool reorder_ids_dense = true;
+    if (scan_duckdb_storage_row_ids) {
+      const int64_t* ids = duckdb_storage_row_ids_ptr;
+      {
+        int64_t mn = (num_rows > 0) ? ids[0] : 0, mx = mn;
+        for (uint64_t k = 0; k < num_rows; ++k) {
+          mn = std::min(mn, ids[k]);
+          mx = std::max(mx, ids[k]);
+        }
+        reorder_ids_dense = (mn == 0 && static_cast<uint64_t>(mx) == num_rows - 1);
+        if (!reorder_ids_dense) {
+          SIRIUS_LOG_WARN(
+            "TableScan reorder: storage row ids not a dense [0,num_rows) permutation "
+            "(table={}, num_rows={}, min={}, max={}); skipping reorder to avoid OOB scatter",
+            table_name,
+            num_rows,
+            mn,
+            mx);
+        }
+      }
+      for (int col = 0; reorder_ids_dense && col < column_ids.size() - gen_row_id_column; col++) {
+        if (already_cached[col]) continue;
+
+        // validity mask: scatter bit k (arrival) -> bit ids[k] (storage)
+        if (mask_ptr[col] != nullptr && mask_size[col] > 0) {
+          uint8_t* dst_mask = gpuBufferManager->customCudaHostAlloc<uint8_t>(mask_size[col]);
+          memset(dst_mask, 0, mask_size[col]);
+          const uint8_t* src_mask = mask_ptr[col];
+          for (uint64_t k = 0; k < num_rows; ++k) {
+            if ((src_mask[k >> 3] >> (k & 7)) & 1u) {
+              uint64_t r = static_cast<uint64_t>(ids[k]);
+              dst_mask[r >> 3] |= (1u << (r & 7));
+            }
+          }
+          mask_ptr[col] = dst_mask;
+        }
+
+        if (scanned_types[col].id() == LogicalTypeId::VARCHAR) {
+          // offset_ptr holds per-row LENGTHS at arrival positions
+          // (offset_ptr[k+1] = len of arrival row k); data_ptr holds chars
+          // packed in arrival order. Produce storage-order lengths + chars.
+          uint64_t*      arr_len     = offset_ptr[col];  // arr_len[k+1] = len(arrival k)
+          const uint8_t* src_chars   = data_ptr[col];
+          uint64_t       total_chars = column_size[col];
+
+          uint64_t* sto_off   = gpuBufferManager->customCudaHostAlloc<uint64_t>(num_rows + 1);
+          uint8_t*  dst_chars = gpuBufferManager->customCudaHostAlloc<uint8_t>(
+            std::max<uint64_t>(total_chars, 1));
+          // storage-order lengths, then prefix sum into cumulative byte offsets
+          for (uint64_t r = 0; r <= num_rows; ++r) sto_off[r] = 0;
+          for (uint64_t k = 0; k < num_rows; ++k) {
+            sto_off[static_cast<uint64_t>(ids[k]) + 1] = arr_len[k + 1];
+          }
+          for (uint64_t r = 1; r <= num_rows; ++r) sto_off[r] += sto_off[r - 1];
+          // copy each arrival string into its storage slot
+          uint64_t acum = 0;
+          for (uint64_t k = 0; k < num_rows; ++k) {
+            uint64_t len = arr_len[k + 1];
+            uint64_t r   = static_cast<uint64_t>(ids[k]);
+            if (len > 0) { memcpy(dst_chars + sto_off[r], src_chars + acum, len); }
+            acum += len;
+          }
+          // Re-express offset_ptr as storage-order LENGTHS so the existing
+          // prefix sum below reproduces the cumulative offsets in place.
+          offset_ptr[col][0] = 0;
+          for (uint64_t r = 0; r < num_rows; ++r) {
+            offset_ptr[col][r + 1] = sto_off[r + 1] - sto_off[r];
+          }
+          data_ptr[col] = dst_chars;
+        } else {
+          // fixed width: scatter row k (arrival) -> row ids[k] (storage)
+          const size_t   width = column_size[col] / num_rows;
+          uint8_t*       dst   = gpuBufferManager->customCudaHostAlloc<uint8_t>(column_size[col]);
+          const uint8_t* src   = data_ptr[col];
+          for (uint64_t k = 0; k < num_rows; ++k) {
+            memcpy(dst + static_cast<uint64_t>(ids[k]) * width, src + k * width, width);
+          }
+          data_ptr[col] = dst;
+        }
+      }
+    }
+
     // ----- Phase 1: per-GPU partitioned upload -----
     //
     // The HOST buffers `data_ptr[col]` / `mask_ptr[col]` were filled by the
@@ -1269,7 +1373,8 @@ void GPUPhysicalTableScan::ScanDataDuckDBOpt(ExecutionContext& exec_context,
     // Limitations:
     //   * Per-GPU row count rounded up to a multiple of 8 so each GPU's mask
     //     slice starts on a byte boundary. Last GPU may end up with fewer rows.
-    //   * scan_duckdb_storage_row_ids reorder branch is not partitioned.
+    //   * Buffers are already in DuckDB storage-row order (reordered on the host
+    //     above), so each GPU's row range maps to a contiguous storage range.
     const int NUM_G = static_cast<int>(gpuBufferManager->tables_per_gpu.size());
     bool any_varchar = false;
     for (int col = 0; col < column_ids.size() - gen_row_id_column; col++) {
@@ -1433,22 +1538,6 @@ void GPUPhysicalTableScan::ScanDataDuckDBOpt(ExecutionContext& exec_context,
       }
     }
     cudaSetDevice(0);
-    // For duckdb storage row ids
-    int64_t* d_duckdb_storage_row_ids_ptr = nullptr;
-    if (scan_duckdb_storage_row_ids) {
-      d_duckdb_storage_row_ids_ptr = gpuBufferManager->customCudaMalloc<int64_t>(num_rows, 0, 0);
-      uint64_t write_offset        = 0;
-      while (write_offset < sizeof(int64_t) * num_rows) {
-        uint64_t write_len = std::min(Config::OPT_TABLE_SCAN_CUDA_MEMCPY_SIZE,
-                                      sizeof(int64_t) * num_rows - write_offset);
-        cudaMemcpyAsync(reinterpret_cast<uint8_t*>(d_duckdb_storage_row_ids_ptr) + write_offset,
-                        reinterpret_cast<uint8_t*>(duckdb_storage_row_ids_ptr) + write_offset,
-                        write_len,
-                        cudaMemcpyHostToDevice,
-                        cuda_streams[num_cuda_memcpy++ % Config::OPT_TABLE_SCAN_NUM_CUDA_STREAMS]);
-        write_offset += write_len;
-      }
-    }
     cudaDeviceSynchronize();
 
     // (No GPU prefix sum needed — VARCHAR offsets were prefix-summed on host
@@ -1500,79 +1589,9 @@ void GPUPhysicalTableScan::ScanDataDuckDBOpt(ExecutionContext& exec_context,
       }
     }
 
-    // Align the row order of scanned columns according to duckdb storage row ids if required
-    if (scan_duckdb_storage_row_ids) {
-      // Get output indices of reordering based on duckdb storage row ids
-      uint64_t* reorder_row_ids_out_indices =
-        gpuBufferManager->customCudaMalloc<uint64_t>(num_rows, 0, 0);
-      reorderRowIds(d_duckdb_storage_row_ids_ptr, reorder_row_ids_out_indices, num_rows);
-      // Reorder each scanned column
-      for (int col : uncached_scan_column_ids) {
-        // Materialize column
-        table->columns[col]->row_ids      = reorder_row_ids_out_indices;
-        table->columns[col]->row_id_count = num_rows;
-        auto reordered_column = HandleMaterializeExpression(table->columns[col], gpuBufferManager);
-        // Copy materialized column (in processing region) to cached column (caching region)
-        num_cuda_memcpy       = 0;
-        uint64_t write_offset = 0;
-        while (write_offset < table->columns[col]->data_wrapper.num_bytes) {
-          uint64_t write_len = std::min(Config::OPT_TABLE_SCAN_CUDA_MEMCPY_SIZE,
-                                        table->columns[col]->data_wrapper.num_bytes - write_offset);
-          cudaMemcpyAsync(
-            table->columns[col]->data_wrapper.data + write_offset,
-            reordered_column->data_wrapper.data + write_offset,
-            write_len,
-            cudaMemcpyDeviceToDevice,
-            cuda_streams[num_cuda_memcpy++ % Config::OPT_TABLE_SCAN_NUM_CUDA_STREAMS]);
-          write_offset += write_len;
-        }
-        if (table->columns[col]->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR) {
-          write_offset = 0;
-          while (write_offset < sizeof(uint64_t) * (num_rows + 1)) {
-            uint64_t write_len = std::min(Config::OPT_TABLE_SCAN_CUDA_MEMCPY_SIZE,
-                                          sizeof(uint64_t) * (num_rows + 1) - write_offset);
-            cudaMemcpyAsync(
-              reinterpret_cast<uint8_t*>(table->columns[col]->data_wrapper.offset) + write_offset,
-              reinterpret_cast<uint8_t*>(reordered_column->data_wrapper.offset) + write_offset,
-              write_len,
-              cudaMemcpyDeviceToDevice,
-              cuda_streams[num_cuda_memcpy++ % Config::OPT_TABLE_SCAN_NUM_CUDA_STREAMS]);
-            write_offset += write_len;
-          }
-        }
-        if (table->columns[col]->data_wrapper.validity_mask != nullptr) {
-          write_offset = 0;
-          while (write_offset < table->columns[col]->data_wrapper.mask_bytes) {
-            uint64_t write_len =
-              std::min(Config::OPT_TABLE_SCAN_CUDA_MEMCPY_SIZE,
-                       table->columns[col]->data_wrapper.mask_bytes - write_offset);
-            cudaMemcpyAsync(
-              reinterpret_cast<uint8_t*>(table->columns[col]->data_wrapper.validity_mask) +
-                write_offset,
-              reinterpret_cast<uint8_t*>(reordered_column->data_wrapper.validity_mask) +
-                write_offset,
-              write_len,
-              cudaMemcpyDeviceToDevice,
-              cuda_streams[num_cuda_memcpy++ % Config::OPT_TABLE_SCAN_NUM_CUDA_STREAMS]);
-            write_offset += write_len;
-          }
-        }
-        cudaDeviceSynchronize();
-        // Reset column's `row_ids` and `row_id_count` and free data of `reordered_column` in
-        // processing region
-        table->columns[col]->row_ids      = nullptr;
-        table->columns[col]->row_id_count = 0;
-        gpuBufferManager->customCudaFree(
-          reinterpret_cast<uint8_t*>(reordered_column->data_wrapper.data), 0);
-        if (table->columns[col]->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR) {
-          gpuBufferManager->customCudaFree(
-            reinterpret_cast<uint8_t*>(reordered_column->data_wrapper.offset), 0);
-        }
-      }
-      // Free `reorder_row_ids_out_indices` and `d_duckdb_storage_row_ids_ptr`
-      gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(reorder_row_ids_out_indices), 0);
-      gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_duckdb_storage_row_ids_ptr), 0);
-    }
+    // Row order was already canonicalized to DuckDB storage order on the host
+    // (before partitioning), so the per-GPU slices above are already aligned.
+    // No GPU-side reorder is needed.
   } else {
     throw NotImplementedException("Table in-out function not supported");
   }
