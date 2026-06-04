@@ -209,6 +209,16 @@ static std::size_t run_per_gpu_typed_tier(int                        gpu_id,
   // Launch the generic kernel for (KeyT, N_SLOTS) tier.
   const auto&         in      = xc.inputs[gpu_id];
   std::uint64_t*      row_ids = magi_q1::GetIdentityRowIdsShared(gpu, in.n_filtered);
+
+  // Make this GPU's cached aggregate input coherent before the kernel reads it.
+  // sirius uploads each GPU's cache slice with a cudaMemcpyAsync issued on a
+  // GPU-0 stream (the scan's stream pool lives on device 0), so for a consuming
+  // GPU != 0 the slice lands in its DRAM via a cross-device copy whose result is
+  // not guaranteed visible to a kernel on that device without a device-side
+  // sync. Without this, the first cross-GPU GROUP BY read stale data and
+  // produced wrong, run-to-run-varying sums (e.g. Q5 was correct only ~2/8
+  // runs; with this sync it is 10/10).
+  cudaDeviceSynchronize();
   auto* global_agg_typed =
       reinterpret_cast<magi_ops::AggSlot64<KeyT>*>(g_agg_dev[gpu_id]);
 
