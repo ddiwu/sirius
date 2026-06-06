@@ -378,39 +378,64 @@ bool DeriveKeyShape(const vector<shared_ptr<GPUColumn>>& keys,
   out_fields.clear();
   using magi_ops::KeyFieldKind;
   using magi_ops::KeyFieldEntry;
+  if (n_keys <= 0) return false;
 
-  if (n_keys == 1) {
-    auto id = keys[0]->data_wrapper.type.id();
-    if (id == GPUColumnTypeId::INT32) {
-      out_kind = magi_generic::KeyKind::INT32;
-      out_fields.push_back({KeyFieldKind::INT32, /*src=*/0, /*off=*/0, /*len=*/4});
+  // ── Generic fixed-width packing (no per-shape hardcoding) ────────────────
+  // Any combination of fixed-width keys auto-packs into one key word: walk the
+  // keys in order, give each its byte range, and pick the key width from the
+  // total. src_col_idx is the per-kind pool index (BuildGenericInputs assigns
+  // i_cols / i64_cols independently in key order), so we track one counter per
+  // pool. Covers single INT, single BIGINT (Q11), and any INT/BIGINT compound
+  // (Q9 = nationkey + o_year) for free.
+  //   total ≤ 4B → INT32 key word;  ≤ 8B → UINT64;  > 8B → needs wide-key path.
+  {
+    bool all_fixed = true;
+    int byte_off = 0, i32_idx = 0, i64_idx = 0;
+    std::vector<KeyFieldEntry> f;
+    for (int k = 0; k < n_keys; ++k) {
+      auto id = keys[k]->data_wrapper.type.id();
+      if (id == GPUColumnTypeId::INT32) {
+        f.push_back({KeyFieldKind::INT32, (int8_t)i32_idx++, (int8_t)byte_off, 4});
+        byte_off += 4;
+      } else if (id == GPUColumnTypeId::INT64) {
+        f.push_back({KeyFieldKind::INT64, (int8_t)i64_idx++, (int8_t)byte_off, 8});
+        byte_off += 8;
+      } else {
+        all_fixed = false;
+        break;
+      }
+    }
+    if (all_fixed) {
+      if (byte_off > 8) return false;   // > 64-bit key → wide-key path (Q3)
+      out_kind = (byte_off <= 4) ? magi_generic::KeyKind::INT32
+                                 : magi_generic::KeyKind::UINT64;
+      out_fields = std::move(f);
       return true;
     }
-    if (id == GPUColumnTypeId::INT64) {
-      out_kind = magi_generic::KeyKind::UINT64;
-      out_fields.push_back({KeyFieldKind::INT64, /*src=*/0, /*off=*/0, /*len=*/8});
-      return true;
-    }
-    if (id == GPUColumnTypeId::VARCHAR) {
-      out_kind = magi_generic::KeyKind::UINT64;
-      // First 8 bytes of v_chars[0] zero-padded.
-      out_fields.push_back({KeyFieldKind::VARCHAR_PREFIX,
-                            /*src=*/0, /*off=*/0, /*len=*/8});
-      return true;
-    }
-    return false;
   }
-  if (n_keys == 2) {
-    if (keys[0]->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR &&
-        keys[1]->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR) {
-      out_kind = magi_generic::KeyKind::INT32;
-      // Q1 pack: key = (c0 << 8) | c1. c0 comes from keys[0]/v_chars[0].
-      out_fields.push_back({KeyFieldKind::VARCHAR_PREFIX,
-                            /*src=*/0, /*off=*/1, /*len=*/1});
-      out_fields.push_back({KeyFieldKind::VARCHAR_PREFIX,
-                            /*src=*/1, /*off=*/0, /*len=*/1});
-      return true;
-    }
+
+  // ── VARCHAR shapes (variable width → explicit recipes) ───────────────────
+  // Strings can't be auto-budgeted into a fixed key word, so each varchar shape
+  // states its own prefix length. The collision-freedom is a property of the
+  // query's FIXED domain — NOT provable for arbitrary VARCHAR:
+  //   Q1: l_returnflag / l_linestatus are single-char by the TPC-H spec, so
+  //       1 byte each is provably enough for that schema.
+  //   Q5: the 25 fixed TPC-H nation names are distinguishable within 8 bytes
+  //       ("UNITED K" vs "UNITED S"). Two distinct strings sharing an 8-byte
+  //       prefix WOULD silently merge into one group — a general VARCHAR key
+  //       needs a full-string side-table (future), not a fixed prefix.
+  if (n_keys == 1 && keys[0]->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR) {
+    out_kind = magi_generic::KeyKind::UINT64;   // Q5: first 8 bytes of n_name
+    out_fields.push_back({KeyFieldKind::VARCHAR_PREFIX, 0, /*off=*/0, /*len=*/8});
+    return true;
+  }
+  if (n_keys == 2 &&
+      keys[0]->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR &&
+      keys[1]->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR) {
+    out_kind = magi_generic::KeyKind::INT32;     // Q1: (c0<<8)|c1, 1 byte each
+    out_fields.push_back({KeyFieldKind::VARCHAR_PREFIX, 0, /*off=*/1, /*len=*/1});
+    out_fields.push_back({KeyFieldKind::VARCHAR_PREFIX, 1, /*off=*/0, /*len=*/1});
+    return true;
   }
   return false;
 }
@@ -732,82 +757,68 @@ void WriteGenericSliceToColumns(int                                             
                                 int                                              num_group_keys,
                                 int                                              num_aggregates,
                                 sirius::AggregationType*                         agg_mode,
-                                magi_generic::KeyKind                            key_kind,
+                                const std::vector<magi_ops::KeyFieldEntry>&      key_fields,
                                 GPUBufferManager*                                gbm)
 {
   const size_t N = slice.size();
 
-  // ── Emit key columns ───────────────────────────────────────────────────
-  // KeyKind selects how to unpack the 64-bit key into one or more output
-  // columns:
-  //   INT32 + 2 VARCHAR keys → bytes [0] and [1] of key as VARCHAR(1) each
-  //   INT32 + 1 INT key      → cast directly to INT32
-  //   UINT64 + 1 VARCHAR     → bytes [0..8) of key as VARCHAR up to 8
-  if (key_kind == magi_generic::KeyKind::INT32 && num_group_keys == 2 &&
-      keys[0]->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR &&
-      keys[1]->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR) {
-    // Q1-shape: int32 key = (c0<<8)|c1 — but pack_key<int32_t> reads c0 from
-    // v_chars[0] (i.e., the FIRST input varchar) and shifts c0 << 8. So:
-    //   bit 8..15 = c0 (= keys[0])
-    //   bit 0..7  = c1 (= keys[1])
-    EmitVarcharKeyFromPacked(gpu_id, N, slice, keys[0],
-                              /*byte_offset=*/1, /*byte_len=*/1, gbm);
-    EmitVarcharKeyFromPacked(gpu_id, N, slice, keys[1],
-                              /*byte_offset=*/0, /*byte_len=*/1, gbm);
-  } else if (key_kind == magi_generic::KeyKind::UINT64 && num_group_keys == 1 &&
-             keys[0]->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR) {
-    EmitVarcharKeyFromPacked(gpu_id, N, slice, keys[0],
-                              /*byte_offset=*/0, /*byte_len=*/8, gbm);
-  } else if (key_kind == magi_generic::KeyKind::INT32 && num_group_keys == 1 &&
-             keys[0]->data_wrapper.type.id() == GPUColumnTypeId::INT32) {
-    // 1 INT key — emit as int32 column directly.
-    if (N == 0) {
-      keys[0] = make_shared_ptr<GPUColumn>(0,
-                                           GPUColumnType(GPUColumnTypeId::INT32),
-                                           /*data=*/nullptr,
-                                           /*validity_mask=*/nullptr);
-      keys[0]->row_id_count = 0;
-    } else {
-      std::vector<int32_t> v(N);
-      for (size_t i = 0; i < N; ++i)
-        v[i] = static_cast<int32_t>(slice[i].key_as_u64);
-      auto* d_buf = gbm->customCudaMalloc<int32_t>(N, gpu_id, false);
-      cudaMemcpy(d_buf, v.data(), N * sizeof(int32_t), cudaMemcpyHostToDevice);
-      keys[0] = make_shared_ptr<GPUColumn>(N,
-                                           GPUColumnType(GPUColumnTypeId::INT32),
-                                           reinterpret_cast<uint8_t*>(d_buf),
-                                           createNullMask(N));
-      keys[0]->row_id_count = 0;
-    }
-  } else if (key_kind == magi_generic::KeyKind::UINT64 && num_group_keys == 1 &&
-             keys[0]->data_wrapper.type.id() == GPUColumnTypeId::INT64) {
-    // Q11-shape: 1 BIGINT key — emit as int64 column directly. The packed
-    // uint64 in key_as_u64 is the original int64 bit-pattern (we used an
-    // unsigned cast in run_per_gpu_typed_tier so high bits don't flip).
-    if (N == 0) {
-      keys[0] = make_shared_ptr<GPUColumn>(0,
-                                           GPUColumnType(GPUColumnTypeId::INT64),
-                                           /*data=*/nullptr,
-                                           /*validity_mask=*/nullptr);
-      keys[0]->row_id_count = 0;
-    } else {
-      std::vector<int64_t> v(N);
-      for (size_t i = 0; i < N; ++i)
-        v[i] = static_cast<int64_t>(slice[i].key_as_u64);
-      auto* d_buf = gbm->customCudaMalloc<int64_t>(N, gpu_id, false);
-      cudaMemcpy(d_buf, v.data(), N * sizeof(int64_t), cudaMemcpyHostToDevice);
-      keys[0] = make_shared_ptr<GPUColumn>(N,
-                                           GPUColumnType(GPUColumnTypeId::INT64),
-                                           reinterpret_cast<uint8_t*>(d_buf),
-                                           createNullMask(N));
-      keys[0]->row_id_count = 0;
-    }
-  } else {
+  // ── Emit key columns (table-driven — inverse of pack_key_from_fields) ────
+  // key_fields[i] describes keys[i]: its KeyFieldKind and byte range inside the
+  // packed key word. We invert each independently, so the emit needs no
+  // per-query branches — it mirrors whatever recipe DeriveKeyShape produced.
+  //   VARCHAR_PREFIX → rebuild the string from [off, off+len) bytes
+  //   INT32          → extract 4 bytes at off
+  //   INT64          → extract 8 bytes at off
+  if (static_cast<int>(key_fields.size()) != num_group_keys) {
     throw NotImplementedException(
-        "magi_groupby (generic): unsupported key emit shape "
-        "(KeyKind=%d, n_keys=%d, type0=%d)",
-        static_cast<int>(key_kind), num_group_keys,
-        static_cast<int>(keys[0]->data_wrapper.type.id()));
+        "magi_groupby (generic): key_fields/num_group_keys mismatch "
+        "(%zu vs %d)", key_fields.size(), num_group_keys);
+  }
+  for (int ki = 0; ki < num_group_keys; ++ki) {
+    const magi_ops::KeyFieldEntry& f = key_fields[ki];
+    const int shift = f.byte_offset * 8;
+    switch (f.kind) {
+      case magi_ops::KeyFieldKind::VARCHAR_PREFIX:
+        EmitVarcharKeyFromPacked(gpu_id, N, slice, keys[ki],
+                                 f.byte_offset, f.byte_len, gbm);
+        break;
+      case magi_ops::KeyFieldKind::INT32: {
+        if (N == 0) {
+          keys[ki] = make_shared_ptr<GPUColumn>(0,
+              GPUColumnType(GPUColumnTypeId::INT32), nullptr, nullptr);
+          keys[ki]->row_id_count = 0;
+          break;
+        }
+        std::vector<int32_t> v(N);
+        for (size_t i = 0; i < N; ++i)
+          v[i] = static_cast<int32_t>((slice[i].key_as_u64 >> shift) & 0xFFFFFFFFu);
+        auto* d_buf = gbm->customCudaMalloc<int32_t>(N, gpu_id, false);
+        cudaMemcpy(d_buf, v.data(), N * sizeof(int32_t), cudaMemcpyHostToDevice);
+        keys[ki] = make_shared_ptr<GPUColumn>(N,
+            GPUColumnType(GPUColumnTypeId::INT32),
+            reinterpret_cast<uint8_t*>(d_buf), createNullMask(N));
+        keys[ki]->row_id_count = 0;
+      } break;
+      case magi_ops::KeyFieldKind::INT64: {
+        // The packed uint64 holds the original int64 bit-pattern (run_per_gpu
+        // used an unsigned cast so high bits don't flip).
+        if (N == 0) {
+          keys[ki] = make_shared_ptr<GPUColumn>(0,
+              GPUColumnType(GPUColumnTypeId::INT64), nullptr, nullptr);
+          keys[ki]->row_id_count = 0;
+          break;
+        }
+        std::vector<int64_t> v(N);
+        for (size_t i = 0; i < N; ++i)
+          v[i] = static_cast<int64_t>(slice[i].key_as_u64 >> shift);
+        auto* d_buf = gbm->customCudaMalloc<int64_t>(N, gpu_id, false);
+        cudaMemcpy(d_buf, v.data(), N * sizeof(int64_t), cudaMemcpyHostToDevice);
+        keys[ki] = make_shared_ptr<GPUColumn>(N,
+            GPUColumnType(GPUColumnTypeId::INT64),
+            reinterpret_cast<uint8_t*>(d_buf), createNullMask(N));
+        keys[ki]->row_id_count = 0;
+      } break;
+    }
   }
 
   // ── Emit aggregate columns ─────────────────────────────────────────────
@@ -931,7 +942,7 @@ void Run(int                                gpu_id,
   WriteGenericSliceToColumns(gpu_id, slice,
                              group_by_keys, aggregate_keys,
                              num_group_keys, num_aggregates, agg_mode,
-                             key_kind,
+                             key_fields,
                              &GPUBufferManager::GetInstance());
 }
 

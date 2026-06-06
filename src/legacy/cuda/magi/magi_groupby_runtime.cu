@@ -40,7 +40,6 @@ namespace duckdb { namespace magi_generic {
 
 // ── Kernel-launch constants ──────────────────────────────────────────────
 constexpr int    BLOCK_SIZE      = 1024;
-constexpr int    N_LOCAL_SLOTS   = magi_ops::DEFAULT_N_LOCAL_SLOTS;
 constexpr int    MAX_AGG_OPS     = 16;  // ample for any TPC-H GROUP BY
 constexpr int    MAX_KEY_FIELDS  = 8;   // 2-VARCHAR (Q1) or compound INT+VARCHAR
 
@@ -52,6 +51,19 @@ constexpr int N_SLOTS_SMALL    = 256;
 constexpr int N_SLOTS_MEDIUM   = 16 * 1024;
 constexpr int N_SLOTS_LARGE    = 1024 * 1024;
 constexpr int MAX_TIER_SLOTS   = N_SLOTS_LARGE;
+
+// Producer per-block local pre-aggregation hash (shared memory). It MUST be at
+// least as large as the query's group cardinality: producer_local_agg drops any
+// row whose key can't claim a local slot (BlockHashAgg returns nullptr when the
+// table is full). With the old value of 16 that silently undercounted every
+// query with >16 groups (Q9 has 175) — keys that overflowed the 16-slot table
+// lost all their rows. Size it to the SMALL tier (256): a 256-slot, 64B-state
+// hash is ~18KB of shared memory (well under the 48KB static limit) and blockDim
+// (1024) ≥ 256 so the one-thread-per-slot flush covers every slot. This makes
+// SMALL-tier groupby (cardinality ≤ 256) exact. MEDIUM/LARGE high-cardinality
+// queries still need a spill/pass-through path instead of dropping — tracked for
+// the Q3 cuco-style global hashagg work.
+constexpr int N_LOCAL_SLOTS    = N_SLOTS_SMALL;
 constexpr size_t AGG_BUF_BYTES = static_cast<size_t>(64) * MAX_TIER_SLOTS;
 
 // Convert TableSize → slot count.
