@@ -406,9 +406,10 @@ bool DeriveKeyShape(const vector<shared_ptr<GPUColumn>>& keys,
       }
     }
     if (all_fixed) {
-      if (byte_off > 8) return false;   // > 64-bit key → wide-key path (Q3)
-      out_kind = (byte_off <= 4) ? magi_generic::KeyKind::INT32
-                                 : magi_generic::KeyKind::UINT64;
+      if (byte_off > 16) return false;  // > 128-bit key → side-table (future)
+      out_kind = (byte_off <= 4)  ? magi_generic::KeyKind::INT32
+                 : (byte_off <= 8) ? magi_generic::KeyKind::UINT64
+                                   : magi_generic::KeyKind::UINT128;
       out_fields = std::move(f);
       return true;
     }
@@ -443,16 +444,18 @@ bool DeriveKeyShape(const vector<shared_ptr<GPUColumn>>& keys,
 // Pick the receiver hash-table tier from the key shape. This is a
 // conservative heuristic until sirius's plan-gen pipes through a
 // per-aggregate cardinality estimate:
-//   - 1× BIGINT key      → LARGE (Q11 ps_partkey: ~200K groups)
-//   - all other shapes   → SMALL (Q1: 4, Q5: 5, Q9: 175 — fits 256 slots)
-// Conservative direction is to over-provision (D2H of unused slots is
-// cheap), so MEDIUM is a future tweak rather than a default.
+//   - any BIGINT key component → LARGE (Q11 ps_partkey ~200K; Q3 l_orderkey
+//                                ~566K — including when it's part of a wider
+//                                compound key like Q3's bigint+date+int)
+//   - all other shapes         → SMALL (Q1: 4, Q5: 5, Q9: 175 — fit 256 slots)
+// Conservative direction is to over-provision (D2H of unused slots is cheap).
 magi_generic::TableSize PickTableSize(const vector<shared_ptr<GPUColumn>>& keys,
                                        int                                  n_keys)
 {
-  if (n_keys == 1 &&
-      keys[0]->data_wrapper.type.id() == GPUColumnTypeId::INT64) {
-    return magi_generic::TableSize::LARGE;
+  for (int k = 0; k < n_keys; ++k) {
+    if (keys[k]->data_wrapper.type.id() == GPUColumnTypeId::INT64) {
+      return magi_generic::TableSize::LARGE;
+    }
   }
   return magi_generic::TableSize::SMALL;
 }
@@ -657,7 +660,7 @@ void EmitVarcharKeyFromPacked(int                                              g
   size_t total_bytes = 0;
   h_offsets[0] = 0;
   for (size_t i = 0; i < N; ++i) {
-    uint64_t k = slice[i].key_as_u64;
+    uint64_t k = static_cast<uint64_t>(slice[i].key_packed);  // varchar key ≤ 8B
     int len = 0;
     for (int b = 0; b < key_byte_len; ++b) {
       uint8_t c = static_cast<uint8_t>((k >> ((key_byte_offset + b) * 8)) & 0xff);
@@ -669,7 +672,7 @@ void EmitVarcharKeyFromPacked(int                                              g
   }
   std::vector<uint8_t> h_chars(total_bytes);
   for (size_t i = 0; i < N; ++i) {
-    uint64_t k = slice[i].key_as_u64;
+    uint64_t k = static_cast<uint64_t>(slice[i].key_packed);  // varchar key ≤ 8B
     size_t dst = h_offsets[i];
     for (int b = 0; b < key_byte_len; ++b) {
       uint8_t c = static_cast<uint8_t>((k >> ((key_byte_offset + b) * 8)) & 0xff);
@@ -791,7 +794,7 @@ void WriteGenericSliceToColumns(int                                             
         }
         std::vector<int32_t> v(N);
         for (size_t i = 0; i < N; ++i)
-          v[i] = static_cast<int32_t>((slice[i].key_as_u64 >> shift) & 0xFFFFFFFFu);
+          v[i] = static_cast<int32_t>((slice[i].key_packed >> shift) & 0xFFFFFFFFu);
         auto* d_buf = gbm->customCudaMalloc<int32_t>(N, gpu_id, false);
         cudaMemcpy(d_buf, v.data(), N * sizeof(int32_t), cudaMemcpyHostToDevice);
         keys[ki] = make_shared_ptr<GPUColumn>(N,
@@ -810,7 +813,7 @@ void WriteGenericSliceToColumns(int                                             
         }
         std::vector<int64_t> v(N);
         for (size_t i = 0; i < N; ++i)
-          v[i] = static_cast<int64_t>(slice[i].key_as_u64 >> shift);
+          v[i] = static_cast<int64_t>(slice[i].key_packed >> shift);
         auto* d_buf = gbm->customCudaMalloc<int64_t>(N, gpu_id, false);
         cudaMemcpy(d_buf, v.data(), N * sizeof(int64_t), cudaMemcpyHostToDevice);
         keys[ki] = make_shared_ptr<GPUColumn>(N,

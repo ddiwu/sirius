@@ -32,8 +32,9 @@ namespace magi_generic {
 // width; the packing of bytes into that KeyT is data (KeyFieldEntry[]),
 // not code.
 enum class KeyKind : std::int8_t {
-  INT32  = 0,   // 32-bit packed key (Q1: 2×VARCHAR(1), or 1 INT)
-  UINT64 = 1,   // 64-bit packed key (Q5: VARCHAR prefix, or BIGINT, or compound)
+  INT32   = 0,  // 32-bit packed key (Q1: 2×VARCHAR(1), or 1 INT)
+  UINT64  = 1,  // 64-bit packed key (Q5: VARCHAR prefix, or BIGINT, or compound)
+  UINT128 = 2,  // 128-bit packed key (Q3: bigint+date+int 16B compound)
 };
 
 // Receiver global-hash table capacity tier. Pre-instantiated per (KeyT,size)
@@ -61,16 +62,18 @@ struct PerGpuInputs {
 };
 
 // One output row per surviving open-addressing slot on this GPU's receiver.
-// `key_as_u64` carries the packed KeyT widened to 64 bits (int32 zero-
-// extended via unsigned cast; uint64 identity). `values[]` are the raw
-// 8-byte slots — the caller knows which AggKind each slot holds (it built
-// the AggOpEntry table) so it can reinterpret per kind.
+// `key_packed` carries the packed KeyT widened to 128 bits (int32/uint64 zero-
+// extended via unsigned cast; uint64 identity in the low 64; 16-byte compound
+// keys use the full width). The host unpacks each group-by column out of it by
+// the same byte offsets the kernel packed with. `values[]` are the raw 8-byte
+// slots — the caller knows which AggKind each holds (it built the AggOpEntry
+// table) so it can reinterpret per kind.
 struct AggResultRow {
   static constexpr int N_VALUES = magi_ops::AggSlot64<std::uint64_t>::N_DOUBLES;
 
-  std::uint64_t key_as_u64;
-  double        values[N_VALUES];
-  std::uint64_t partial_count;
+  unsigned __int128 key_packed;
+  double            values[N_VALUES];
+  std::uint64_t     partial_count;
 };
 
 // Per-GPU dispatcher entry. Called by every sirius worker thread (one per
