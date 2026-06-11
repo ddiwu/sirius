@@ -45,14 +45,12 @@ constexpr int    BLOCK_SIZE      = 1024;
 constexpr int    MAX_AGG_OPS     = 16;  // ample for any TPC-H GROUP BY
 constexpr int    MAX_KEY_FIELDS  = 8;   // 2-VARCHAR (Q1) or compound INT+VARCHAR
 
-// Tier sizes. SMALL covers Q1/Q5/Q9; MEDIUM covers Q16/Q18-class; LARGE
-// covers Q3/Q11. Slot is 64B, so MAX_TIER_SLOTS * 64 is the per-GPU agg
-// buffer footprint (we keep it allocated at the largest tier and just
-// memset/memcpy the prefix the active tier needs).
-constexpr int N_SLOTS_SMALL    = 256;
-constexpr int N_SLOTS_MEDIUM   = 16 * 1024;
-constexpr int N_SLOTS_LARGE    = 1024 * 1024;
-constexpr int MAX_TIER_SLOTS   = N_SLOTS_LARGE;
+// Tier sizes (N_SLOTS_SMALL/MEDIUM/LARGE/XLARGE) live in the public header so
+// PickTableSize's routing policy and these instantiations share one source of
+// truth. Slot is 64B, so MAX_TIER_SLOTS * 64 is the per-GPU agg buffer
+// footprint (we keep it allocated at the largest tier and just memset/memcpy
+// the prefix the active tier needs).
+constexpr int MAX_TIER_SLOTS   = N_SLOTS_XLARGE;
 
 // Producer per-block local pre-aggregation hash (shared memory). It MUST be at
 // least as large as the query's group cardinality: producer_local_agg drops any
@@ -74,6 +72,7 @@ constexpr int slots_for(TableSize t) {
     case TableSize::SMALL:  return N_SLOTS_SMALL;
     case TableSize::MEDIUM: return N_SLOTS_MEDIUM;
     case TableSize::LARGE:  return N_SLOTS_LARGE;
+    case TableSize::XLARGE: return N_SLOTS_XLARGE;
   }
   return N_SLOTS_SMALL;
 }
@@ -157,12 +156,15 @@ MAGI_INSTANTIATE_SINGLE(std::uint64_t);
 MAGI_INSTANTIATE_BOTH(std::int32_t,  duckdb::magi_generic::N_SLOTS_SMALL);
 MAGI_INSTANTIATE_BOTH(std::int32_t,  duckdb::magi_generic::N_SLOTS_MEDIUM);
 MAGI_INSTANTIATE_BOTH(std::int32_t,  duckdb::magi_generic::N_SLOTS_LARGE);
+MAGI_INSTANTIATE_BOTH(std::int32_t,  duckdb::magi_generic::N_SLOTS_XLARGE);
 MAGI_INSTANTIATE_BOTH(std::uint64_t, duckdb::magi_generic::N_SLOTS_SMALL);
 MAGI_INSTANTIATE_BOTH(std::uint64_t, duckdb::magi_generic::N_SLOTS_MEDIUM);
 MAGI_INSTANTIATE_BOTH(std::uint64_t, duckdb::magi_generic::N_SLOTS_LARGE);
+MAGI_INSTANTIATE_BOTH(std::uint64_t, duckdb::magi_generic::N_SLOTS_XLARGE);
 MAGI_INSTANTIATE_BOTH(unsigned __int128, duckdb::magi_generic::N_SLOTS_SMALL);
 MAGI_INSTANTIATE_BOTH(unsigned __int128, duckdb::magi_generic::N_SLOTS_MEDIUM);
 MAGI_INSTANTIATE_BOTH(unsigned __int128, duckdb::magi_generic::N_SLOTS_LARGE);
+MAGI_INSTANTIATE_BOTH(unsigned __int128, duckdb::magi_generic::N_SLOTS_XLARGE);
 
 #undef MAGI_INSTANTIATE_PREAGG
 #undef MAGI_INSTANTIATE_SHUFFLE
@@ -173,7 +175,7 @@ MAGI_INSTANTIATE_BOTH(unsigned __int128, duckdb::magi_generic::N_SLOTS_LARGE);
 namespace duckdb { namespace magi_generic {
 
 // ── Per-GPU device buffers (lazy-init) ────────────────────────────────────
-// `g_agg_dev[i]`     : MAX_TIER_SLOTS × 64B per GPU (LARGE-tier sized;
+// `g_agg_dev[i]`     : MAX_TIER_SLOTS × 64B per GPU (XLARGE-tier sized = 256 MB;
 //                       smaller tiers just use the prefix).
 // `g_ops_dev[i]`     : MAX_AGG_OPS × 4B per GPU; AggOpEntry table copied
 //                       per query.
@@ -434,6 +436,7 @@ static std::size_t dispatch_by_kind_and_tier(int                        gpu_id,
         case TableSize::SMALL:  return run_per_gpu_typed_tier<std::int32_t, N_SLOTS_SMALL >(gpu_id, my_slice);
         case TableSize::MEDIUM: return run_per_gpu_typed_tier<std::int32_t, N_SLOTS_MEDIUM>(gpu_id, my_slice);
         case TableSize::LARGE:  return run_per_gpu_typed_tier<std::int32_t, N_SLOTS_LARGE >(gpu_id, my_slice);
+        case TableSize::XLARGE: return run_per_gpu_typed_tier<std::int32_t, N_SLOTS_XLARGE>(gpu_id, my_slice);
       }
       break;
     case KeyKind::UINT64:
@@ -441,6 +444,7 @@ static std::size_t dispatch_by_kind_and_tier(int                        gpu_id,
         case TableSize::SMALL:  return run_per_gpu_typed_tier<std::uint64_t, N_SLOTS_SMALL >(gpu_id, my_slice);
         case TableSize::MEDIUM: return run_per_gpu_typed_tier<std::uint64_t, N_SLOTS_MEDIUM>(gpu_id, my_slice);
         case TableSize::LARGE:  return run_per_gpu_typed_tier<std::uint64_t, N_SLOTS_LARGE >(gpu_id, my_slice);
+        case TableSize::XLARGE: return run_per_gpu_typed_tier<std::uint64_t, N_SLOTS_XLARGE>(gpu_id, my_slice);
       }
       break;
     case KeyKind::UINT128:
@@ -448,6 +452,7 @@ static std::size_t dispatch_by_kind_and_tier(int                        gpu_id,
         case TableSize::SMALL:  return run_per_gpu_typed_tier<unsigned __int128, N_SLOTS_SMALL >(gpu_id, my_slice);
         case TableSize::MEDIUM: return run_per_gpu_typed_tier<unsigned __int128, N_SLOTS_MEDIUM>(gpu_id, my_slice);
         case TableSize::LARGE:  return run_per_gpu_typed_tier<unsigned __int128, N_SLOTS_LARGE >(gpu_id, my_slice);
+        case TableSize::XLARGE: return run_per_gpu_typed_tier<unsigned __int128, N_SLOTS_XLARGE>(gpu_id, my_slice);
       }
       break;
   }

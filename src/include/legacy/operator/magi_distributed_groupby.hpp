@@ -40,17 +40,29 @@ enum class KeyKind : std::int8_t {
 // Receiver global-hash table capacity tier. Pre-instantiated per (KeyT,size)
 // pair so the dispatcher can pick at runtime without recompilation.
 //
-//   SMALL  — 256    slots, fits Q1/Q5/Q9-class (cardinality ≤ ~100)
-//   MEDIUM — 16 K   slots, fits Q16/Q18-class  (cardinality ≤ ~10 K)
-//   LARGE  — 1 M    slots, fits Q3/Q11-class   (cardinality ≤ ~500 K)
+//   SMALL  — 256    slots, fits Q1/Q5/Q9-class   (cardinality ≤ ~200)
+//   MEDIUM — 16 K   slots, fits Q16/Q18-class    (cardinality ≤ ~12 K)
+//   LARGE  — 1 M    slots, fits Q3-sf50 / Q11    (cardinality ≤ ~800 K)
+//   XLARGE — 4 M    slots, fits Q3-sf100         (cardinality ≤ ~3 M)
 //
-// LARGE costs 64 MB / GPU of always-allocated buffer (we keep the buffer at
-// largest tier and only cudaMemcpy as many slots as the chosen tier needs).
+// XLARGE costs 256 MB / GPU of always-allocated buffer (we keep the buffer at
+// the largest tier and only cudaMemcpy as many slots as the chosen tier needs).
+// PickTableSize routes low-cardinality BIGINT-keyed queries (Q11) down to the
+// small tiers, so only genuinely high-card queries pay the big-tier copyback.
 enum class TableSize : std::int8_t {
   SMALL  = 0,
   MEDIUM = 1,
   LARGE  = 2,
+  XLARGE = 3,
 };
+
+// Tier slot counts. Single source of truth shared by the cardinality→tier
+// routing policy (PickTableSize, magi_groupby.cu) and the kernel
+// instantiations / dispatch (magi_groupby_runtime.cu) so they cannot drift.
+constexpr int N_SLOTS_SMALL  = 256;
+constexpr int N_SLOTS_MEDIUM = 16 * 1024;
+constexpr int N_SLOTS_LARGE  = 1024 * 1024;
+constexpr int N_SLOTS_XLARGE = 4 * 1024 * 1024;
 
 // One worker thread's input: how many rows + the packed column views the
 // kernel will read. ColPack column ordering must match the KeyFieldEntry[]

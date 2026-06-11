@@ -441,23 +441,46 @@ bool DeriveKeyShape(const vector<shared_ptr<GPUColumn>>& keys,
   return false;
 }
 
-// Pick the receiver hash-table tier from the key shape. This is a
-// conservative heuristic until sirius's plan-gen pipes through a
-// per-aggregate cardinality estimate:
-//   - any BIGINT key component → LARGE (Q11 ps_partkey ~200K; Q3 l_orderkey
-//                                ~566K — including when it's part of a wider
-//                                compound key like Q3's bigint+date+int)
-//   - all other shapes         → SMALL (Q1: 4, Q5: 5, Q9: 175 — fit 256 slots)
-// Conservative direction is to over-provision (D2H of unused slots is cheap).
+// Pick the receiver hash-table tier. Cardinality-aware within the BIGINT-keyed
+// subclass, which is where tier choice actually matters:
+//
+//   - No BIGINT key component (Q1: 4 groups, Q5: 5, Q9: 175 — packed from
+//     INT/VARCHAR into ≤8B): low cardinality by construction in the TPC-H set,
+//     so route to SMALL (the single-kernel shmem combiner — fast for low
+//     card + high row count, and its 256-slot table is exact).
+//
+//   - BIGINT key component: splits into low-card (Q11: ps_partkey<20 → 19
+//     groups, tens of rows) and high-card (Q3: l_orderkey compound → ~1.1M
+//     groups, millions of rows). Here the per-GPU input row count is a good
+//     cardinality proxy *for this subclass* (distinct ≤ rows; Q11 has few
+//     rows, Q3 has many), so size the tier from it. This drops Q11 to SMALL
+//     (its slice is tiny → fast shmem path, avoids the big-tier O(slots) host
+//     copyback) while letting Q3-sf100 reach XLARGE and stay on magi instead
+//     of overflowing LARGE and falling back to DuckDB.
+//
+// The estimate carries ~1.33× headroom so the open-addressing load factor stays
+// below ~0.77 even when keys are near-unique; the overflow counter is the
+// backstop (→ DuckDB fallback) if a mis-estimate still fills the table. With
+// even cache slicing every GPU sees ~the same row count and so picks the same
+// tier (the cross-GPU wire format is tier-independent regardless).
 magi_generic::TableSize PickTableSize(const vector<shared_ptr<GPUColumn>>& keys,
                                        int                                  n_keys)
 {
+  bool has_bigint = false;
   for (int k = 0; k < n_keys; ++k) {
     if (keys[k]->data_wrapper.type.id() == GPUColumnTypeId::INT64) {
-      return magi_generic::TableSize::LARGE;
+      has_bigint = true;
+      break;
     }
   }
-  return magi_generic::TableSize::SMALL;
+  if (!has_bigint) return magi_generic::TableSize::SMALL;
+
+  const uint64_t local_rows = keys[0]->column_length;
+  const uint64_t est        = local_rows + local_rows / 3;   // ~1.33× headroom
+  if (est <= magi_generic::N_SLOTS_SMALL)  return magi_generic::TableSize::SMALL;
+  if (est <= magi_generic::N_SLOTS_MEDIUM) return magi_generic::TableSize::MEDIUM;
+  if (est <= magi_generic::N_SLOTS_LARGE)  return magi_generic::TableSize::LARGE;
+  return magi_generic::TableSize::XLARGE;
 }
 
 magi_generic::PerGpuInputs BuildGenericInputs(
