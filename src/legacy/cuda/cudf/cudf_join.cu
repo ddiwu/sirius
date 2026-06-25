@@ -46,6 +46,13 @@ void cudf_hash_inner_join(vector<shared_ptr<GPUColumn>>& probe_keys,
   START_TIMER();
 
   cudf::set_current_device_resource_ref(gpuBufferManager->get_mr_ref());
+  // Multi-GPU: an upstream op may have left this thread's CUDA device on another
+  // GPU while sirius_current_gpu (and the columns it built) belong to THIS worker's
+  // GPU. Re-bind the device so convertToCudfColumn's columns, the MR, and every
+  // cudf kernel launch all agree — otherwise a build/probe column whose
+  // validity_mask lives on the worker's real GPU is "wild" for the current device
+  // and convertToCudfColumn throws, which then deadlocks the downstream magi barrier.
+  cudaSetDevice(sirius_current_gpu);
 
   std::vector<cudf::column_view> build_keys_cudf, probe_keys_cudf;
   std::vector<std::unique_ptr<cudf::column>> keys_cast;
@@ -100,9 +107,9 @@ void cudf_hash_inner_join(vector<shared_ptr<GPUColumn>>& probe_keys,
     row_ids_right =
       convertInt32ToUInt64(reinterpret_cast<int32_t*>(row_ids_right_buffer.data()), result_count);
 
-    gpuBufferManager->rmm_stored_buffers.push_back(
+    gpuBufferManager->storeRmmBuffer(
       std::make_unique<rmm::device_buffer>(std::move(row_ids_left_buffer)));
-    gpuBufferManager->rmm_stored_buffers.push_back(
+    gpuBufferManager->storeRmmBuffer(
       std::make_unique<rmm::device_buffer>(std::move(row_ids_right_buffer)));
 
     count    = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
@@ -120,9 +127,9 @@ void cudf_hash_inner_join(vector<shared_ptr<GPUColumn>>& probe_keys,
     row_ids_right =
       convertInt32ToUInt64(reinterpret_cast<int32_t*>(row_ids_right_buffer.data()), result_count);
 
-    gpuBufferManager->rmm_stored_buffers.push_back(
+    gpuBufferManager->storeRmmBuffer(
       std::make_unique<rmm::device_buffer>(std::move(row_ids_left_buffer)));
-    gpuBufferManager->rmm_stored_buffers.push_back(
+    gpuBufferManager->storeRmmBuffer(
       std::make_unique<rmm::device_buffer>(std::move(row_ids_right_buffer)));
 
     count    = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
@@ -156,6 +163,13 @@ void cudf_mixed_or_conditional_inner_join(vector<shared_ptr<GPUColumn>>& probe_c
   START_TIMER();
 
   cudf::set_current_device_resource_ref(gpuBufferManager->get_mr_ref());
+  // Multi-GPU: an upstream op may have left this thread's CUDA device on another
+  // GPU while sirius_current_gpu (and the columns it built) belong to THIS worker's
+  // GPU. Re-bind the device so convertToCudfColumn's columns, the MR, and every
+  // cudf kernel launch all agree — otherwise a build/probe column whose
+  // validity_mask lives on the worker's real GPU is "wild" for the current device
+  // and convertToCudfColumn throws, which then deadlocks the downstream magi barrier.
+  cudaSetDevice(sirius_current_gpu);
 
   std::vector<cudf::column_view> probe_equal_columns;
   std::vector<cudf::column_view> build_equal_columns;
@@ -250,9 +264,9 @@ void cudf_mixed_or_conditional_inner_join(vector<shared_ptr<GPUColumn>>& probe_c
   row_ids_right =
     convertInt32ToUInt64(reinterpret_cast<int32_t*>(row_ids_right_buffer.data()), result_count);
 
-  gpuBufferManager->rmm_stored_buffers.push_back(
+  gpuBufferManager->storeRmmBuffer(
     std::make_unique<rmm::device_buffer>(std::move(row_ids_left_buffer)));
-  gpuBufferManager->rmm_stored_buffers.push_back(
+  gpuBufferManager->storeRmmBuffer(
     std::make_unique<rmm::device_buffer>(std::move(row_ids_right_buffer)));
 
   count    = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
@@ -285,6 +299,13 @@ void cudf_hash_left_join(vector<shared_ptr<GPUColumn>>& probe_keys,
   START_TIMER();
 
   cudf::set_current_device_resource_ref(gpuBufferManager->get_mr_ref());
+  // Multi-GPU: an upstream op may have left this thread's CUDA device on another
+  // GPU while sirius_current_gpu (and the columns it built) belong to THIS worker's
+  // GPU. Re-bind the device so convertToCudfColumn's columns, the MR, and every
+  // cudf kernel launch all agree — otherwise a build/probe column whose
+  // validity_mask lives on the worker's real GPU is "wild" for the current device
+  // and convertToCudfColumn throws, which then deadlocks the downstream magi barrier.
+  cudaSetDevice(sirius_current_gpu);
 
   std::vector<cudf::column_view> build_keys_cudf, probe_keys_cudf;
   std::vector<std::unique_ptr<cudf::column>> keys_cast;
@@ -339,9 +360,9 @@ void cudf_hash_left_join(vector<shared_ptr<GPUColumn>>& probe_keys,
   row_ids_right =
     convertInt32ToUInt64(reinterpret_cast<int32_t*>(row_ids_right_buffer.data()), result_count);
 
-  gpuBufferManager->rmm_stored_buffers.push_back(
+  gpuBufferManager->storeRmmBuffer(
     std::make_unique<rmm::device_buffer>(std::move(row_ids_left_buffer)));
-  gpuBufferManager->rmm_stored_buffers.push_back(
+  gpuBufferManager->storeRmmBuffer(
     std::make_unique<rmm::device_buffer>(std::move(row_ids_right_buffer)));
 
   count    = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
@@ -373,6 +394,13 @@ void cudf_hash_full_join(vector<shared_ptr<GPUColumn>>& probe_keys,
   START_TIMER();
 
   cudf::set_current_device_resource_ref(gpuBufferManager->get_mr_ref());
+  // Multi-GPU: an upstream op may have left this thread's CUDA device on another
+  // GPU while sirius_current_gpu (and the columns it built) belong to THIS worker's
+  // GPU. Re-bind the device so convertToCudfColumn's columns, the MR, and every
+  // cudf kernel launch all agree — otherwise a build/probe column whose
+  // validity_mask lives on the worker's real GPU is "wild" for the current device
+  // and convertToCudfColumn throws, which then deadlocks the downstream magi barrier.
+  cudaSetDevice(sirius_current_gpu);
 
   std::vector<cudf::column_view> build_keys_cudf, probe_keys_cudf;
   std::vector<std::unique_ptr<cudf::column>> keys_cast;
@@ -423,9 +451,9 @@ void cudf_hash_full_join(vector<shared_ptr<GPUColumn>>& probe_keys,
   row_ids_right =
     convertInt32ToUInt64(reinterpret_cast<int32_t*>(row_ids_right_buffer.data()), result_count);
 
-  gpuBufferManager->rmm_stored_buffers.push_back(
+  gpuBufferManager->storeRmmBuffer(
     std::make_unique<rmm::device_buffer>(std::move(row_ids_left_buffer)));
-  gpuBufferManager->rmm_stored_buffers.push_back(
+  gpuBufferManager->storeRmmBuffer(
     std::make_unique<rmm::device_buffer>(std::move(row_ids_right_buffer)));
 
   count    = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);

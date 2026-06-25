@@ -62,7 +62,13 @@ enum class TableSize : std::int8_t {
 constexpr int N_SLOTS_SMALL  = 256;
 constexpr int N_SLOTS_MEDIUM = 16 * 1024;
 constexpr int N_SLOTS_LARGE  = 1024 * 1024;
-constexpr int N_SLOTS_XLARGE = 4 * 1024 * 1024;
+// XLARGE bumped 4M->16M so high-cardinality GROUP BYs (e.g. l_partkey ~10M
+// distinct) fit BOTH the per-GPU local hash H (~10M) AND the post-shuffle
+// receiver merge table (~card/NUM_GPUS) without overflowing -> previously these
+// threw "cardinality exceeds hash capacity" and fell back to DuckDB CPU. Cost:
+// g_agg_dev/g_stage_dev grow to 16M*64B = 1 GB each per GPU (always allocated).
+// Must stay a power of two (open-addressing uses `& (N_SLOTS-1)`); 16M = 2^24.
+constexpr int N_SLOTS_XLARGE = 16 * 1024 * 1024;
 
 // One worker thread's input: how many rows + the packed column views the
 // kernel will read. ColPack column ordering must match the KeyFieldEntry[]

@@ -23,6 +23,7 @@
 #include "gpu_buffer_manager.hpp"
 #include "log/logging.hpp"
 #include "operator/gpu_materialize.hpp"
+#include "operator/gpu_physical_table_scan.hpp"
 #include "operator/magi_groupby.hpp"
 #include "utils.hpp"
 
@@ -187,6 +188,35 @@ void HandleGroupByAggregateCuDF(vector<shared_ptr<GPUColumn>>& group_by_keys,
         throw NotImplementedException("Grouped aggregate (not distinct) function not supported: %s",
                                       expr.function.name);
       }
+    }
+  }
+
+  // HIGH-CARDINALITY local pre-aggregation with cudf. magi's open-addressing
+  // local hash is weak when a per-GPU slice has millions of distinct keys (it
+  // routes to the XLARGE tier whose O(slots) init/flush dominates, or — before
+  // the 16M tier — overflowed outright and fell back to DuckDB CPU). For those,
+  // let cudf do the LOCAL group-by first (no fixed cap; reduces rows -> distinct
+  // in place), then hand the much smaller partials to magi for the cross-GPU
+  // NVLink shuffle + merge. magi's PickTableSize then sees the reduced
+  // column_length and picks a right-sized tier. AVERAGE (mean is not associative)
+  // and COUNT_DISTINCT are excluded — they would need SUM+COUNT carriers; those
+  // stay on the magi-direct path. The cudf decision is identical on every GPU
+  // (same query + even slicing) so the begin barrier inside Run() stays balanced.
+  if (magi_groupby::ShouldCudfPreAgg(group_by_keys, num_group_keys)) {
+    bool reagg_ok = true;
+    for (size_t i = 0; i < aggregates.size(); ++i)
+      if (agg_mode[i] == AggregationType::AVERAGE ||
+          agg_mode[i] == AggregationType::COUNT_DISTINCT) { reagg_ok = false; break; }
+    if (reagg_ok) {
+      cudf_groupby(group_by_keys, aggregate_keys, num_group_keys,
+                   static_cast<int>(aggregates.size()), agg_mode, estimated_output_groups);
+      // Re-aggregation of the partials: a COUNT/COUNT_STAR partial is an INT64
+      // count column (cudf widened it), which must be SUMMED across the shuffle,
+      // not re-counted. SUM/MIN/MAX are already associative and stay as-is.
+      for (size_t i = 0; i < aggregates.size(); ++i)
+        if (agg_mode[i] == AggregationType::COUNT_STAR ||
+            agg_mode[i] == AggregationType::COUNT)
+          agg_mode[i] = AggregationType::SUM;
     }
   }
 
@@ -377,6 +407,20 @@ SinkResultType GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_
   SIRIUS_LOG_DEBUG("Perform groupby and aggregation");
 
   auto start = std::chrono::high_resolution_clock::now();
+
+  // Replicated-input guard: if every base table under this aggregate is
+  // REPLICATED (small-table cache layout), all GPUs hold identical full
+  // input — the per-GPU workers would each aggregate the whole thing and the
+  // magi shuffle would merge N identical copies (every value xN). Fail loudly
+  // -> DuckDB fallback. (Replicated input that passed through a join with a
+  // partitioned probe side is partitioned again, so this only trips for
+  // dimension-table-only subtrees.)
+  if (GPUBufferManager::GetMaxGpus() > 1 && !children.empty() &&
+      SubtreeAllReplicated(*children[0])) {
+    throw NotImplementedException(
+      "Multi-GPU GROUP BY over fully-replicated input (small tables only) is not supported; "
+      "falling back to DuckDB");
+  }
 
   // if (distinct_collection_info) {
   // 	SinkDistinct(input_relation);

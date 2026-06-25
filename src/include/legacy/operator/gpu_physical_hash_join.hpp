@@ -127,6 +127,26 @@ void scanHashTableRight(unsigned long long* ht,
                         int join_mode,
                         int num_keys);
 
+//! Per-GPU runtime state for the hash join. Under the parallel multi-GPU
+//! executor every worker thread runs Sink/Execute/GetData on the shared
+//! operator instance; everything an execution mutates lives here, indexed by
+//! sirius_current_gpu. With the broadcast build (see Sink), each GPU holds
+//! its own full copy of the build side, hash table, and uniqueness flags.
+struct HashJoinRuntimeState : OpRuntimeState {
+  unsigned long long* gpu_hash_table = nullptr;
+  uint64_t ht_len                    = 0;
+  //! Full (allgathered) build side: join-key columns + payload columns,
+  //! indexed the same way the plan-time `hash_table_result` template is.
+  shared_ptr<GPUIntermediateRelation> hash_table_result;
+  //! Materialized build keys in condition order (probe-side cudf joins read
+  //! these directly).
+  shared_ptr<GPUIntermediateRelation> materialized_build_key;
+  bool unique_build_keys             = false;
+  bool unique_probe_keys             = false;
+  //! Set when FULL OUTER JOIN was fully handled via cudf in Execute().
+  bool outer_join_handled_in_execute = false;
+};
+
 class GPUPhysicalHashJoin : public GPUPhysicalOperator {
  public:
   static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::HASH_JOIN;
@@ -176,14 +196,6 @@ class GPUPhysicalHashJoin : public GPUPhysicalOperator {
   //! Duplicate eliminated types; only used for delim_joins (i.e. correlated subqueries)
   vector<LogicalType> delim_types;
 
-  mutable bool unique_build_keys = false;
-
-  mutable bool unique_probe_keys = false;
-
-  //! Set to true when FULL OUTER JOIN is handled via cudf in Execute()
-  //! (all indices including unmatched build rows are already emitted)
-  mutable bool outer_join_handled_in_execute = false;
-
   OperatorResultType Execute(GPUIntermediateRelation& input_relation,
                              GPUIntermediateRelation& output_relation) const override;
 
@@ -214,11 +226,9 @@ class GPUPhysicalHashJoin : public GPUPhysicalOperator {
   bool IsSink() const override { return true; }
   bool ParallelSink() const override { return true; }
 
-  mutable unsigned long long* gpu_hash_table;
-  mutable uint64_t ht_len;
-
+  //! Plan-time size templates only (column counts). The per-execution
+  //! instances holding actual data live in HashJoinRuntimeState (per GPU).
   shared_ptr<GPUIntermediateRelation> hash_table_result;
-
   shared_ptr<GPUIntermediateRelation> materialized_build_key;
 };
 }  // namespace duckdb

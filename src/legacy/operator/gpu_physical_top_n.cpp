@@ -172,10 +172,9 @@ SourceResultType GPUPhysicalTopN::GetData(GPUIntermediateRelation& output_relati
       auto output_col_validity_mask = sort_result->columns[col]->data_wrapper.validity_mask;
       if (offset > 0) {
         auto new_mask = cudf::copy_bitmask(output_col_validity_mask, offset, offset + limit_const);
-        gpuBufferManager->rmm_stored_buffers.push_back(
-          std::make_unique<rmm::device_buffer>(std::move(new_mask)));
         output_col_validity_mask = reinterpret_cast<cudf::bitmask_type*>(
-          gpuBufferManager->rmm_stored_buffers.back()->data());
+          gpuBufferManager->storeRmmBuffer(
+            std::make_unique<rmm::device_buffer>(std::move(new_mask))));
       }
       output_relation.columns[col] =
         make_shared_ptr<GPUColumn>(limit_const,

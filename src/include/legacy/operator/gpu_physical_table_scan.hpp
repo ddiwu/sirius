@@ -159,6 +159,10 @@ class GPUPhysicalTableScan : public GPUPhysicalOperator {
   vector<LogicalType> orig_scanned_types;
   bool exhausted = false;
 
+  //! Unqualified table name this scan reads (upper-cased, as keyed in the
+  //! GPUBufferManager catalog).
+  string GetCatalogTableName() const;
+
  public:
   SourceResultType GetData(GPUIntermediateRelation& output_relation) const override;
 
@@ -177,5 +181,16 @@ class GPUPhysicalTableScan : public GPUPhysicalOperator {
                                                    GlobalSourceState& gstate) const override;
   unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext& context) const override;
 };
+
+//! True iff every leaf under `op` is a TABLE_SCAN over a table the multi-GPU
+//! cache REPLICATED (see TableShouldReplicate). Such a subtree computes the
+//! identical full result on every GPU:
+//!   - the hash join requires this of its build side (broadcast join), and
+//!   - aggregates / result collection must NOT consume such input directly
+//!     (every GPU would contribute the same rows -> N-times duplication).
+//! Any unknown leaf type conservatively returns false. Only valid after the
+//! subtree's scans have cached their tables (pipeline order guarantees this
+//! for the Sink-time callers).
+bool SubtreeAllReplicated(const GPUPhysicalOperator& op);
 
 }  // namespace duckdb

@@ -23,6 +23,8 @@
 #include "helper/common.h"
 #include "utils.hpp"
 
+#include <mutex>
+
 #include <rmm/version_config.hpp>
 
 namespace duckdb {
@@ -204,7 +206,37 @@ class GPUBufferManager {
                     int gpu);
   bool checkIfColumnCached(string table_name, string column_name, int gpu);
 
-  std::vector<std::unique_ptr<rmm::device_buffer>> rmm_stored_buffers;
+  // Per-GPU list so each worker pushes into its OWN sublist (the old single
+  // shared vector raced: two workers' cudf joins push_back concurrently →
+  // reallocation corrupts it → dropped device_buffers freed while a join's
+  // row_ids still point into them → garbage / zero rows). The push is still
+  // guarded by `alloc_mutex` because customCudaFree's cross-GPU fallback scans
+  // EVERY GPU's sublist while another GPU's worker may be appending to it.
+  std::vector<std::vector<std::unique_ptr<rmm::device_buffer>>> rmm_stored_buffers;
+
+  // Serializes all host-side buffer-manager metadata: allocation_table /
+  // locked_allocation_table (std::map) and rmm_stored_buffers (std::vector).
+  // Multi-GPU execution runs one worker thread per GPU concurrently; a worker
+  // that frees a buffer it did NOT allocate on its own GPU (a real cross-GPU
+  // free, e.g. a cudf-join intermediate) must scan the OTHER GPUs' tables,
+  // which those GPUs' workers are concurrently mutating. Reading/writing a
+  // std::map from two threads without this lock is UB (it manifested as a
+  // near-deterministic "Pointer not found" throw on one worker → that worker
+  // skips magi_groupby::Run → the peer hangs forever on the NUM_GPUS-way
+  // std::barrier → Magi deadlock). The RMM allocate() call in customCudaMalloc
+  // stays OUTSIDE this lock (RMM is internally thread-safe); only the map
+  // bookkeeping is serialized.
+  std::mutex alloc_mutex;
+
+  // Append a kept-alive buffer to the CURRENT worker's per-GPU list and return
+  // its device pointer (callers need it after the move).
+  void* storeRmmBuffer(std::unique_ptr<rmm::device_buffer> buf)
+  {
+    void* p = buf->data();
+    std::lock_guard<std::mutex> lk(alloc_mutex);
+    rmm_stored_buffers[sirius_current_gpu].push_back(std::move(buf));
+    return p;
+  }
 
   // create an allocation table that keep tracks of the allocation of the memory, it stores the
   // pointer, size, and the gpu id

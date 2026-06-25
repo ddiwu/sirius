@@ -251,6 +251,11 @@ class GPUIntermediateRelation {
   vector<string> column_names;
   vector<shared_ptr<GPUColumn>> columns;
   size_t column_count;
+  //! Multi-GPU cache layout of this (cached-table) relation: true when every
+  //! GPU holds the FULL table (small tables are replicated at scan time so
+  //! they can serve as broadcast-join build sides), false when each GPU holds
+  //! its disjoint row-range partition (the default for large tables).
+  bool is_replicated = false;
 };
 
 }  // namespace duckdb

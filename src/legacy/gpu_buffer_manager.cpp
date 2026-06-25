@@ -25,6 +25,8 @@
 #include "operator/gpu_physical_table_scan.hpp"
 #include "utils.hpp"
 
+#include <cstdio>
+
 #include <rmm/aligned.hpp>
 #include <rmm/cuda_stream_view.hpp>
 
@@ -215,6 +217,7 @@ GPUBufferManager::GPUBufferManager(size_t cache_size_per_gpu,
   set_current_gpu_resource(*mr);
   allocation_table.resize(NUM_GPUS);
   locked_allocation_table.resize(NUM_GPUS);
+  rmm_stored_buffers.resize(NUM_GPUS);
 
   for (int gpu = 0; gpu < NUM_GPUS; gpu++) {
     if (Config::USE_PIN_MEM_FOR_CACHING) {
@@ -298,6 +301,9 @@ void GPUBufferManager::set_gpu_for_thread(int g)
 
 void GPUBufferManager::ResetBuffer()
 {
+  // Called single-threaded between queries, but take the lock defensively so
+  // the table/buffer mutations here can never overlap a stray free.
+  std::lock_guard<std::mutex> lk(alloc_mutex);
   for (int gpu = 0; gpu < NUM_GPUS; gpu++) {
     SIRIUS_LOG_DEBUG("Resetting buffer for GPU {}", gpu);
     cudaSetDevice(gpu);
@@ -330,7 +336,7 @@ void GPUBufferManager::ResetBuffer()
     if (!locked_allocation_table[gpu].empty()) {
       throw InvalidInputException("Locked allocation table is not empty");
     }
-    rmm_stored_buffers.clear();
+    rmm_stored_buffers[gpu].clear();  // per-GPU; outer vector keeps its NUM_GPUS slots
     // SIRIUS_LOG_DEBUG("pool size {}", mr->pool_size());
 
     // size_t allocated_size = mr->pool_size();
@@ -407,6 +413,10 @@ T* GPUBufferManager::customCudaMalloc(size_t size, int gpu, bool caching)
     auto* gmr  = mr_per_gpu[t_gpu];
     void* ptr  = gmr->allocate(rmm::cuda_stream_view{}, alloc, rmm::CUDA_ALLOCATION_ALIGNMENT);
     if (ptr == nullptr) throw InvalidInputException("Pointer is nullptr");
+    // RMM allocate above is left outside the lock (RMM is thread-safe); only
+    // the std::map bookkeeping is serialized, because another GPU's worker may
+    // be scanning allocation_table[t_gpu] in customCudaFree's cross-GPU path.
+    std::lock_guard<std::mutex> lk(alloc_mutex);
     if (allocation_table[t_gpu].find(ptr) != allocation_table[t_gpu].end()) {
       throw InvalidInputException("Pointer already exists in allocation table");
     }
@@ -418,6 +428,7 @@ T* GPUBufferManager::customCudaMalloc(size_t size, int gpu, bool caching)
 void GPUBufferManager::lockAllocation(void* ptr, int gpu)
 {
   // move entries from the allocation table to the locked table
+  std::lock_guard<std::mutex> lk(alloc_mutex);
   auto it = allocation_table[gpu].find(ptr);
   if (it != allocation_table[gpu].end()) {
     // SIRIUS_LOG_DEBUG("Locking Pointer {}", static_cast<void*>(ptr));
@@ -445,6 +456,10 @@ void GPUBufferManager::customCudaFree(uint8_t* ptr, int gpu)
     }
   }
 
+  // Everything below reads/writes the allocation tables and rmm_stored_buffers,
+  // which other GPUs' worker threads mutate concurrently — serialize it.
+  std::lock_guard<std::mutex> lk(alloc_mutex);
+
   auto try_dealloc = [&](int g) -> bool {
     auto it = allocation_table[g].find(reinterpret_cast<void*>(ptr));
     if (it != allocation_table[g].end()) {
@@ -456,30 +471,74 @@ void GPUBufferManager::customCudaFree(uint8_t* ptr, int gpu)
     return false;
   };
 
-  // Try caller-provided gpu first, then per-thread current GPU, then scan
-  // every allocation_table. The scan covers the cross-GPU free pattern
-  // introduced by magi_groupby — its per-thread output columns can be
-  // allocated on any GPU but get freed inside CombineColumns from a
-  // thread whose hint is GPU 0.
-  if (try_dealloc(gpu)) return;
-  if (gpu != sirius_current_gpu && try_dealloc(sirius_current_gpu)) return;
-  for (int g = 0; g < static_cast<int>(allocation_table.size()); ++g) {
-    if (g == gpu || g == sirius_current_gpu) continue;
-    if (try_dealloc(g)) return;
+  // Own GPU first (cheapest common case). Cross-GPU frees do happen (a cudf
+  // join / cache-load intermediate allocated under one current-GPU and freed
+  // by another worker), so the fallback scans below are real — they just must
+  // run under the lock above.
+  const int cur = sirius_current_gpu;
+  if (try_dealloc(cur)) return;
+  if (cur == gpu && locked_allocation_table[cur].find(reinterpret_cast<void*>(ptr)) !=
+                      locked_allocation_table[cur].end()) {
+    return;  // locked on own GPU, do not free
+  }
+  for (auto& buf : rmm_stored_buffers[cur]) {
+    if (ptr == reinterpret_cast<uint8_t*>(buf->data())) { return; }  // own-GPU stored buffer
   }
 
-  // Not in any allocation_table — check locked tables and rmm_stored_buffers.
+  // Anything below touches ANOTHER GPU's bookkeeping (cross-GPU free). That is
+  // only legitimate from a single-threaded phase (result consolidation / reset).
+  // Instrumented: if this ever fires while the per-GPU workers run concurrently
+  // it would be a data race — the [XGPUFREE] marker lets us confirm it doesn't.
+  if (gpu != cur && try_dealloc(gpu)) {
+    std::fprintf(stderr, "[XGPUFREE] explicit cur=%d gpu=%d\n", cur, gpu);
+    return;
+  }
+  for (int g = 0; g < static_cast<int>(allocation_table.size()); ++g) {
+    if (g == cur || g == gpu) continue;
+    if (try_dealloc(g)) {
+      std::fprintf(stderr, "[XGPUFREE] alloc-scan cur=%d found=%d\n", cur, g);
+      return;
+    }
+  }
   for (int g = 0; g < static_cast<int>(mr_per_gpu.size()); ++g) {
+    if (g == cur) continue;
     if (locked_allocation_table[g].find(reinterpret_cast<void*>(ptr)) !=
         locked_allocation_table[g].end()) {
+      std::fprintf(stderr, "[XGPUFREE] locked-scan cur=%d found=%d\n", cur, g);
       return;  // locked, do not free
     }
   }
-  for (auto& buf : rmm_stored_buffers) {
-    if (ptr == reinterpret_cast<uint8_t*>(buf->data())) { return; }
+  for (int g = 0; g < static_cast<int>(rmm_stored_buffers.size()); ++g) {
+    if (g == cur) continue;
+    for (auto& buf : rmm_stored_buffers[g]) {
+      if (ptr == reinterpret_cast<uint8_t*>(buf->data())) {
+        std::fprintf(stderr, "[XGPUFREE] stored-scan cur=%d found=%d\n", cur, g);
+        return;
+      }
+    }
   }
 
   SIRIUS_LOG_DEBUG("Invalid Pointer {}", static_cast<void*>(ptr));
+  // A VALID device pointer that is in no sirius allocation table is owned by cudf
+  // (allocated via the RMM resource inside a cudf join/groupby, not customCudaMalloc).
+  // cudf frees it through its own resource when the result table is destroyed, so
+  // customCudaFree must NOT throw or double-free here — just skip it. Only a truly
+  // wild/unregistered pointer (lookup error or not device memory) is a real bug.
+  {
+    cudaPointerAttributes a{};
+    cudaError_t           e = cudaPointerGetAttributes(&a, reinterpret_cast<void*>(ptr));
+    cudaGetLastError();
+    if (e == cudaSuccess && a.type == cudaMemoryTypeDevice) {
+      static int warned = 0;
+      if (warned++ < 3)
+        SIRIUS_LOG_DEBUG("customCudaFree: skipping cudf-owned device ptr not in sirius table");
+      return;
+    }
+    std::fprintf(stderr, "[FREE-WILD] ptr=%p cur_gpu=%d sirius_current_gpu=%d perr=%d ptr_dev=%d ptr_type=%d\n",
+                 reinterpret_cast<void*>(ptr), cur, sirius_current_gpu, static_cast<int>(e),
+                 a.device, static_cast<int>(a.type));
+    std::fflush(stderr);
+  }
   throw InvalidInputException("Pointer not found in allocation table");
 }
 

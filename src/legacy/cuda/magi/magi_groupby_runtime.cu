@@ -94,6 +94,21 @@ __global__ void init_global_agg_slots(magi_ops::AggSlot64<KeyT>* agg, int n_slot
     agg[i].key = magi_ops::empty_key_v<KeyT>;
   }
 }
+
+// Flush helper: GPU-compact the LIVE slots of a tier-sized hash table into a dense
+// prefix of `out`, counting them via an atomic. Lets the flush D2H + host loop run
+// in O(live) instead of O(tier) (XLARGE = 16M slots = 1 GB scanned per GPU).
+template <typename KeyT>
+__global__ void compact_live_slots_kernel(const magi_ops::AggSlot64<KeyT>* __restrict__ in,
+                                          magi_ops::AggSlot64<KeyT>* __restrict__       out,
+                                          unsigned int* __restrict__                    count,
+                                          int                                           n_slots)
+{
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n_slots) return;
+  if (in[i].key == magi_ops::empty_key_v<KeyT>) return;
+  out[atomicAdd(count, 1u)] = in[i];
+}
 }}  // namespace duckdb::magi_generic
 
 // ── Explicit kernel instantiations (KeyT × N_GLOBAL_SLOTS tier) ───────────
@@ -377,15 +392,31 @@ static std::size_t run_per_gpu_typed_tier(int                        gpu_id,
   cudaMemcpy(&overflow_count, g_overflow_dev[gpu_id], sizeof(unsigned int),
              cudaMemcpyDeviceToHost);
 
-  // D2H only the active tier's prefix (saves up to 64 MB at SMALL).
-  const size_t tier_bytes = static_cast<size_t>(N_SLOTS)
-                          * sizeof(magi_ops::AggSlot64<KeyT>);
-  std::vector<magi_ops::AggSlot64<KeyT>> host(N_SLOTS);
-  cudaMemcpy(host.data(), g_agg_dev[gpu_id], tier_bytes, cudaMemcpyDeviceToHost);
+  // Flush-compaction: GPU-compact the live slots into a dense buffer (reuse
+  // g_stage_dev — free once the producer pre-agg is done; counter reuses
+  // g_overflow_dev, already read into overflow_count above) so the D2H + host loop
+  // are O(live) not O(tier). At XLARGE this avoids a 1 GB D2H + a 16M-slot host
+  // scan — the dominant cost of high-cardinality GROUP BY (nsys: ~430ms host-side).
+  auto*        agg_d = reinterpret_cast<magi_ops::AggSlot64<KeyT>*>(g_agg_dev[gpu_id]);
+  auto*        dense = reinterpret_cast<magi_ops::AggSlot64<KeyT>*>(g_stage_dev[gpu_id]);
+  cudaStream_t st    = magi_q1::magi_stream(gpu_id);
+  cudaMemsetAsync(g_overflow_dev[gpu_id], 0, sizeof(unsigned int), st);
+  constexpr int CB = 256;
+  const int     cg = (N_SLOTS + CB - 1) / CB;
+  compact_live_slots_kernel<KeyT><<<cg, CB, 0, st>>>(agg_d, dense,
+                                                     g_overflow_dev[gpu_id], N_SLOTS);
+  unsigned int live = 0;
+  cudaMemcpyAsync(&live, g_overflow_dev[gpu_id], sizeof(unsigned int),
+                  cudaMemcpyDeviceToHost, st);
+  cudaStreamSynchronize(st);
+  std::vector<magi_ops::AggSlot64<KeyT>> host(live);
+  cudaMemcpy(host.data(), dense,
+             static_cast<size_t>(live) * sizeof(magi_ops::AggSlot64<KeyT>),
+             cudaMemcpyDeviceToHost);
 
   my_slice.clear();
-  for (int j = 0; j < N_SLOTS; ++j) {
-    if (host[j].key == magi_ops::empty_key_v<KeyT>) continue;
+  my_slice.reserve(live);
+  for (unsigned int j = 0; j < live; ++j) {
     AggResultRow row{};
     // Widen KeyT to the 128-bit result key. For int32/uint64 zero-extend via
     // the unsigned cast (the caller re-narrows on emit; sign-extension would

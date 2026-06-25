@@ -39,5 +39,10 @@ void Run(int                                gpu_id,
          int                                num_aggregates,
          sirius::AggregationType*           agg_mode);
 
+// True iff this per-GPU slice is high-cardinality (would route magi to XLARGE).
+// The operator runs a cudf local groupby first for these, then calls Run() on the
+// reduced partials with re-aggregation agg modes (COUNT*->SUM, etc.).
+bool ShouldCudfPreAgg(const vector<shared_ptr<GPUColumn>>& keys, int n_keys);
+
 }  // namespace magi_groupby
 }  // namespace duckdb

@@ -28,6 +28,7 @@
 
 #include <nvtx3/nvtx3.hpp>
 
+#include <cstdio>
 #include <stdio.h>
 
 #include <atomic>
@@ -259,6 +260,20 @@ void GPUExecutor::Execute()
   }  // end for-pipeline
     } catch (...) {
       *err_slot = std::current_exception();
+      // Surface the exception the moment a worker catches it. Otherwise it is
+      // stored and only rethrown AFTER every worker joins (line ~278) — but if
+      // a peer is blocked on magi_groupby::Run's NUM_GPUS-way std::barrier
+      // (this worker never arrived), that join never returns and the message
+      // is never printed: the query just hangs until the Magi deadlock detector
+      // fires. Printing here turns a silent barrier deadlock into a diagnosable
+      // "[WORKER-THROW] gpu=N: <reason>".
+      try {
+        std::rethrow_exception(*err_slot);
+      } catch (const std::exception& ex) {
+        std::fprintf(stderr, "[WORKER-THROW] gpu=%d: %s\n", gpu_iter, ex.what());
+      } catch (...) {
+        std::fprintf(stderr, "[WORKER-THROW] gpu=%d: <non-std exception>\n", gpu_iter);
+      }
     }
   };  // end worker_body lambda
 

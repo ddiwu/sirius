@@ -28,6 +28,7 @@
 #include "gpu_pipeline.hpp"
 #include "log/logging.hpp"
 #include "operator/gpu_materialize.hpp"
+#include "operator/gpu_physical_table_scan.hpp"
 #include "operator/gpu_physical_ungrouped_aggregate.hpp"
 #include "utils.hpp"
 
@@ -499,6 +500,16 @@ SinkResultType GPUPhysicalMaterializedCollector::ConvertGPUTableToCPUCollection(
 
 SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation& input_relation) const
 {
+  // Replicated-input guard: a plan whose every base table is REPLICATED
+  // (small-tables-only query) produces the identical full result on every
+  // GPU worker — merging the per-GPU collections would return N copies of
+  // each row. Fail loudly -> DuckDB fallback.
+  if (GPUBufferManager::GetMaxGpus() > 1 && SubtreeAllReplicated(plan)) {
+    throw NotImplementedException(
+      "Multi-GPU query over only replicated (small) tables is not supported; "
+      "falling back to DuckDB");
+  }
+
   // Each GPU worker thread accumulates into its own per-GPU collection. They
   // are merged at GetResult time. Lazy-init on first Sink for this GPU.
   auto& rstate = runtime_state<ResultCollectorRuntimeState>(sirius_current_gpu);

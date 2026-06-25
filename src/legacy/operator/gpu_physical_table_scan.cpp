@@ -16,6 +16,8 @@
 
 #include "operator/gpu_physical_table_scan.hpp"
 
+#include <cstdlib>
+
 #include "config.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/execution/execution_context.hpp"
@@ -1163,6 +1165,61 @@ SourceResultType GPUPhysicalTableScan::GetDataDuckDBOpt(ExecutionContext& exec_c
   SIRIUS_LOG_DEBUG("GetDataDuckDBOpt updated num rows to {}", num_rows);
 }
 
+// Replicate-vs-partition decision for the multi-GPU cache, by table row
+// count. Small tables (dimension tables: nation/region/supplier...) are
+// replicated on every GPU so joins can use them as broadcast build sides;
+// large tables are range-partitioned. Tunable via SIRIUS_REPLICATE_ROW_LIMIT
+// (rows); the default admits supplier at SF100 (1M rows) and rejects
+// customer/part and the fact tables.
+static bool TableShouldReplicate(uint64_t num_rows)
+{
+  static const uint64_t limit = [] {
+    if (const char* env = std::getenv("SIRIUS_REPLICATE_ROW_LIMIT")) {
+      return static_cast<uint64_t>(std::strtoull(env, nullptr, 10));
+    }
+    return static_cast<uint64_t>(2) * 1000 * 1000;
+  }();
+  return num_rows <= limit;
+}
+
+string GPUPhysicalTableScan::GetCatalogTableName() const
+{
+  TableFunctionToStringInput input(function, bind_data.get());
+  auto to_string_result = function.to_string(input);
+  string table_name;
+  for (const auto& it : to_string_result) {
+    if (it.first.compare("Table") == 0) {
+      // DuckDB v1.5.0 returns a fully qualified name; keep the last component.
+      auto& qualified = it.second;
+      auto dot        = qualified.rfind('.');
+      table_name      = (dot == string::npos) ? qualified : qualified.substr(dot + 1);
+      break;
+    }
+  }
+  transform(table_name.begin(), table_name.end(), table_name.begin(), ::toupper);
+  return table_name;
+}
+
+bool SubtreeAllReplicated(const GPUPhysicalOperator& op)
+{
+  if (op.type == PhysicalOperatorType::TABLE_SCAN) {
+    auto& scan      = op.Cast<GPUPhysicalTableScan>();
+    auto table_name = scan.GetCatalogTableName();
+    auto& tables    = GPUBufferManager::GetInstance().tables_per_gpu[0];
+    auto it         = tables.find(table_name);
+    return it != tables.end() && it->second->is_replicated;
+  }
+  auto children = op.GetChildren();
+  if (children.empty()) {
+    // Unknown leaf (DELIM_SCAN, CTE, ...): assume partitioned.
+    return false;
+  }
+  for (auto& child : children) {
+    if (!SubtreeAllReplicated(child.get())) { return false; }
+  }
+  return true;
+}
+
 void GPUPhysicalTableScan::ScanDataDuckDBOpt(ExecutionContext& exec_context,
                                              GPUBufferManager* gpuBufferManager,
                                              string table_name)
@@ -1416,15 +1473,34 @@ void GPUPhysicalTableScan::ScanDataDuckDBOpt(ExecutionContext& exec_context,
       }
     }
 
+    // Multi-GPU cache layout. Small tables are REPLICATED (every GPU caches
+    // the full row range) so they can serve as broadcast-join build sides
+    // with zero cross-GPU traffic at join time; large tables are PARTITIONED
+    // into disjoint row ranges as before. The decision is per table, by row
+    // count, and deterministic — later incremental column caches of the same
+    // table recompute the same answer, keeping all its columns in one layout.
+    // Consumers (hash join build gate, aggregate duplication guard) read the
+    // flag from the catalog entry, set below.
+    const bool replicate_table = NUM_G > 1 && TableShouldReplicate(num_rows);
+    if (replicate_table) {
+      SIRIUS_LOG_DEBUG("Replicating table {} on all GPUs ({} rows)", table_name, num_rows);
+    }
+
     // Per-GPU row range: align per_gpu_rows up to a multiple of 8 so mask
     // bytes are byte-aligned.
     const size_t per_gpu_rows_unaligned = (num_rows + NUM_G - 1) / NUM_G;
     const size_t per_gpu_rows           = ((per_gpu_rows_unaligned + 7) / 8) * 8;
     vector<size_t> gpu_row_lo(NUM_G), gpu_row_hi(NUM_G);
     for (int g = 0; g < NUM_G; ++g) {
-      gpu_row_lo[g] = std::min(static_cast<size_t>(g) * per_gpu_rows, static_cast<size_t>(num_rows));
-      gpu_row_hi[g] =
-        std::min(static_cast<size_t>(g + 1) * per_gpu_rows, static_cast<size_t>(num_rows));
+      if (replicate_table) {
+        gpu_row_lo[g] = 0;
+        gpu_row_hi[g] = num_rows;
+      } else {
+        gpu_row_lo[g] =
+          std::min(static_cast<size_t>(g) * per_gpu_rows, static_cast<size_t>(num_rows));
+        gpu_row_hi[g] =
+          std::min(static_cast<size_t>(g + 1) * per_gpu_rows, static_cast<size_t>(num_rows));
+      }
     }
 
     // Per-GPU device pointer arrays, indexed [gpu][col].
@@ -1550,8 +1626,18 @@ void GPUPhysicalTableScan::ScanDataDuckDBOpt(ExecutionContext& exec_context,
         }
       }
     }
-    cudaSetDevice(0);
-    cudaDeviceSynchronize();
+    // Sync EVERY GPU's async replica copies (cudaDeviceSynchronize only covers the
+    // current device, so the old single cudaSetDevice(0)+sync left other GPUs'
+    // copies in flight), then RESTORE this worker's device. The old hardcoded
+    // cudaSetDevice(0) left the calling thread on GPU 0 while sirius_current_gpu
+    // stayed on the worker's real GPU — so every downstream allocation/column in a
+    // multi-GPU broadcast join landed on the wrong device (validity_mask wild
+    // pointer, then "pointer not found in allocation table" -> magi barrier deadlock).
+    for (int g = 0; g < NUM_G; ++g) {
+      cudaSetDevice(g);
+      cudaDeviceSynchronize();
+    }
+    cudaSetDevice(sirius_current_gpu);
 
     // (No GPU prefix sum needed — VARCHAR offsets were prefix-summed on host
     // before partitioning so that each GPU's slice could be computed in
@@ -1564,6 +1650,7 @@ void GPUPhysicalTableScan::ScanDataDuckDBOpt(ExecutionContext& exec_context,
     //                  num_bytes = data_bytes_per_gpu[g][col]
     for (int g = 0; g < NUM_G; ++g) {
       auto& table_g = gpuBufferManager->tables_per_gpu[g][up_table_name];
+      table_g->is_replicated = replicate_table;
       size_t rows_g = gpu_row_hi[g] - gpu_row_lo[g];
       for (int col = 0; col < column_ids.size() - gen_row_id_column; col++) {
         if (already_cached[col]) continue;

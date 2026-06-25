@@ -904,6 +904,18 @@ void WriteGenericSliceToColumns(int                                             
 
 }  // namespace
 
+// High-cardinality predicate (exported): true iff this per-GPU slice would route
+// magi to the XLARGE tier — i.e. a BIGINT-keyed GROUP BY with a large row-count
+// proxy. For these the operator does a cudf LOCAL aggregation first (no fixed cap,
+// reduces rows -> distinct), then magi re-aggregates the partials over NVLink with
+// a tier sized from the (now small) distinct count. Reuses PickTableSize so the
+// cudf-vs-magi-direct decision and the tier picker cannot drift; every GPU sees
+// ~the same row count and so decides identically (the begin barrier stays balanced).
+bool ShouldCudfPreAgg(const vector<shared_ptr<GPUColumn>>& keys, int n_keys)
+{
+  return PickTableSize(keys, n_keys) == magi_generic::TableSize::XLARGE;
+}
+
 void Run(int                                gpu_id,
          vector<shared_ptr<GPUColumn>>&     group_by_keys,
          vector<shared_ptr<GPUColumn>>&     aggregate_keys,

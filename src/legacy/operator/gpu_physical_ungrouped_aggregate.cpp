@@ -17,8 +17,10 @@
 #include "operator/gpu_physical_ungrouped_aggregate.hpp"
 
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "gpu_buffer_manager.hpp"
 #include "log/logging.hpp"
 #include "operator/gpu_materialize.hpp"
+#include "operator/gpu_physical_table_scan.hpp"
 
 namespace duckdb {
 using sirius::AggregationType;
@@ -135,6 +137,16 @@ SinkResultType GPUPhysicalUngroupedAggregate::Sink(GPUIntermediateRelation& inpu
 {
   SIRIUS_LOG_DEBUG("Performing ungrouped aggregation");
   auto start = std::chrono::high_resolution_clock::now();
+
+  // Replicated-input guard (see GPUPhysicalGroupedAggregate::Sink): all GPUs
+  // holding identical full input would each contribute the whole aggregate
+  // -> values xN after the cross-GPU merge. Fail loudly -> DuckDB fallback.
+  if (GPUBufferManager::GetMaxGpus() > 1 && !children.empty() &&
+      SubtreeAllReplicated(*children[0])) {
+    throw NotImplementedException(
+      "Multi-GPU ungrouped aggregate over fully-replicated input (small tables only) is not "
+      "supported; falling back to DuckDB");
+  }
   vector<shared_ptr<GPUColumn>> aggregate_column(aggregates.size());
   for (int aggr_idx = 0; aggr_idx < aggregates.size(); aggr_idx++) {
     aggregate_column[aggr_idx] = nullptr;

@@ -16,6 +16,8 @@
 
 #include "operator/gpu_physical_hash_join.hpp"
 
+#include <cstdlib>
+
 #include "duckdb/common/enums/physical_operator_type.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "gpu_buffer_manager.hpp"
@@ -23,6 +25,7 @@
 #include "gpu_pipeline.hpp"
 #include "log/logging.hpp"
 #include "operator/gpu_materialize.hpp"
+#include "operator/gpu_physical_table_scan.hpp"
 
 namespace duckdb {
 
@@ -465,7 +468,8 @@ SourceResultType GPUPhysicalHashJoin::GetData(GPUIntermediateRelation& output_re
     throw InvalidInputException("Get data not supported for this join type");
   }
 
-  if (join_type == JoinType::OUTER && outer_join_handled_in_execute) {
+  auto& rstate = runtime_state<HashJoinRuntimeState>(sirius_current_gpu);
+  if (join_type == JoinType::OUTER && rstate.outer_join_handled_in_execute) {
     // cudf::full_join already emitted all rows (matched + unmatched on both sides)
     // in Execute(), so GetData has nothing more to produce.
     auto end      = std::chrono::high_resolution_clock::now();
@@ -478,15 +482,16 @@ SourceResultType GPUPhysicalHashJoin::GetData(GPUIntermediateRelation& output_re
   uint64_t* row_ids                  = nullptr;
   uint64_t* count                    = nullptr;
   GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
-  HandleScanHTExpression(gpu_hash_table, ht_len, row_ids, count, join_type, conditions);
+  HandleScanHTExpression(
+    rstate.gpu_hash_table, rstate.ht_len, row_ids, count, join_type, conditions);
 
   for (idx_t i = 0; i < rhs_output_columns.col_idxs.size(); i++) {
     const auto rhs_col = rhs_output_columns.col_idxs[i];
     SIRIUS_LOG_DEBUG("Writing hash_table column {} to column {}", rhs_col, i);
   }
   // TODO: Check if we need to maintain unique for the RHS columns
-  if (unique_probe_keys) {
-    HandleMaterializeRowIDsRHS(*hash_table_result,
+  if (rstate.unique_probe_keys) {
+    HandleMaterializeRowIDsRHS(*rstate.hash_table_result,
                                output_relation,
                                rhs_output_columns.col_idxs,
                                left_column_count,
@@ -495,7 +500,7 @@ SourceResultType GPUPhysicalHashJoin::GetData(GPUIntermediateRelation& output_re
                                gpuBufferManager,
                                true);
   } else {
-    HandleMaterializeRowIDsRHS(*hash_table_result,
+    HandleMaterializeRowIDsRHS(*rstate.hash_table_result,
                                output_relation,
                                rhs_output_columns.col_idxs,
                                left_column_count,
@@ -567,6 +572,7 @@ OperatorResultType GPUPhysicalHashJoin::Execute(GPUIntermediateRelation& input_r
   }
 
   GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
+  auto& rstate = runtime_state<HashJoinRuntimeState>(sirius_current_gpu);
   vector<shared_ptr<GPUColumn>> probe_key(conditions.size());
   for (int i = 0; i < conditions.size(); i++) {
     probe_key[i] = nullptr;
@@ -581,7 +587,7 @@ OperatorResultType GPUPhysicalHashJoin::Execute(GPUIntermediateRelation& input_r
   for (idx_t cond_idx = 0; cond_idx < conditions.size(); cond_idx++) {
     auto& condition     = conditions[cond_idx];
     auto join_key_index = condition.left->Cast<BoundReferenceExpression>().index;
-    if (input_relation.columns[join_key_index]->is_unique) { unique_probe_keys = true; }
+    if (input_relation.columns[join_key_index]->is_unique) { rstate.unique_probe_keys = true; }
     SIRIUS_LOG_DEBUG("Materializing join key for probing hash table from index {}", join_key_index);
     probe_key[cond_idx] =
       HandleMaterializeExpression(input_relation.columns[join_key_index], gpuBufferManager);
@@ -593,7 +599,7 @@ OperatorResultType GPUPhysicalHashJoin::Execute(GPUIntermediateRelation& input_r
     // check if there is a non-equality condition
     vector<shared_ptr<GPUColumn>> build_key(conditions.size());
     for (int cond_idx = 0; cond_idx < conditions.size(); cond_idx++) {
-      build_key[cond_idx] = materialized_build_key->columns[cond_idx];
+      build_key[cond_idx] = rstate.materialized_build_key->columns[cond_idx];
     }
     if (build_key[0]->column_length > INT32_MAX || probe_key[0]->column_length > INT32_MAX) {
       throw NotImplementedException("Column length greater than INT32_MAX is not supported");
@@ -610,7 +616,7 @@ OperatorResultType GPUPhysicalHashJoin::Execute(GPUIntermediateRelation& input_r
         if (join_type == JoinType::OUTER) {
           cudf_hash_full_join(
             probe_key, build_key, conditions.size(), row_ids_left, row_ids_right, count);
-          outer_join_handled_in_execute = true;
+          rstate.outer_join_handled_in_execute = true;
         } else if (join_type == JoinType::LEFT) {
           cudf_hash_left_join(probe_key,
                               build_key,
@@ -618,7 +624,7 @@ OperatorResultType GPUPhysicalHashJoin::Execute(GPUIntermediateRelation& input_r
                               row_ids_left,
                               row_ids_right,
                               count,
-                              unique_build_keys);
+                              rstate.unique_build_keys);
         } else {
           cudf_hash_inner_join(probe_key,
                                build_key,
@@ -626,7 +632,7 @@ OperatorResultType GPUPhysicalHashJoin::Execute(GPUIntermediateRelation& input_r
                                row_ids_left,
                                row_ids_right,
                                count,
-                               unique_build_keys);
+                               rstate.unique_build_keys);
         }
       } else {
         if (join_type == JoinType::LEFT || join_type == JoinType::OUTER) {
@@ -643,26 +649,27 @@ OperatorResultType GPUPhysicalHashJoin::Execute(GPUIntermediateRelation& input_r
                           count,
                           row_ids_left,
                           row_ids_right,
-                          gpu_hash_table,
-                          ht_len,
+                          rstate.gpu_hash_table,
+                          rstate.ht_len,
                           conditions,
                           join_type,
-                          unique_build_keys,
+                          rstate.unique_build_keys,
                           gpuBufferManager);
     // if (count[0] == 0) throw NotImplementedException("No match found");
   } else if (join_type == JoinType::MARK) {
     SIRIUS_LOG_DEBUG("Writing boolean column to output relation");
-    HandleMarkExpression(probe_key, output, gpu_hash_table, ht_len, conditions, gpuBufferManager);
+    HandleMarkExpression(
+      probe_key, output, rstate.gpu_hash_table, rstate.ht_len, conditions, gpuBufferManager);
   } else if (join_type == JoinType::RIGHT_SEMI || join_type == JoinType::RIGHT_ANTI) {
     HandleProbeExpression(probe_key,
                           count,
                           row_ids_left,
                           row_ids_right,
-                          gpu_hash_table,
-                          ht_len,
+                          rstate.gpu_hash_table,
+                          rstate.ht_len,
                           conditions,
                           join_type,
-                          unique_build_keys,
+                          rstate.unique_build_keys,
                           gpuBufferManager);
   } else {
     throw NotImplementedException("Unsupported join type");
@@ -673,7 +680,7 @@ OperatorResultType GPUPhysicalHashJoin::Execute(GPUIntermediateRelation& input_r
       join_type == JoinType::RIGHT || join_type == JoinType::LEFT || join_type == JoinType::OUTER) {
     SIRIUS_LOG_DEBUG("Writing LHS columns to output relation");
 
-    if (join_type == JoinType::SEMI || join_type == JoinType::ANTI || unique_build_keys) {
+    if (join_type == JoinType::SEMI || join_type == JoinType::ANTI || rstate.unique_build_keys) {
       HandleMaterializeRowIDsLHS(input_relation,
                                  output_relation,
                                  lhs_output_columns.col_idxs,
@@ -717,7 +724,7 @@ OperatorResultType GPUPhysicalHashJoin::Execute(GPUIntermediateRelation& input_r
       output_relation.columns[i] = make_shared_ptr<GPUColumn>(input_relation.columns[lhs_col]);
       output_relation.columns[i]->row_ids      = input_relation.columns[lhs_col]->row_ids;
       output_relation.columns[i]->row_id_count = input_relation.columns[lhs_col]->row_id_count;
-      if (unique_build_keys) {
+      if (rstate.unique_build_keys) {
         output_relation.columns[i]->is_unique = input_relation.columns[lhs_col]->is_unique;
       } else {
         output_relation.columns[i]->is_unique = false;
@@ -753,19 +760,22 @@ OperatorResultType GPUPhysicalHashJoin::Execute(GPUIntermediateRelation& input_r
   if (join_type == JoinType::INNER || join_type == JoinType::RIGHT || join_type == JoinType::LEFT ||
       join_type == JoinType::OUTER) {
     SIRIUS_LOG_DEBUG("Writing row IDs from RHS to output relation");
-    for (int col = 0; col < hash_table_result->columns.size(); col++) {
+    auto& ht_result = *rstate.hash_table_result;
+    for (int col = 0; col < ht_result.columns.size(); col++) {
       gpuBufferManager->lockAllocation(
-        reinterpret_cast<uint8_t*>(hash_table_result->columns[col]->data_wrapper.data), 0);
+        reinterpret_cast<uint8_t*>(ht_result.columns[col]->data_wrapper.data),
+        sirius_current_gpu);
       gpuBufferManager->lockAllocation(
-        reinterpret_cast<uint8_t*>(hash_table_result->columns[col]->row_ids), 0);
+        reinterpret_cast<uint8_t*>(ht_result.columns[col]->row_ids), sirius_current_gpu);
       // If the column type is VARCHAR, also lock the offset allocation
-      if (hash_table_result->columns[col]->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR) {
+      if (ht_result.columns[col]->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR) {
         gpuBufferManager->lockAllocation(
-          reinterpret_cast<uint8_t*>(hash_table_result->columns[col]->data_wrapper.offset), 0);
+          reinterpret_cast<uint8_t*>(ht_result.columns[col]->data_wrapper.offset),
+          sirius_current_gpu);
       }
     }
-    if (unique_probe_keys) {
-      HandleMaterializeRowIDsRHS(*hash_table_result,
+    if (rstate.unique_probe_keys) {
+      HandleMaterializeRowIDsRHS(ht_result,
                                  output_relation,
                                  rhs_output_columns.col_idxs,
                                  lhs_output_columns.col_idxs.size(),
@@ -774,7 +784,7 @@ OperatorResultType GPUPhysicalHashJoin::Execute(GPUIntermediateRelation& input_r
                                  gpuBufferManager,
                                  true);
     } else {
-      HandleMaterializeRowIDsRHS(*hash_table_result,
+      HandleMaterializeRowIDsRHS(ht_result,
                                  output_relation,
                                  rhs_output_columns.col_idxs,
                                  lhs_output_columns.col_idxs.size(),
@@ -807,13 +817,16 @@ OperatorResultType GPUPhysicalHashJoin::Execute(GPUIntermediateRelation& input_r
         rhs_col,
         i);
       output_relation.columns[i] = make_shared_ptr<GPUColumn>(
-        0, hash_table_result->columns[rhs_col]->data_wrapper.type, nullptr, nullptr);
+        0, rstate.hash_table_result->columns[rhs_col]->data_wrapper.type, nullptr, nullptr);
     }
   }
 
   if (join_type == JoinType::INNER || join_type == JoinType::SEMI || join_type == JoinType::MARK) {
-    if (gpu_hash_table != nullptr)
-      gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(gpu_hash_table), 0);
+    if (rstate.gpu_hash_table != nullptr) {
+      gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(rstate.gpu_hash_table),
+                                       sirius_current_gpu);
+      rstate.gpu_hash_table = nullptr;
+    }
   }
   auto end      = std::chrono::high_resolution_clock::now();
   auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
@@ -832,76 +845,102 @@ SinkResultType GPUPhysicalHashJoin::Sink(GPUIntermediateRelation& input_relation
   }
 
   GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
+  const int num_gpus                 = GPUBufferManager::GetMaxGpus();
+  const int gpu                      = sirius_current_gpu;
+
+  // Multi-GPU broadcast join. The build side must be REPLICATED — i.e. its
+  // subtree reads only tables the scan cached in full on every GPU — so each
+  // GPU builds an identical full hash table locally with zero cross-GPU
+  // traffic, and probes it with its own partition of the probe side. Two
+  // gates, both loud (-> DuckDB fallback):
+  //   1. Join type: only probe-side-semantics joins (each probe row handled
+  //      exactly once on its own GPU). Build-side-emitting types (RIGHT
+  //      family, FULL OUTER) would emit unmatched build rows once per GPU
+  //      and keep per-replica match flags — wrong without a cross-GPU flag
+  //      merge; they need the magi shuffle join.
+  //   2. Build layout: a partitioned (large) build side can't broadcast;
+  //      large-large joins also need the magi shuffle join.
+  if (num_gpus > 1) {
+    // Only the cudf probe path (INNER/LEFT) is multi-GPU-verified. The custom
+    // open-addressing hash-table path (SEMI/ANTI/MARK and the RIGHT/OUTER
+    // family) is not multi-GPU-safe yet — its probe kernel hits illegal
+    // accesses — so fail loud → DuckDB fallback instead of crashing.
+    if (join_type != JoinType::INNER && join_type != JoinType::LEFT) {
+      throw NotImplementedException(
+        "Multi-GPU broadcast hash join only supports INNER/LEFT yet (this join type falls back)");
+    }
+    if (children.size() < 2 || !SubtreeAllReplicated(*children[1])) {
+      throw NotImplementedException(
+        "Multi-GPU hash join: build side is not replicated (large table in build subtree); "
+        "needs the magi shuffle join");
+    }
+  }
+
+  auto& rstate = runtime_state<HashJoinRuntimeState>(gpu);
+
   vector<shared_ptr<GPUColumn>> build_keys(conditions.size());
-  for (idx_t i = 0; i < conditions.size(); i++) {
-    build_keys[i] = nullptr;
-  }
-
-  for (idx_t cond_idx = 0; cond_idx < conditions.size(); cond_idx++) {
-    auto& condition     = conditions[cond_idx];
-    auto join_key_index = condition.right->Cast<BoundReferenceExpression>().index;
-    if (input_relation.columns[join_key_index]->is_unique) { unique_build_keys = true; }
-    SIRIUS_LOG_DEBUG("Materializing join key for building hash table from index {}",
-                     join_key_index);
-    build_keys[cond_idx] =
-      HandleMaterializeExpression(input_relation.columns[join_key_index], gpuBufferManager);
-  }
-
-  SIRIUS_LOG_DEBUG("Building hash table");
-  ht_len = build_keys[0]->column_length * 2;
-  if (join_type == JoinType::INNER || join_type == JoinType::SEMI || join_type == JoinType::MARK ||
-      join_type == JoinType::ANTI) {
-    if (ht_len == 0)
-      gpu_hash_table = nullptr;
-    else
-      gpu_hash_table = (unsigned long long*)gpuBufferManager->customCudaMalloc<uint64_t>(
-        ht_len * (conditions.size() + 1), 0, 0);
-  } else if (join_type == JoinType::RIGHT || join_type == JoinType::RIGHT_SEMI ||
-             join_type == JoinType::RIGHT_ANTI) {
-    if (ht_len == 0)
-      gpu_hash_table = nullptr;
-    else
-      gpu_hash_table = (unsigned long long*)gpuBufferManager->customCudaMalloc<uint64_t>(
-        ht_len * (conditions.size() + 2), 0, 0);
-  }
-
-  if (join_type == JoinType::INNER || join_type == JoinType::LEFT || join_type == JoinType::OUTER) {
-    // check if there is a non-equality condition
-    // bool has_non_equality_condition = false;
-    // for (idx_t i = 0; i < conditions.size(); i++) {
-    // 	if (conditions[i].comparison != ExpressionType::COMPARE_EQUAL && conditions[i].comparison !=
-    // ExpressionType::COMPARE_NOT_DISTINCT_FROM) { 		has_non_equality_condition = true; 		break;
-    // 	}
-    // }
-    // if (!has_non_equality_condition) {
-    // 	cudf_build(build_keys, cudf_hash_table, conditions.size());
-    // }
-  } else {
-    HandleBuildExpression(
-      build_keys, gpu_hash_table, ht_len, conditions, join_type, gpuBufferManager);
-  }
-
-  int right_idx = 0;
   for (idx_t cond_idx = 0; cond_idx < conditions.size(); cond_idx++) {
     auto& condition = conditions[cond_idx];
     if (condition.right->GetExpressionClass() != ExpressionClass::BOUND_REF) {
       throw InvalidInputException("Unsupported join condition");
     }
     auto join_key_index = condition.right->Cast<BoundReferenceExpression>().index;
+    if (input_relation.columns[join_key_index]->is_unique) { rstate.unique_build_keys = true; }
+    SIRIUS_LOG_DEBUG("Materializing join key for building hash table from index {}",
+                     join_key_index);
+    build_keys[cond_idx] =
+      HandleMaterializeExpression(input_relation.columns[join_key_index], gpuBufferManager);
+  }
+
+  // Per-GPU hash table over the (locally complete, replicated) build side.
+  SIRIUS_LOG_DEBUG("Building hash table");
+  rstate.ht_len = build_keys[0]->column_length * 2;
+  if (join_type == JoinType::INNER || join_type == JoinType::SEMI || join_type == JoinType::MARK ||
+      join_type == JoinType::ANTI) {
+    if (rstate.ht_len == 0)
+      rstate.gpu_hash_table = nullptr;
+    else
+      rstate.gpu_hash_table = (unsigned long long*)gpuBufferManager->customCudaMalloc<uint64_t>(
+        rstate.ht_len * (conditions.size() + 1), gpu, 0);
+  } else if (join_type == JoinType::RIGHT || join_type == JoinType::RIGHT_SEMI ||
+             join_type == JoinType::RIGHT_ANTI) {
+    if (rstate.ht_len == 0)
+      rstate.gpu_hash_table = nullptr;
+    else
+      rstate.gpu_hash_table = (unsigned long long*)gpuBufferManager->customCudaMalloc<uint64_t>(
+        rstate.ht_len * (conditions.size() + 2), gpu, 0);
+  }
+
+  if (join_type == JoinType::INNER || join_type == JoinType::LEFT || join_type == JoinType::OUTER) {
+    // INNER/LEFT/OUTER probe through cudf at Execute time using
+    // materialized_build_key; no custom hash table build here.
+  } else {
+    HandleBuildExpression(
+      build_keys, rstate.gpu_hash_table, rstate.ht_len, conditions, join_type, gpuBufferManager);
+  }
+
+  // Per-GPU build-side result columns (sizes from the plan-time templates).
+  rstate.hash_table_result =
+    make_shared_ptr<GPUIntermediateRelation>(hash_table_result->columns.size());
+  rstate.materialized_build_key =
+    make_shared_ptr<GPUIntermediateRelation>(materialized_build_key->columns.size());
+  int right_idx = 0;
+  for (idx_t cond_idx = 0; cond_idx < conditions.size(); cond_idx++) {
+    auto& condition     = conditions[cond_idx];
+    auto join_key_index = condition.right->Cast<BoundReferenceExpression>().index;
     SIRIUS_LOG_DEBUG("Passing column idx {} from input relation to index {} in RHS hash table",
                      join_key_index,
                      cond_idx);
-    hash_table_result->columns[cond_idx]      = input_relation.columns[join_key_index];
-    materialized_build_key->columns[cond_idx] = build_keys[cond_idx];
+    rstate.hash_table_result->columns[cond_idx]      = input_relation.columns[join_key_index];
+    rstate.materialized_build_key->columns[cond_idx] = build_keys[cond_idx];
     right_idx++;
   }
-
   for (idx_t i = 0; i < payload_columns.col_idxs.size(); i++) {
     auto payload_idx = payload_columns.col_idxs[i];
     SIRIUS_LOG_DEBUG("Passing column idx {} from input relation to index {} in RHS hash table",
                      payload_idx,
                      right_idx + i);
-    hash_table_result->columns[right_idx + i] = input_relation.columns[payload_idx];
+    rstate.hash_table_result->columns[right_idx + i] = input_relation.columns[payload_idx];
   }
 
   auto end      = std::chrono::high_resolution_clock::now();

@@ -16,6 +16,8 @@
 
 #include "gpu_columns.hpp"
 
+#include <cuda_runtime.h>
+
 #include "duckdb/common/types/decimal.hpp"
 #include "gpu_buffer_manager.hpp"
 #include "log/logging.hpp"
@@ -150,11 +152,36 @@ cudf::column_view GPUColumn::convertToCudfColumn()
 {
   SIRIUS_LOG_DEBUG("Converting GPUColumn to cuDF column");
   cudf::size_type size = column_length;
-  if (data_wrapper.validity_mask == nullptr) {
-    data_wrapper.validity_mask = createNullMask(column_length);
-    data_wrapper.mask_bytes    = getMaskBytesSize(size);
+  // A null validity_mask means all-valid: hand cudf a nullptr mask (null_count
+  // 0) directly. We deliberately do NOT lazily createNullMask and write it
+  // back into data_wrapper — that mutation, on a column object shared between
+  // per-GPU worker threads, was the source of a flaky cross-GPU mask: whichever
+  // GPU converted first stored its own all-valid mask, and the other GPU then
+  // read a mask living on the wrong device (illegal access in null_count that
+  // poisons the whole CUDA session). nullptr is the correct, allocation-free,
+  // race-free way to express all-valid.
+  cudf::size_type null_count = 0;
+  if (data_wrapper.validity_mask != nullptr && size > 0) {
+    // A non-null mask must be device memory on the CURRENT GPU. If it isn't,
+    // the multi-GPU data-prep failed to localize the mask (a real plumbing
+    // bug) — fail LOUD → DuckDB fallback rather than reading a wild pointer or
+    // silently treating a possibly-nullable column as all-valid (wrong answer).
+    cudaPointerAttributes attr{};
+    cudaError_t           perr    = cudaPointerGetAttributes(&attr, data_wrapper.validity_mask);
+    int                   cur_dev = 0;
+    cudaGetDevice(&cur_dev);
+    const bool wild = (perr != cudaSuccess) || (attr.type == cudaMemoryTypeUnregistered) ||
+                      (attr.type == cudaMemoryTypeDevice && attr.device != cur_dev);
+    if (wild) {
+      cudaGetLastError();  // clear any error cudaPointerGetAttributes left pending
+      throw InvalidInputException(
+        "convertToCudfColumn: validity_mask is not device memory on the current GPU "
+        "(cur_gpu=%d, mask_dev=%d, ptr_type=%d) — multi-GPU plumbing did not localize "
+        "the validity mask for this column",
+        cur_dev, attr.device, static_cast<int>(attr.type));
+    }
+    null_count = cudf::null_count(data_wrapper.validity_mask, 0, size);
   }
-  cudf::size_type null_count = cudf::null_count(data_wrapper.validity_mask, 0, size);
 
   if (data_wrapper.type.id() == GPUColumnTypeId::INT64) {
     return cudf::column_view(cudf::data_type(cudf::type_id::INT64),
@@ -272,10 +299,8 @@ void GPUColumn::setFromCudfColumn(cudf::column& cudf_column,
   cudf::size_type col_size    = cudf_column.size();
   bool nullable               = cudf_column.nullable();
   cudf::column::contents cont = cudf_column.release();
-  gpuBufferManager->rmm_stored_buffers.push_back(std::move(cont.data));
-
   data_wrapper.data =
-    reinterpret_cast<uint8_t*>(gpuBufferManager->rmm_stored_buffers.back()->data());
+    reinterpret_cast<uint8_t*>(gpuBufferManager->storeRmmBuffer(std::move(cont.data)));
   data_wrapper.size       = col_size;
   column_length           = data_wrapper.size;
   data_wrapper.mask_bytes = getMaskBytesSize(column_length);
@@ -284,30 +309,27 @@ void GPUColumn::setFromCudfColumn(cudf::column& cudf_column,
   if (cont.null_mask->data() == nullptr || nullable == false) {
     data_wrapper.validity_mask = createNullMask(column_length);
   } else {
-    gpuBufferManager->rmm_stored_buffers.push_back(std::move(cont.null_mask));
-    data_wrapper.validity_mask =
-      reinterpret_cast<cudf::bitmask_type*>(gpuBufferManager->rmm_stored_buffers.back()->data());
+    data_wrapper.validity_mask = reinterpret_cast<cudf::bitmask_type*>(
+      gpuBufferManager->storeRmmBuffer(std::move(cont.null_mask)));
   }
 
   if (col_type == cudf::data_type(cudf::type_id::STRING)) {
     if (cont.children[0]->type().id() == cudf::type_id::INT32) {
       cudf::column::contents child_cont = cont.children[0]->release();
-      gpuBufferManager->rmm_stored_buffers.push_back(std::move(child_cont.data));
+      void* off_ptr               = gpuBufferManager->storeRmmBuffer(std::move(child_cont.data));
       data_wrapper.is_string_data = true;
       data_wrapper.type           = GPUColumnType(GPUColumnTypeId::VARCHAR);
-      convertCudfOffsetToSiriusOffset(
-        reinterpret_cast<int32_t*>(gpuBufferManager->rmm_stored_buffers.back()->data()));
+      convertCudfOffsetToSiriusOffset(reinterpret_cast<int32_t*>(off_ptr));
       uint64_t* temp_num_bytes = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
       callCudaMemcpyDeviceToHost<uint64_t>(
         temp_num_bytes, data_wrapper.offset + column_length, 1, 0);
       data_wrapper.num_bytes = temp_num_bytes[0];
     } else if (cont.children[0]->type().id() == cudf::type_id::INT64) {
       cudf::column::contents child_cont = cont.children[0]->release();
-      gpuBufferManager->rmm_stored_buffers.push_back(std::move(child_cont.data));
       data_wrapper.is_string_data = true;
       data_wrapper.type           = GPUColumnType(GPUColumnTypeId::VARCHAR);
-      data_wrapper.offset =
-        reinterpret_cast<uint64_t*>(gpuBufferManager->rmm_stored_buffers.back()->data());
+      data_wrapper.offset         = reinterpret_cast<uint64_t*>(
+        gpuBufferManager->storeRmmBuffer(std::move(child_cont.data)));
       uint64_t* temp_num_bytes = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
       callCudaMemcpyDeviceToHost<uint64_t>(
         temp_num_bytes, data_wrapper.offset + column_length, 1, 0);
