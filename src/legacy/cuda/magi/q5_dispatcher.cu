@@ -53,7 +53,7 @@ static void EnsureQ5AggDev()
   std::lock_guard<std::mutex> lk(g_q5_init_mu);
   if (g_q5_agg_dev[0] != nullptr) return;  // already allocated
   for (int i = 0; i < NUM_GPUS; ++i) {
-    int gpu = magi_q1::magi_phys_gpu(i);
+    int gpu = magi_runtime::magi_phys_gpu(i);
     cudaSetDevice(gpu);
     cudaMalloc(&g_q5_agg_dev[i],
                ::q5::Q5_AGG_SLOTS * sizeof(::q5::Q5AggSlot));
@@ -80,7 +80,7 @@ std::size_t Q5MagiRunPerGpu(int                                gpu_id,
 {
   // Shared init: builds Endpoints/Channels on first call from ANY query;
   // Q1 may have already done this — idempotent.
-  magi_q1::MagiInitOnce();
+  magi_runtime::MagiInitOnce();
   EnsureQ5AggDev();
 
   if (gpu_id < 0 || gpu_id >= NUM_GPUS) {
@@ -107,36 +107,36 @@ std::size_t Q5MagiRunPerGpu(int                                gpu_id,
   xc.begin.arrive_and_wait();
   tick("phase B/begin barrier");
 
-  int gpu = magi_q1::magi_phys_gpu(gpu_id);
+  int gpu = magi_runtime::magi_phys_gpu(gpu_id);
   cudaSetDevice(gpu);
   cudaMemset(g_q5_agg_dev[gpu_id], 0,
              ::q5::Q5_AGG_SLOTS * sizeof(::q5::Q5AggSlot));
-  magi_q1::magi_set_tuple_size(gpu_id, sizeof(::q5::Q5Tuple));
+  magi_runtime::magi_set_tuple_size(gpu_id, sizeof(::q5::Q5Tuple));
   tick("phase C/cudaMemset+set_tuple");
 
   // One thread bumps the session counter; the rest pick it up after barrier.
-  if (gpu_id == 0) xc.session_id = magi_q1::magi_bump_session();
+  if (gpu_id == 0) xc.session_id = magi_runtime::magi_bump_session();
   xc.after_session_start.arrive_and_wait();
   tick("phase C/session barrier");
 
   // Launch this GPU's q5_kernel on its own input slice.
   const auto&    in      = xc.inputs[gpu_id];
-  std::uint64_t* row_ids = magi_q1::GetIdentityRowIdsShared(gpu, in.n_filtered);
+  std::uint64_t* row_ids = magi_runtime::GetIdentityRowIdsShared(gpu, in.n_filtered);
   ::q5::q5_kernel<Q5_BLOCK_SIZE,
                   KBUFFERING_INTRA_PARTITION_SIZE,
                   KBUFFERING_INTER_PARTITION_SIZE>
       <<<USER_KERNEL_GRID_SIZE, Q5_BLOCK_SIZE, 0,
-         magi_q1::magi_stream(gpu_id)>>>(row_ids,
+         magi_runtime::magi_stream(gpu_id)>>>(row_ids,
                                           in.n_filtered,
                                           in.n_name_chars,
                                           in.n_name_offsets,
                                           in.d_revenue,
                                           g_q5_agg_dev[gpu_id],
                                           /*just_load=*/false);
-  cudaStreamSynchronize(magi_q1::magi_stream(gpu_id));
+  cudaStreamSynchronize(magi_runtime::magi_stream(gpu_id));
   tick("phase D/q5_kernel + streamSync");
 
-  magi_q1::magi_sync_after_session(gpu_id, xc.session_id);
+  magi_runtime::magi_sync_after_session(gpu_id, xc.session_id);
   tick("phase E/sync_after_session");
 
   // D2H this GPU's slice (256-slot sparse table). Filter non-empty.

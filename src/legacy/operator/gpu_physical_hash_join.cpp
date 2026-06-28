@@ -25,6 +25,7 @@
 #include "gpu_pipeline.hpp"
 #include "log/logging.hpp"
 #include "operator/gpu_materialize.hpp"
+#include "operator/magi_join.hpp"
 #include "operator/gpu_physical_table_scan.hpp"
 
 namespace duckdb {
@@ -593,6 +594,59 @@ OperatorResultType GPUPhysicalHashJoin::Execute(GPUIntermediateRelation& input_r
       HandleMaterializeExpression(input_relation.columns[join_key_index], gpuBufferManager);
   }
 
+  // ── magi NVLink shuffle join (build side not replicated / forced) ─────────
+  // Runs the full build+probe shuffle over NVLink and emits the join output
+  // columns directly, bypassing the cudf probe + row_id materialization (after
+  // the shuffle the rows are relocated to owner GPUs, so original row_ids don't
+  // apply). v1: INNER, unique build key. LHS (probe) output columns flow as
+  // probe payload, RHS (build) output columns as build payload; both ≤ 8-byte.
+  if (rstate.use_shuffle_join) {
+    // v1 contract: build key is UNIQUE (single-slot H_build → ≤1 match per probe
+    // row). sirius does not propagate table-PK uniqueness to is_unique, so we do
+    // NOT gate on rstate.unique_build_keys (it would reject Q11's supplier/nation
+    // PK joins). A genuinely non-unique build key would undercount — a documented
+    // v1 limitation (chained multi-value table is the follow-up).
+    // Payload carried as 8-byte wire slots (≤ JOIN_MAX_PAYLOAD=4 per side). Reject
+    // wider projections / non-8-byte columns loudly → DuckDB fallback (avoids the
+    // int64 force-fit OOB read for INT32/DATE payloads).
+    if (lhs_output_columns.col_idxs.size() > 4 || rhs_output_columns.col_idxs.size() > 4) {
+      throw NotImplementedException("magi shuffle join v1: > 4 output payload columns per side");
+    }
+    auto is_supported = [](GPUColumnTypeId tid) {
+      return tid == GPUColumnTypeId::INT32 || tid == GPUColumnTypeId::INT64 ||
+             tid == GPUColumnTypeId::FLOAT64 || tid == GPUColumnTypeId::DECIMAL;
+    };
+    for (auto col_idx : lhs_output_columns.col_idxs)
+      if (!is_supported(input_relation.columns[col_idx]->data_wrapper.type.id()))
+        throw NotImplementedException(
+          "magi shuffle join v1: LHS payload column type unsupported (INT32/INT64/DECIMAL/FLOAT64)");
+    for (idx_t i = 0; i < rhs_output_columns.col_idxs.size(); i++)
+      if (!is_supported(rstate.shuffle_build_payload->columns[i]->data_wrapper.type.id()))
+        throw NotImplementedException(
+          "magi shuffle join v1: RHS payload column type unsupported (INT32/INT64/DECIMAL/FLOAT64)");
+
+    vector<shared_ptr<GPUColumn>> build_key_cols;
+    for (idx_t c = 0; c < conditions.size(); c++)
+      build_key_cols.push_back(rstate.materialized_build_key->columns[c]);
+    vector<shared_ptr<GPUColumn>> build_payload;
+    for (idx_t i = 0; i < rhs_output_columns.col_idxs.size(); i++)
+      build_payload.push_back(rstate.shuffle_build_payload->columns[i]);
+    vector<shared_ptr<GPUColumn>> probe_payload;
+    for (auto col_idx : lhs_output_columns.col_idxs)
+      probe_payload.push_back(
+        HandleMaterializeExpression(input_relation.columns[col_idx], gpuBufferManager));
+
+    vector<shared_ptr<GPUColumn>> out_key, out_build_payload, out_payload;
+    magi_join_op::Run(sirius_current_gpu, build_key_cols, build_payload, probe_key,
+                      probe_payload, out_key, out_build_payload, out_payload);
+    // Output layout = LHS columns first, then RHS columns (matches the cudf path's
+    // HandleMaterializeRowIDsLHS then ...RHS).
+    const idx_t n_lhs = lhs_output_columns.col_idxs.size();
+    for (idx_t i = 0; i < n_lhs; i++)                          output_relation.columns[i]         = out_payload[i];
+    for (idx_t i = 0; i < rhs_output_columns.col_idxs.size(); i++) output_relation.columns[n_lhs + i] = out_build_payload[i];
+    return OperatorResultType::FINISHED;
+  }
+
   // probing hash table
   SIRIUS_LOG_DEBUG("Probing hash table");
   if (join_type == JoinType::INNER || join_type == JoinType::LEFT || join_type == JoinType::OUTER) {
@@ -869,10 +923,43 @@ SinkResultType GPUPhysicalHashJoin::Sink(GPUIntermediateRelation& input_relation
       throw NotImplementedException(
         "Multi-GPU broadcast hash join only supports INNER/LEFT yet (this join type falls back)");
     }
-    if (children.size() < 2 || !SubtreeAllReplicated(*children[1])) {
-      throw NotImplementedException(
-        "Multi-GPU hash join: build side is not replicated (large table in build subtree); "
-        "needs the magi shuffle join");
+    const bool build_replicated =
+        (children.size() >= 2 && SubtreeAllReplicated(*children[1]));
+    static const bool force_shuffle = std::getenv("MAGI_FORCE_SHUFFLE_JOIN") != nullptr;
+    if (!build_replicated || force_shuffle) {
+      // Build side not replicated (or forced for testing) → magi NVLink shuffle
+      // join. v1: INNER only. Stash the materialized build join key; the
+      // probe-time Execute runs the whole build+probe shuffle and emits the LHS
+      // output columns directly (no replicated hash table built here).
+      if (join_type != JoinType::INNER) {
+        throw NotImplementedException(
+          "magi shuffle join: only INNER supported in v1 (this join type falls back)");
+      }
+      auto& rstate = runtime_state<HashJoinRuntimeState>(gpu);
+      rstate.use_shuffle_join  = true;
+      rstate.unique_build_keys = true;   // require unique build key (cleared below)
+      rstate.materialized_build_key =
+        make_shared_ptr<GPUIntermediateRelation>(conditions.size());
+      for (idx_t cond_idx = 0; cond_idx < conditions.size(); cond_idx++) {
+        auto& condition = conditions[cond_idx];
+        if (condition.right->GetExpressionClass() != ExpressionClass::BOUND_REF) {
+          throw InvalidInputException("magi shuffle join: unsupported build-side join condition");
+        }
+        auto join_key_index = condition.right->Cast<BoundReferenceExpression>().index;
+        // v1's H_build is single-slot — a non-unique build key would fan out
+        // (one match per key), which we can't emit. Track it so Execute falls back.
+        if (!input_relation.columns[join_key_index]->is_unique) rstate.unique_build_keys = false;
+        rstate.materialized_build_key->columns[cond_idx] =
+          HandleMaterializeExpression(input_relation.columns[join_key_index], gpuBufferManager);
+      }
+      // Build-side (RHS) output columns → build payload carried through the shuffle.
+      rstate.shuffle_build_payload =
+        make_shared_ptr<GPUIntermediateRelation>(rhs_output_columns.col_idxs.size());
+      for (idx_t i = 0; i < rhs_output_columns.col_idxs.size(); i++)
+        rstate.shuffle_build_payload->columns[i] =
+          HandleMaterializeExpression(input_relation.columns[rhs_output_columns.col_idxs[i]],
+                                      gpuBufferManager);
+      return SinkResultType::FINISHED;
     }
   }
 

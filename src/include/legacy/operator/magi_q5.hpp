@@ -49,8 +49,8 @@ std::size_t Q5MagiRunPerGpu(int                         gpu_id,
                             const PerGpuInputs&         my_inputs,
                             std::vector<AggResultRow>&  my_slice);
 
-// Mirrored from magi_q1::NUM_GPUS for clarity at use sites; same value.
-constexpr int NUM_GPUS = magi_q1::NUM_GPUS;
+// Mirrored from magi_runtime::NUM_GPUS for clarity at use sites; same value.
+constexpr int NUM_GPUS = magi_runtime::NUM_GPUS;
 
 }  // namespace magi_q5
 }  // namespace duckdb

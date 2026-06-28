@@ -47,9 +47,11 @@ constexpr int    MAX_KEY_FIELDS  = 8;   // 2-VARCHAR (Q1) or compound INT+VARCHA
 
 // Tier sizes (N_SLOTS_SMALL/MEDIUM/LARGE/XLARGE) live in the public header so
 // PickTableSize's routing policy and these instantiations share one source of
-// truth. Slot is 64B, so MAX_TIER_SLOTS * 64 is the per-GPU agg buffer
-// footprint (we keep it allocated at the largest tier and just memset/memcpy
-// the prefix the active tier needs).
+// truth. The per-GPU agg buffer footprint is sizeof(AggSlot64) * MAX_TIER_SLOTS
+// (we keep it allocated at the largest tier and just memset/memcpy the prefix
+// the active tier needs). MUST use sizeof(slot), NOT a hardcoded 64 — the slot
+// width is now 128B (widened for fat GROUP BYs like Q1); a literal 64 here
+// under-allocates the arena to half size and corrupts memory on write.
 constexpr int MAX_TIER_SLOTS   = N_SLOTS_XLARGE;
 
 // Producer per-block local pre-aggregation hash (shared memory). It MUST be at
@@ -64,7 +66,8 @@ constexpr int MAX_TIER_SLOTS   = N_SLOTS_XLARGE;
 // queries still need a spill/pass-through path instead of dropping — tracked for
 // the Q3 cuco-style global hashagg work.
 constexpr int N_LOCAL_SLOTS    = N_SLOTS_SMALL;
-constexpr size_t AGG_BUF_BYTES = static_cast<size_t>(64) * MAX_TIER_SLOTS;
+constexpr size_t AGG_BUF_BYTES =
+    sizeof(magi_ops::AggSlot64<std::uint64_t, 128>) * MAX_TIER_SLOTS;
 
 // Convert TableSize → slot count.
 constexpr int slots_for(TableSize t) {
@@ -85,12 +88,12 @@ constexpr int slots_for(TableSize t) {
 // writes the correct empty-key sentinel into every slot at session start.
 // `n_slots` is the *active* tier's slot count — we only touch that prefix.
 namespace duckdb { namespace magi_generic {
-template <typename KeyT>
-__global__ void init_global_agg_slots(magi_ops::AggSlot64<KeyT>* agg, int n_slots)
+template <typename KeyT, int SB>
+__global__ void init_global_agg_slots(magi_ops::AggSlot64<KeyT, SB>* agg, int n_slots)
 {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < n_slots) {
-    agg[i] = magi_ops::AggSlot64<KeyT>{};   // zero values + count + index
+    agg[i] = magi_ops::AggSlot64<KeyT, SB>{};   // zero values + count + index
     agg[i].key = magi_ops::empty_key_v<KeyT>;
   }
 }
@@ -98,9 +101,9 @@ __global__ void init_global_agg_slots(magi_ops::AggSlot64<KeyT>* agg, int n_slot
 // Flush helper: GPU-compact the LIVE slots of a tier-sized hash table into a dense
 // prefix of `out`, counting them via an atomic. Lets the flush D2H + host loop run
 // in O(live) instead of O(tier) (XLARGE = 16M slots = 1 GB scanned per GPU).
-template <typename KeyT>
-__global__ void compact_live_slots_kernel(const magi_ops::AggSlot64<KeyT>* __restrict__ in,
-                                          magi_ops::AggSlot64<KeyT>* __restrict__       out,
+template <typename KeyT, int SB>
+__global__ void compact_live_slots_kernel(const magi_ops::AggSlot64<KeyT, SB>* __restrict__ in,
+                                          magi_ops::AggSlot64<KeyT, SB>* __restrict__       out,
                                           unsigned int* __restrict__                    count,
                                           int                                           n_slots)
 {
@@ -120,28 +123,28 @@ namespace magi {
 // Two-kernel global-memory hashagg: Kernel A (rows -> per-GPU global hash H)
 // and Kernel B (scan H -> shuffle -> per-GPU final). Replaces the single
 // shmem-pre-agg kernel, which capped each block at N_LOCAL_SLOTS distinct keys.
-#define MAGI_INSTANTIATE_PREAGG(KEY_TYPE, N_SLOTS)                              \
+#define MAGI_INSTANTIATE_PREAGG(KEY_TYPE, N_SLOTS, SB)                          \
   template __global__ void                                                       \
-  global_preagg_kernel<KEY_TYPE, N_SLOTS>(                                       \
+  global_preagg_kernel<KEY_TYPE, N_SLOTS, SB>(                                   \
       const std::uint64_t*, std::uint64_t,                                       \
       magi_ops::ColPack,                                                         \
       const magi_ops::KeyFieldEntry*, int,                                       \
       const magi_ops::AggOpEntry*, int,                                          \
-      magi_ops::AggSlot64<KEY_TYPE>*, bool, unsigned int*)
+      magi_ops::AggSlot64<KEY_TYPE, SB>*, bool, unsigned int*)
 
-#define MAGI_INSTANTIATE_SHUFFLE(KEY_TYPE, N_SLOTS)                             \
+#define MAGI_INSTANTIATE_SHUFFLE(KEY_TYPE, N_SLOTS, SB)                         \
   template __global__ void                                                       \
   shuffle_global_kernel<KEY_TYPE,                                                \
                         KBUFFERING_INTRA_PARTITION_SIZE,                         \
                         KBUFFERING_INTER_PARTITION_SIZE,                         \
-                        N_SLOTS>(                                                \
-      const magi_ops::AggSlot64<KEY_TYPE>*,                                      \
+                        N_SLOTS, SB>(                                            \
+      const magi_ops::AggSlot64<KEY_TYPE, SB>*,                                  \
       const magi_ops::AggOpEntry*, int,                                          \
-      magi_ops::AggSlot64<KEY_TYPE>*, bool, unsigned int*)
+      magi_ops::AggSlot64<KEY_TYPE, SB>*, bool, unsigned int*)
 
-#define MAGI_INSTANTIATE_BOTH(KEY_TYPE, N_SLOTS)                                \
-  MAGI_INSTANTIATE_PREAGG(KEY_TYPE, N_SLOTS);                                    \
-  MAGI_INSTANTIATE_SHUFFLE(KEY_TYPE, N_SLOTS)
+#define MAGI_INSTANTIATE_BOTH(KEY_TYPE, N_SLOTS, SB)                            \
+  MAGI_INSTANTIATE_PREAGG(KEY_TYPE, N_SLOTS, SB);                                \
+  MAGI_INSTANTIATE_SHUFFLE(KEY_TYPE, N_SLOTS, SB)
 
 // Single-kernel shmem-combiner path — used for the SMALL tier (≤256 groups)
 // with ≤8B keys. For low cardinality + high row count (Q1: 4 groups, 120M
@@ -150,36 +153,42 @@ namespace magi {
 // ≤256 distinct keys so the 256-slot shmem table doesn't drop; if a query is
 // mis-routed and exceeds it, the overflow counter (threaded through
 // producer_local_agg) trips → throw → DuckDB fallback (never a silent drop).
-#define MAGI_INSTANTIATE_SINGLE(KEY_TYPE)                                       \
+#define MAGI_INSTANTIATE_SINGLE(KEY_TYPE, SB)                                   \
   template __global__ void                                                       \
   distributed_hash_groupby_kernel<KEY_TYPE,                                      \
                                    duckdb::magi_generic::BLOCK_SIZE,             \
                                    KBUFFERING_INTRA_PARTITION_SIZE,              \
                                    KBUFFERING_INTER_PARTITION_SIZE,             \
                                    duckdb::magi_generic::N_LOCAL_SLOTS,          \
-                                   duckdb::magi_generic::N_SLOTS_SMALL>(         \
+                                   duckdb::magi_generic::N_SLOTS_SMALL, SB>(     \
       const std::uint64_t*, std::uint64_t,                                       \
       magi_ops::ColPack,                                                         \
       const magi_ops::KeyFieldEntry*, int,                                       \
       const magi_ops::AggOpEntry*, int,                                          \
-      magi_ops::AggSlot64<KEY_TYPE>*, bool, unsigned int*)
+      magi_ops::AggSlot64<KEY_TYPE, SB>*, bool, unsigned int*)
 
-MAGI_INSTANTIATE_SINGLE(std::int32_t);
-MAGI_INSTANTIATE_SINGLE(std::uint64_t);
+// Single-kernel SMALL path: ≤8B keys only; both slot widths (64B for ≤6-slot
+// GROUP BYs, 128B for Q1-class).
+MAGI_INSTANTIATE_SINGLE(std::int32_t,  64);
+MAGI_INSTANTIATE_SINGLE(std::int32_t,  128);
+MAGI_INSTANTIATE_SINGLE(std::uint64_t, 64);
+MAGI_INSTANTIATE_SINGLE(std::uint64_t, 128);
 #undef MAGI_INSTANTIATE_SINGLE
 
-MAGI_INSTANTIATE_BOTH(std::int32_t,  duckdb::magi_generic::N_SLOTS_SMALL);
-MAGI_INSTANTIATE_BOTH(std::int32_t,  duckdb::magi_generic::N_SLOTS_MEDIUM);
-MAGI_INSTANTIATE_BOTH(std::int32_t,  duckdb::magi_generic::N_SLOTS_LARGE);
-MAGI_INSTANTIATE_BOTH(std::int32_t,  duckdb::magi_generic::N_SLOTS_XLARGE);
-MAGI_INSTANTIATE_BOTH(std::uint64_t, duckdb::magi_generic::N_SLOTS_SMALL);
-MAGI_INSTANTIATE_BOTH(std::uint64_t, duckdb::magi_generic::N_SLOTS_MEDIUM);
-MAGI_INSTANTIATE_BOTH(std::uint64_t, duckdb::magi_generic::N_SLOTS_LARGE);
-MAGI_INSTANTIATE_BOTH(std::uint64_t, duckdb::magi_generic::N_SLOTS_XLARGE);
-MAGI_INSTANTIATE_BOTH(unsigned __int128, duckdb::magi_generic::N_SLOTS_SMALL);
-MAGI_INSTANTIATE_BOTH(unsigned __int128, duckdb::magi_generic::N_SLOTS_MEDIUM);
-MAGI_INSTANTIATE_BOTH(unsigned __int128, duckdb::magi_generic::N_SLOTS_LARGE);
-MAGI_INSTANTIATE_BOTH(unsigned __int128, duckdb::magi_generic::N_SLOTS_XLARGE);
+// Two-kernel path: all 3 key kinds × 4 tiers × {64B, 128B} slot.
+#define MAGI_INST_ALLTIERS(KEY_TYPE, SB)                                        \
+  MAGI_INSTANTIATE_BOTH(KEY_TYPE, duckdb::magi_generic::N_SLOTS_SMALL,  SB);     \
+  MAGI_INSTANTIATE_BOTH(KEY_TYPE, duckdb::magi_generic::N_SLOTS_MEDIUM, SB);     \
+  MAGI_INSTANTIATE_BOTH(KEY_TYPE, duckdb::magi_generic::N_SLOTS_LARGE,  SB);     \
+  MAGI_INSTANTIATE_BOTH(KEY_TYPE, duckdb::magi_generic::N_SLOTS_XLARGE, SB)
+
+MAGI_INST_ALLTIERS(std::int32_t,      64);
+MAGI_INST_ALLTIERS(std::int32_t,      128);
+MAGI_INST_ALLTIERS(std::uint64_t,     64);
+MAGI_INST_ALLTIERS(std::uint64_t,     128);
+MAGI_INST_ALLTIERS(unsigned __int128, 64);
+MAGI_INST_ALLTIERS(unsigned __int128, 128);
+#undef MAGI_INST_ALLTIERS
 
 #undef MAGI_INSTANTIATE_PREAGG
 #undef MAGI_INSTANTIATE_SHUFFLE
@@ -215,7 +224,7 @@ static void EnsureDeviceBuffers()
   std::lock_guard<std::mutex> lk(g_init_mu);
   if (g_agg_dev[0] != nullptr) return;
   for (int i = 0; i < NUM_GPUS; ++i) {
-    int gpu = magi_q1::magi_phys_gpu(i);
+    int gpu = magi_runtime::magi_phys_gpu(i);
     cudaSetDevice(gpu);
     cudaMalloc(reinterpret_cast<void**>(&g_agg_dev[i]), AGG_BUF_BYTES);
     cudaMalloc(reinterpret_cast<void**>(&g_stage_dev[i]), AGG_BUF_BYTES);
@@ -254,29 +263,29 @@ static GenericExchange& exchange() { static GenericExchange e; return e; }
 // Mirrors Q5MagiRunPerGpu's flow exactly; the only differences are the
 // kernel symbol (now selected by both KeyT and tier) and the slice
 // extraction loop.
-template <typename KeyT, int N_SLOTS>
+template <typename KeyT, int N_SLOTS, int SB>
 static std::size_t run_per_gpu_typed_tier(int                        gpu_id,
                                            std::vector<AggResultRow>& my_slice)
 {
   auto& xc = exchange();
-  const int gpu = magi_q1::magi_phys_gpu(gpu_id);
+  const int gpu = magi_runtime::magi_phys_gpu(gpu_id);
   cudaSetDevice(gpu);
 
   // Clear receiver global agg (writes empty_key_v<KeyT> per slot — a plain
   // memset to 0 would mis-mark int32 slots as "occupied" since
   // empty_key_v<int32_t> = -1). Only touch the prefix this tier uses.
   auto* agg_typed_for_init =
-      reinterpret_cast<magi_ops::AggSlot64<KeyT>*>(g_agg_dev[gpu_id]);
+      reinterpret_cast<magi_ops::AggSlot64<KeyT, SB>*>(g_agg_dev[gpu_id]);
   auto* stage_typed_for_init =
-      reinterpret_cast<magi_ops::AggSlot64<KeyT>*>(g_stage_dev[gpu_id]);
+      reinterpret_cast<magi_ops::AggSlot64<KeyT, SB>*>(g_stage_dev[gpu_id]);
   constexpr int INIT_BLOCK = 256;
   const     int init_grid  = (N_SLOTS + INIT_BLOCK - 1) / INIT_BLOCK;
-  init_global_agg_slots<KeyT>
-      <<<init_grid, INIT_BLOCK, 0, magi_q1::magi_stream(gpu_id)>>>(
+  init_global_agg_slots<KeyT, SB>
+      <<<init_grid, INIT_BLOCK, 0, magi_runtime::magi_stream(gpu_id)>>>(
           agg_typed_for_init, N_SLOTS);
   // Stage hash H (producer pre-agg) — same empty-key init.
-  init_global_agg_slots<KeyT>
-      <<<init_grid, INIT_BLOCK, 0, magi_q1::magi_stream(gpu_id)>>>(
+  init_global_agg_slots<KeyT, SB>
+      <<<init_grid, INIT_BLOCK, 0, magi_runtime::magi_stream(gpu_id)>>>(
           stage_typed_for_init, N_SLOTS);
 
   // Push per-query tables: ops + key_fields.
@@ -284,21 +293,27 @@ static std::size_t run_per_gpu_typed_tier(int                        gpu_id,
                    xc.ops_host_ptrs[gpu_id],
                    sizeof(magi_ops::AggOpEntry) * xc.n_ops[gpu_id],
                    cudaMemcpyHostToDevice,
-                   magi_q1::magi_stream(gpu_id));
+                   magi_runtime::magi_stream(gpu_id));
   cudaMemcpyAsync(g_kfields_dev[gpu_id],
                    xc.kfields_host_ptrs[gpu_id],
                    sizeof(magi_ops::KeyFieldEntry) * xc.n_key_fields[gpu_id],
                    cudaMemcpyHostToDevice,
-                   magi_q1::magi_stream(gpu_id));
-  magi_q1::magi_set_tuple_size(gpu_id, sizeof(magi_ops::AggSlot64<KeyT>));
+                   magi_runtime::magi_stream(gpu_id));
+  // CELL mode: the groupby shuffle sends AggSlot64 as CELL_SIZE-byte cells
+  // (recv_direct[_self]_cell reassembles them), so the host worker must move
+  // CELL_SIZE-sized units. The slot is sizeof(AggSlot64) = N×CELL_SIZE; setting
+  // tuple_size = CELL_SIZE lets nbytes = tail_cells × CELL_SIZE come out right
+  // for slots wider than one cell (128B). For 64B slots CELL_SIZE == sizeof,
+  // so this is unchanged behaviour.
+  magi_runtime::magi_set_tuple_size(gpu_id, magi::CELL_SIZE);
 
   // Session bump (thread 0) + sync.
-  if (gpu_id == 0) xc.session_id = magi_q1::magi_bump_session();
+  if (gpu_id == 0) xc.session_id = magi_runtime::magi_bump_session();
   xc.after_session_start.arrive_and_wait();
 
   // Launch the generic kernel for (KeyT, N_SLOTS) tier.
   const auto&         in      = xc.inputs[gpu_id];
-  std::uint64_t*      row_ids = magi_q1::GetIdentityRowIdsShared(gpu, in.n_filtered);
+  std::uint64_t*      row_ids = magi_runtime::GetIdentityRowIdsShared(gpu, in.n_filtered);
 
   // Make this GPU's cached aggregate input coherent before the kernel reads it.
   // sirius uploads each GPU's cache slice with a cudaMemcpyAsync issued on a
@@ -310,15 +325,15 @@ static std::size_t run_per_gpu_typed_tier(int                        gpu_id,
   // runs; with this sync it is 10/10).
   cudaDeviceSynchronize();
   auto* global_agg_typed =
-      reinterpret_cast<magi_ops::AggSlot64<KeyT>*>(g_agg_dev[gpu_id]);
+      reinterpret_cast<magi_ops::AggSlot64<KeyT, SB>*>(g_agg_dev[gpu_id]);
   auto* stage_typed =
-      reinterpret_cast<magi_ops::AggSlot64<KeyT>*>(g_stage_dev[gpu_id]);
+      reinterpret_cast<magi_ops::AggSlot64<KeyT, SB>*>(g_stage_dev[gpu_id]);
 
   // Zero the overflow counter; the kernel bumps it whenever a row's key can't
   // claim a global hash slot (i.e. cardinality exceeds the tier). On the same
   // stream as the kernels so ordering is guaranteed.
   cudaMemsetAsync(g_overflow_dev[gpu_id], 0, sizeof(unsigned int),
-                  magi_q1::magi_stream(gpu_id));
+                  magi_runtime::magi_stream(gpu_id));
 
   // Path selection:
   //  - SMALL tier (≤256 groups) + ≤8B key → single shmem-combiner kernel. Low
@@ -338,9 +353,9 @@ static std::size_t run_per_gpu_typed_tier(int                        gpu_id,
                                             KBUFFERING_INTRA_PARTITION_SIZE,
                                             KBUFFERING_INTER_PARTITION_SIZE,
                                             N_LOCAL_SLOTS,
-                                            N_SLOTS>
+                                            N_SLOTS, SB>
           <<<USER_KERNEL_GRID_SIZE, BLOCK_SIZE, 0,
-             magi_q1::magi_stream(gpu_id)>>>(row_ids,
+             magi_runtime::magi_stream(gpu_id)>>>(row_ids,
                                               in.n_filtered,
                                               in.cols,
                                               g_kfields_dev[gpu_id],
@@ -356,9 +371,9 @@ static std::size_t run_per_gpu_typed_tier(int                        gpu_id,
     // Two-kernel global-memory hashagg (see distributed_hash_groupby.cuh). Both
     // run on this GPU's magi stream, so kernel B observes a fully-built H.
     //   A: rows -> per-GPU global hash H (no per-block shmem cap → no drop)
-    magi::global_preagg_kernel<KeyT, N_SLOTS>
+    magi::global_preagg_kernel<KeyT, N_SLOTS, SB>
         <<<USER_KERNEL_GRID_SIZE, BLOCK_SIZE, 0,
-           magi_q1::magi_stream(gpu_id)>>>(row_ids,
+           magi_runtime::magi_stream(gpu_id)>>>(row_ids,
                                             in.n_filtered,
                                             in.cols,
                                             g_kfields_dev[gpu_id],
@@ -372,17 +387,17 @@ static std::size_t run_per_gpu_typed_tier(int                        gpu_id,
     magi::shuffle_global_kernel<KeyT,
                                 KBUFFERING_INTRA_PARTITION_SIZE,
                                 KBUFFERING_INTER_PARTITION_SIZE,
-                                N_SLOTS>
+                                N_SLOTS, SB>
         <<<USER_KERNEL_GRID_SIZE, BLOCK_SIZE, 0,
-           magi_q1::magi_stream(gpu_id)>>>(stage_typed,
+           magi_runtime::magi_stream(gpu_id)>>>(stage_typed,
                                             g_ops_dev[gpu_id],
                                             xc.n_ops[gpu_id],
                                             global_agg_typed,
                                             /*just_load=*/false,
                                             g_overflow_dev[gpu_id]);
   }
-  cudaStreamSynchronize(magi_q1::magi_stream(gpu_id));
-  magi_q1::magi_sync_after_session(gpu_id, xc.session_id);
+  cudaStreamSynchronize(magi_runtime::magi_stream(gpu_id));
+  magi_runtime::magi_sync_after_session(gpu_id, xc.session_id);
 
   // Read the overflow counter back. A non-zero value means the hash dropped
   // rows (cardinality > N_SLOTS, i.e. beyond the LARGE tier) and this GPU's
@@ -397,21 +412,21 @@ static std::size_t run_per_gpu_typed_tier(int                        gpu_id,
   // g_overflow_dev, already read into overflow_count above) so the D2H + host loop
   // are O(live) not O(tier). At XLARGE this avoids a 1 GB D2H + a 16M-slot host
   // scan — the dominant cost of high-cardinality GROUP BY (nsys: ~430ms host-side).
-  auto*        agg_d = reinterpret_cast<magi_ops::AggSlot64<KeyT>*>(g_agg_dev[gpu_id]);
-  auto*        dense = reinterpret_cast<magi_ops::AggSlot64<KeyT>*>(g_stage_dev[gpu_id]);
-  cudaStream_t st    = magi_q1::magi_stream(gpu_id);
+  auto*        agg_d = reinterpret_cast<magi_ops::AggSlot64<KeyT, SB>*>(g_agg_dev[gpu_id]);
+  auto*        dense = reinterpret_cast<magi_ops::AggSlot64<KeyT, SB>*>(g_stage_dev[gpu_id]);
+  cudaStream_t st    = magi_runtime::magi_stream(gpu_id);
   cudaMemsetAsync(g_overflow_dev[gpu_id], 0, sizeof(unsigned int), st);
   constexpr int CB = 256;
   const int     cg = (N_SLOTS + CB - 1) / CB;
-  compact_live_slots_kernel<KeyT><<<cg, CB, 0, st>>>(agg_d, dense,
+  compact_live_slots_kernel<KeyT, SB><<<cg, CB, 0, st>>>(agg_d, dense,
                                                      g_overflow_dev[gpu_id], N_SLOTS);
   unsigned int live = 0;
   cudaMemcpyAsync(&live, g_overflow_dev[gpu_id], sizeof(unsigned int),
                   cudaMemcpyDeviceToHost, st);
   cudaStreamSynchronize(st);
-  std::vector<magi_ops::AggSlot64<KeyT>> host(live);
+  std::vector<magi_ops::AggSlot64<KeyT, SB>> host(live);
   cudaMemcpy(host.data(), dense,
-             static_cast<size_t>(live) * sizeof(magi_ops::AggSlot64<KeyT>),
+             static_cast<size_t>(live) * sizeof(magi_ops::AggSlot64<KeyT, SB>),
              cudaMemcpyDeviceToHost);
 
   my_slice.clear();
@@ -427,7 +442,7 @@ static std::size_t run_per_gpu_typed_tier(int                        gpu_id,
       row.key_packed = static_cast<unsigned __int128>(
           static_cast<std::make_unsigned_t<KeyT>>(host[j].key));
     }
-    for (int v = 0; v < magi_ops::AggSlot64<KeyT>::N_DOUBLES; ++v) {
+    for (int v = 0; v < magi_ops::AggSlot64<KeyT, SB>::N_DOUBLES; ++v) {
       row.values[v] = host[j].values[v];
     }
     row.partial_count = host[j].partial_count;
@@ -455,35 +470,57 @@ static std::size_t run_per_gpu_typed_tier(int                        gpu_id,
   return my_slice.size();
 }
 
-// ── 6-way dispatch over (KeyKind, TableSize) ─────────────────────────────
+// Pick the narrowest slot that fits the query's agg-slot count, then run.
+// Each output aggregate uses one 8B value slot; a 64B slot holds
+// AggSlot64<KeyT,64>::N_DOUBLES of them (6 for ≤8B keys, 5 for the 16B compound
+// key). Wider GROUP BYs (e.g. TPC-H Q1 = 9 slots: 4 SUM + 3 AVG + COUNT(*) +
+// the shared AVG-COUNT) spill to the 128B slot. The byte budget is derived from
+// the key type — no magic constant. SB must be identical on every GPU (they
+// shuffle slots to each other); guaranteed since `n_slots` comes from the
+// identical per-query ops table.
+template <typename KeyT, int N_SLOTS>
+static std::size_t run_tier(int gpu_id, int n_slots,
+                            std::vector<AggResultRow>& my_slice)
+{
+  constexpr int N64 = magi_ops::AggSlot64<KeyT, 64>::N_DOUBLES;
+  const int sb = (n_slots <= N64) ? 64 : 128;
+  if (std::getenv("MAGI_SB_DEBUG"))
+    std::fprintf(stderr, "[magi-sb] gpu=%d n_slots=%d N64=%d -> SB=%dB\n",
+                 gpu_id, n_slots, N64, sb);
+  if (n_slots <= N64) return run_per_gpu_typed_tier<KeyT, N_SLOTS, 64 >(gpu_id, my_slice);
+  return              run_per_gpu_typed_tier<KeyT, N_SLOTS, 128>(gpu_id, my_slice);
+}
+
+// ── dispatch over (KeyKind, TableSize) × runtime SlotSize ────────────────
 static std::size_t dispatch_by_kind_and_tier(int                        gpu_id,
                                               KeyKind                    kk,
                                               TableSize                  ts,
+                                              int                        n_slots,
                                               std::vector<AggResultRow>& my_slice)
 {
   switch (kk) {
     case KeyKind::INT32:
       switch (ts) {
-        case TableSize::SMALL:  return run_per_gpu_typed_tier<std::int32_t, N_SLOTS_SMALL >(gpu_id, my_slice);
-        case TableSize::MEDIUM: return run_per_gpu_typed_tier<std::int32_t, N_SLOTS_MEDIUM>(gpu_id, my_slice);
-        case TableSize::LARGE:  return run_per_gpu_typed_tier<std::int32_t, N_SLOTS_LARGE >(gpu_id, my_slice);
-        case TableSize::XLARGE: return run_per_gpu_typed_tier<std::int32_t, N_SLOTS_XLARGE>(gpu_id, my_slice);
+        case TableSize::SMALL:  return run_tier<std::int32_t, N_SLOTS_SMALL >(gpu_id, n_slots, my_slice);
+        case TableSize::MEDIUM: return run_tier<std::int32_t, N_SLOTS_MEDIUM>(gpu_id, n_slots, my_slice);
+        case TableSize::LARGE:  return run_tier<std::int32_t, N_SLOTS_LARGE >(gpu_id, n_slots, my_slice);
+        case TableSize::XLARGE: return run_tier<std::int32_t, N_SLOTS_XLARGE>(gpu_id, n_slots, my_slice);
       }
       break;
     case KeyKind::UINT64:
       switch (ts) {
-        case TableSize::SMALL:  return run_per_gpu_typed_tier<std::uint64_t, N_SLOTS_SMALL >(gpu_id, my_slice);
-        case TableSize::MEDIUM: return run_per_gpu_typed_tier<std::uint64_t, N_SLOTS_MEDIUM>(gpu_id, my_slice);
-        case TableSize::LARGE:  return run_per_gpu_typed_tier<std::uint64_t, N_SLOTS_LARGE >(gpu_id, my_slice);
-        case TableSize::XLARGE: return run_per_gpu_typed_tier<std::uint64_t, N_SLOTS_XLARGE>(gpu_id, my_slice);
+        case TableSize::SMALL:  return run_tier<std::uint64_t, N_SLOTS_SMALL >(gpu_id, n_slots, my_slice);
+        case TableSize::MEDIUM: return run_tier<std::uint64_t, N_SLOTS_MEDIUM>(gpu_id, n_slots, my_slice);
+        case TableSize::LARGE:  return run_tier<std::uint64_t, N_SLOTS_LARGE >(gpu_id, n_slots, my_slice);
+        case TableSize::XLARGE: return run_tier<std::uint64_t, N_SLOTS_XLARGE>(gpu_id, n_slots, my_slice);
       }
       break;
     case KeyKind::UINT128:
       switch (ts) {
-        case TableSize::SMALL:  return run_per_gpu_typed_tier<unsigned __int128, N_SLOTS_SMALL >(gpu_id, my_slice);
-        case TableSize::MEDIUM: return run_per_gpu_typed_tier<unsigned __int128, N_SLOTS_MEDIUM>(gpu_id, my_slice);
-        case TableSize::LARGE:  return run_per_gpu_typed_tier<unsigned __int128, N_SLOTS_LARGE >(gpu_id, my_slice);
-        case TableSize::XLARGE: return run_per_gpu_typed_tier<unsigned __int128, N_SLOTS_XLARGE>(gpu_id, my_slice);
+        case TableSize::SMALL:  return run_tier<unsigned __int128, N_SLOTS_SMALL >(gpu_id, n_slots, my_slice);
+        case TableSize::MEDIUM: return run_tier<unsigned __int128, N_SLOTS_MEDIUM>(gpu_id, n_slots, my_slice);
+        case TableSize::LARGE:  return run_tier<unsigned __int128, N_SLOTS_LARGE >(gpu_id, n_slots, my_slice);
+        case TableSize::XLARGE: return run_tier<unsigned __int128, N_SLOTS_XLARGE>(gpu_id, n_slots, my_slice);
       }
       break;
   }
@@ -521,7 +558,7 @@ std::size_t distributed_hash_groupby_run_per_gpu(
     return 0;
   }
 
-  magi_q1::MagiInitOnce();
+  magi_runtime::MagiInitOnce();
   EnsureDeviceBuffers();
 
   auto& xc = exchange();
@@ -536,9 +573,20 @@ std::size_t distributed_hash_groupby_run_per_gpu(
   }
   xc.begin.arrive_and_wait();
 
+  // Number of agg value-slots this query uses = max dst_slot_idx + 1 over the
+  // ops table (includes the hidden AVG COUNT carrier). Drives the 64B-vs-128B
+  // slot choice in run_tier. Identical on every GPU (same ops table) so the
+  // shuffle slot width matches across peers.
+  int n_slots = 0;
+  for (const auto& op : ops) {
+    const int s = static_cast<int>(op.dst_slot_idx) + 1;
+    if (s > n_slots) n_slots = s;
+  }
+
   return dispatch_by_kind_and_tier(gpu_id,
                                     xc.key_kind_for_this_query,
                                     xc.table_size_for_this_query,
+                                    n_slots,
                                     my_slice);
 }
 

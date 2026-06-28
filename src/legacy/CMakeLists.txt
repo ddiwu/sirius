@@ -100,10 +100,12 @@ option(ENABLE_MAGI_TPCH
        "Use Magi NVLink-shuffle backend for cross-GPU TPC-H queries" OFF)
 if(ENABLE_MAGI_TPCH)
   list(APPEND SIRIUS_LEGACY_CUDA_SOURCES
-       ${CMAKE_CURRENT_LIST_DIR}/cuda/magi/q1_dispatcher.cu
+       ${CMAKE_CURRENT_LIST_DIR}/cuda/magi/magi_runtime.cu
        ${CMAKE_CURRENT_LIST_DIR}/cuda/magi/q5_dispatcher.cu
        ${CMAKE_CURRENT_LIST_DIR}/cuda/magi/magi_groupby_runtime.cu
-       ${CMAKE_CURRENT_LIST_DIR}/cuda/magi/magi_groupby.cu)
+       ${CMAKE_CURRENT_LIST_DIR}/cuda/magi/magi_groupby.cu
+       ${CMAKE_CURRENT_LIST_DIR}/cuda/magi/magi_join_runtime.cu
+       ${CMAKE_CURRENT_LIST_DIR}/cuda/magi/magi_join.cu)
 
   # Magi data-plane header tree (data_plane/api, data_plane/queries, ...).
   # CMAKE_SOURCE_DIR is the *duckdb* subdir when the build is driven via

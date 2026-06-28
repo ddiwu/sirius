@@ -19,7 +19,7 @@
 #include "legacy/operator/magi_q1.hpp"  // for NUM_GPUS
 
 namespace duckdb {
-namespace magi_q1 {
+namespace magi_runtime {
 
 // One-shot init: builds Endpoints, ChannelRuntimes, P2P paths. Idempotent;
 // safe to call from any dispatcher's per-GPU entry.
@@ -49,5 +49,5 @@ void magi_sync_after_session(int gpu_id, std::uint64_t session_id);
 // works for every query — we just need a device buffer to feed magi.
 std::uint64_t* GetIdentityRowIdsShared(int phys_gpu, std::size_t n);
 
-}  // namespace magi_q1
+}  // namespace magi_runtime
 }  // namespace duckdb

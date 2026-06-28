@@ -145,6 +145,12 @@ struct HashJoinRuntimeState : OpRuntimeState {
   bool unique_probe_keys             = false;
   //! Set when FULL OUTER JOIN was fully handled via cudf in Execute().
   bool outer_join_handled_in_execute = false;
+  //! Set in Sink when the build side is not replicated (or MAGI_FORCE_SHUFFLE_JOIN):
+  //! Execute then runs the magi NVLink shuffle join instead of the cudf probe.
+  bool use_shuffle_join              = false;
+  //! Build-side (RHS) output columns, materialized in Sink and carried through
+  //! the shuffle as build payload so Execute can emit them (e.g. Q11's s_nationkey).
+  shared_ptr<GPUIntermediateRelation> shuffle_build_payload;
 };
 
 class GPUPhysicalHashJoin : public GPUPhysicalOperator {

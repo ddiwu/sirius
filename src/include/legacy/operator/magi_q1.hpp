@@ -9,7 +9,7 @@
 #include "legacy/gpu_buffer_manager.hpp"  // kSiriusLegacyNumGpus
 
 namespace duckdb {
-namespace magi_q1 {
+namespace magi_runtime {
 
 // One partition's worth of column pointers + row count, as already cached
 // by sirius's per-GPU TableScan. Pointers are device pointers on the
@@ -63,5 +63,5 @@ size_t Q1MagiRunPerGpu(int                                gpu_id,
 // -DSIRIUS_LEGACY_NUM_GPUS=N).
 constexpr int NUM_GPUS = kSiriusLegacyNumGpus;
 
-}  // namespace magi_q1
+}  // namespace magi_runtime
 }  // namespace duckdb

@@ -22,7 +22,7 @@
 #include "data_plane/ops/agg_slot.cuh"
 #include "data_plane/ops/col_pack.cuh"
 
-#include "legacy/operator/magi_q1.hpp"  // for magi_q1::NUM_GPUS
+#include "legacy/operator/magi_q1.hpp"  // for magi_runtime::NUM_GPUS
 
 namespace duckdb {
 namespace magi_generic {
@@ -87,7 +87,10 @@ struct PerGpuInputs {
 // slots — the caller knows which AggKind each holds (it built the AggOpEntry
 // table) so it can reinterpret per kind.
 struct AggResultRow {
-  static constexpr int N_VALUES = magi_ops::AggSlot64<std::uint64_t>::N_DOUBLES;
+  // Sized for the WIDEST slot (128B → 14 doubles) so this host-side row holds the
+  // result of whichever (64B/128B) GPU slot the dynamic dispatch picked; the
+  // runtime copies only the active slot's N_DOUBLES prefix.
+  static constexpr int N_VALUES = magi_ops::AggSlot64<std::uint64_t, 128>::N_DOUBLES;
 
   unsigned __int128 key_packed;
   double            values[N_VALUES];
@@ -109,9 +112,9 @@ std::size_t distributed_hash_groupby_run_per_gpu(
     std::vector<AggResultRow>&                       my_slice);
 
 // Number of GPUs the runtime expects, mirrored from
-// `magi_q1::NUM_GPUS` (= `kSiriusLegacyNumGpus`). Exposed so sirius
+// `magi_runtime::NUM_GPUS` (= `kSiriusLegacyNumGpus`). Exposed so sirius
 // callers can size per-GPU vectors without instantiating the runtime.
-constexpr int NUM_GPUS = magi_q1::NUM_GPUS;
+constexpr int NUM_GPUS = magi_runtime::NUM_GPUS;
 
 }  // namespace magi_generic
 }  // namespace duckdb

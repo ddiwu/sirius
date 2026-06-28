@@ -51,7 +51,7 @@
 // q1.cuh sidesteps this by caching all 9 input pointers (+ partitions_count)
 // in __shared__ CachedInputs at producer entry — those are uniform across
 // the block, so per-thread regs go down by ~16. With that fix, 1024 fits.
-namespace duckdb { namespace magi_q1 {
+namespace duckdb { namespace magi_runtime {
 // NUM_GPUS already declared in magi_q1.hpp (= kSiriusLegacyNumGpus); just
 // add the dispatcher-private partition + block size here.
 constexpr int PARTITIONS_COUNT = NUM_GPUS;
@@ -61,7 +61,7 @@ constexpr int Q1_BLOCK_SIZE    = 1024;
 // ── Explicit instantiation of q1_kernel ────────────────────────────────────
 // Kernel template params must match the Endpoint instantiation below.
 namespace q1 {
-template __global__ void q1_kernel<duckdb::magi_q1::Q1_BLOCK_SIZE,
+template __global__ void q1_kernel<duckdb::magi_runtime::Q1_BLOCK_SIZE,
                                     KBUFFERING_INTRA_PARTITION_SIZE,
                                     KBUFFERING_INTER_PARTITION_SIZE>(
     const uint64_t*, size_t,
@@ -72,7 +72,7 @@ template __global__ void q1_kernel<duckdb::magi_q1::Q1_BLOCK_SIZE,
 }  // namespace q1
 
 namespace duckdb {
-namespace magi_q1 {
+namespace magi_runtime {
 
 using EndpointT = ::Endpoint<1, 1, PARTITIONS_COUNT,
                              USER_KERNEL_GRID_SIZE, USER_KERNEL_GRID_SIZE,
@@ -579,5 +579,5 @@ void magi_sync_after_session(int gpu_id, std::uint64_t session_id)
   s.channels[gpu_id].sync_after_session(s.endpoints[gpu], session_id);
 }
 
-}  // namespace magi_q1
+}  // namespace magi_runtime
 }  // namespace duckdb

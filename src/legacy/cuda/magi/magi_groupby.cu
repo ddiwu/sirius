@@ -10,346 +10,27 @@
 //
 // Anything else throws NotImplementedException. Future queries widen the
 // dispatch by adding more shape branches. The Q1 path internally calls
-// magi_q1::Q1MagiRunPerGpu (which std::barriers across the per-GPU
+// magi_runtime::Q1MagiRunPerGpu (which std::barriers across the per-GPU
 // threads), then materialises this GPU's hash-partitioned slice as a
 // new (chars+offsets) VARCHAR + DOUBLE/INT64 column set on the same GPU.
 
 #include "operator/magi_groupby.hpp"
 
 #include <cstdint>
+#include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <vector>
 
 #include <cuda_runtime.h>
 
 #include "gpu_buffer_manager.hpp"
-#include "operator/magi_q1.hpp"
-#include "operator/magi_q5.hpp"
 #include "operator/magi_distributed_groupby.hpp"
 
 namespace duckdb {
 namespace magi_groupby {
 
 namespace {
-
-// Detect Q1 shape: keys are 2 VARCHAR (rf, ls), aggregates are SUM(DOUBLE)
-// + COUNT_STAR / COUNT in any order. We also need 4 SUM aggregates and 1
-// COUNT-ish for the Q1 result row, but we leave that count-check to the
-// Q1 mapping below — Run() is happy to dispatch as long as the columns
-// look Q1-shaped.
-bool IsQ1Shape(const vector<shared_ptr<GPUColumn>>& keys,
-               const vector<shared_ptr<GPUColumn>>& aggs,
-               int                                  num_group_keys,
-               int                                  num_aggregates,
-               sirius::AggregationType*                     agg_mode)
-{
-  if (num_group_keys != 2) return false;
-  for (int i = 0; i < 2; ++i) {
-    if (!keys[i]) return false;
-    if (keys[i]->data_wrapper.type.id() != GPUColumnTypeId::VARCHAR) return false;
-  }
-  for (int i = 0; i < num_aggregates; ++i) {
-    if (agg_mode[i] == sirius::AggregationType::COUNT_STAR) continue;
-    if (!aggs[i]) return false;
-    auto tid = aggs[i]->data_wrapper.type.id();
-    bool is_sum = (agg_mode[i] == sirius::AggregationType::SUM)   && tid == GPUColumnTypeId::FLOAT64;
-    bool is_cnt = (agg_mode[i] == sirius::AggregationType::COUNT) && tid == GPUColumnTypeId::FLOAT64;
-    if (!is_sum && !is_cnt) return false;
-  }
-  return true;
-}
-
-// Pull the column pointers Q1's kernel needs out of sirius's GPUColumns.
-// The kernel's input layout is fixed: l_quantity / l_extendedprice /
-// l_discount / l_tax + (rf chars+offsets) + (ls chars+offsets). The
-// 4 SUM aggregates from the operator are passed in some order; for M1
-// we trust that the operator hands us {sum_qty, sum_ep, sum_disc, sum_tax}
-// in that index order — caller (gpu_physical_grouped_aggregate) ensures
-// it because that's the order the planner emits them in for Q1.
-//
-// FUTURE: when we widen past Q1, replace this with a generic
-// (column_index → role) mapping derived from the BoundAggregateExpression
-// children, so we don't depend on planner emit order.
-magi_q1::PerGpuInputs BuildPerGpuInputs(
-    const vector<shared_ptr<GPUColumn>>& keys,
-    const vector<shared_ptr<GPUColumn>>& aggs,
-    int                                  num_aggregates)
-{
-  magi_q1::PerGpuInputs in{};
-  in.n_filtered = keys[0]->column_length;
-
-  // Aggregate columns 0..3 are SUM(double); skip COUNT_STAR (no data ptr).
-  // We need exactly 4 SUM doubles in some prefix; M1's q1.cuh doesn't read
-  // tax separately, but the planner still passes it as a SUM input.
-  int sum_idx = 0;
-  const double* sum_ptrs[4] = { nullptr, nullptr, nullptr, nullptr };
-  for (int i = 0; i < num_aggregates && sum_idx < 4; ++i) {
-    if (!aggs[i]) continue;  // COUNT_STAR has no data
-    if (aggs[i]->data_wrapper.type.id() != GPUColumnTypeId::FLOAT64) continue;
-    sum_ptrs[sum_idx++] = reinterpret_cast<const double*>(aggs[i]->data_wrapper.data);
-  }
-  in.d_quantity = sum_ptrs[0];
-  in.d_ep       = sum_ptrs[1];
-  in.d_disc     = sum_ptrs[2];
-  in.d_tax      = sum_ptrs[3];
-
-  in.rf_chars   = keys[0]->data_wrapper.data;
-  in.rf_offsets = keys[0]->data_wrapper.offset;
-  in.ls_chars   = keys[1]->data_wrapper.data;
-  in.ls_offsets = keys[1]->data_wrapper.offset;
-  return in;
-}
-
-// Materialise this GPU's slice into freshly-allocated device columns.
-// VARCHAR(1) layout matches sirius's existing convention: chars buffer
-// of length N (one byte per row) + offsets buffer of length N+1
-// (offsets[i] = i, offsets[N] = N).
-void WriteSliceToColumns(int                                gpu_id,
-                         const std::vector<magi_q1::AggResultRow>& slice,
-                         vector<shared_ptr<GPUColumn>>&     keys,
-                         vector<shared_ptr<GPUColumn>>&     aggs,
-                         int                                num_aggregates,
-                         sirius::AggregationType*                   agg_mode,
-                         GPUBufferManager*                  gbm)
-{
-  const size_t N = slice.size();
-
-  // ── Group keys (2 × VARCHAR(1)) ────────────────────────────────────────
-  for (int kcol = 0; kcol < 2; ++kcol) {
-    if (N == 0) {
-      // Empty slice: hand sirius a column with data=nullptr so the operator's
-      // combine branch picks the peer thread's non-empty column (instead of
-      // falling into combineMasks with garbage on N=0). At 4 GPUs with Q1's 4
-      // hash buckets some workers regularly get zero rows.
-      keys[kcol] = make_shared_ptr<GPUColumn>(0,
-                                              GPUColumnType(GPUColumnTypeId::VARCHAR),
-                                              /*data=*/nullptr,
-                                              /*offset=*/nullptr,
-                                              /*num_bytes=*/0,
-                                              /*is_string_data=*/true,
-                                              /*validity_mask=*/nullptr);
-      keys[kcol]->row_id_count = 0;
-      continue;
-    }
-    auto* d_chars   = gbm->customCudaMalloc<uint8_t> (N,     gpu_id, false);
-    auto* d_offsets = gbm->customCudaMalloc<uint64_t>(N + 1, gpu_id, false);
-    std::vector<uint8_t>  h_chars(N);
-    std::vector<uint64_t> h_offsets(N + 1);
-    for (size_t i = 0; i < N; ++i) {
-      h_chars[i]   = static_cast<uint8_t>(kcol == 0 ? slice[i].rf : slice[i].ls);
-      h_offsets[i] = i;
-    }
-    h_offsets[N] = N;
-    cudaMemcpy(d_chars,   h_chars.data(),   N,                 cudaMemcpyHostToDevice);
-    cudaMemcpy(d_offsets, h_offsets.data(), (N + 1) * sizeof(uint64_t),
-               cudaMemcpyHostToDevice);
-    auto* mask = createNullMask(N);  // ALL_VALID
-    keys[kcol] = make_shared_ptr<GPUColumn>(N,
-                                            GPUColumnType(GPUColumnTypeId::VARCHAR),
-                                            d_chars,
-                                            d_offsets,
-                                            /*num_bytes=*/N,
-                                            /*is_string_data=*/true,
-                                            mask);
-    keys[kcol]->row_id_count = 0;
-  }
-
-  // ── Aggregates: 4 SUM doubles (in planner-emit order) + COUNT_STAR ─────
-  // Helper: write a vector of doubles to device and replace the column.
-  auto write_double_col = [&](int agg_idx, const std::vector<double>& host) {
-    if (N == 0) {
-      aggs[agg_idx] = make_shared_ptr<GPUColumn>(0,
-                                                 GPUColumnType(GPUColumnTypeId::FLOAT64),
-                                                 /*data=*/nullptr,
-                                                 /*validity_mask=*/nullptr);
-      aggs[agg_idx]->row_id_count = 0;
-      return;
-    }
-    auto* d_buf = gbm->customCudaMalloc<double>(N, gpu_id, false);
-    cudaMemcpy(d_buf, host.data(), N * sizeof(double), cudaMemcpyHostToDevice);
-    aggs[agg_idx] = make_shared_ptr<GPUColumn>(N,
-                                               GPUColumnType(GPUColumnTypeId::FLOAT64),
-                                               reinterpret_cast<uint8_t*>(d_buf),
-                                               createNullMask(N));
-    aggs[agg_idx]->row_id_count = 0;
-  };
-  auto write_int64_col = [&](int agg_idx, const std::vector<uint64_t>& host) {
-    if (N == 0) {
-      aggs[agg_idx] = make_shared_ptr<GPUColumn>(0,
-                                                 GPUColumnType(GPUColumnTypeId::INT64),
-                                                 /*data=*/nullptr,
-                                                 /*validity_mask=*/nullptr);
-      aggs[agg_idx]->row_id_count = 0;
-      return;
-    }
-    auto* d_buf = gbm->customCudaMalloc<uint64_t>(N, gpu_id, false);
-    cudaMemcpy(d_buf, host.data(), N * sizeof(uint64_t), cudaMemcpyHostToDevice);
-    aggs[agg_idx] = make_shared_ptr<GPUColumn>(N,
-                                               GPUColumnType(GPUColumnTypeId::INT64),
-                                               reinterpret_cast<uint8_t*>(d_buf),
-                                               createNullMask(N));
-    aggs[agg_idx]->row_id_count = 0;
-  };
-
-  // Walk the agg list in planner order; for each SUM/COUNT slot, emit the
-  // matching field from the slice. SUM order matches BuildPerGpuInputs.
-  std::vector<double>  v_qty(N), v_ep(N), v_disc(N), v_charge(N);
-  std::vector<uint64_t> v_count(N);
-  // q1.cuh's slot encoding doesn't track sum_tax; the planner doesn't need
-  // it as a final agg either (TPC-H Q1 uses tax only inside the disc_price
-  // / charge expression, which Q1Tuple precomputes). But the planner does
-  // pass an l_tax SUM aggregate column. Map that slot to slice.sum_disc
-  // (= partial sum of l_discount, also unused downstream). It's a
-  // placeholder only — kill this once we generalise past Q1's hardcoded
-  // schema, but keeps the column count + types matching what the operator
-  // expects to find on output.
-  std::vector<double> v_disc_placeholder(N);
-  for (size_t i = 0; i < N; ++i) {
-    v_qty[i]               = slice[i].sum_qty;
-    v_ep[i]                = slice[i].sum_ep;
-    v_disc[i]              = slice[i].sum_disc_price;
-    v_charge[i]            = slice[i].sum_charge;
-    v_disc_placeholder[i]  = slice[i].sum_disc;
-    v_count[i]             = slice[i].count;
-  }
-  int sum_emit = 0;
-  for (int i = 0; i < num_aggregates; ++i) {
-    if (agg_mode[i] == sirius::AggregationType::COUNT_STAR ||
-        agg_mode[i] == sirius::AggregationType::COUNT) {
-      write_int64_col(i, v_count);
-    } else if (agg_mode[i] == sirius::AggregationType::SUM) {
-      // Map by emit order. The planner emits SUM(qty), SUM(ep),
-      // SUM(ep*(1-disc)), SUM(ep*(1-disc)*(1+tax)) for TPC-H Q1.
-      // Q1Tuple precomputed the multiplications producer-side and stored:
-      //   slice.sum_qty        ← SUM(l_quantity)
-      //   slice.sum_ep         ← SUM(l_extendedprice)
-      //   slice.sum_disc_price ← SUM(l_extendedprice*(1-l_discount))
-      //   slice.sum_charge     ← SUM(l_extendedprice*(1-l_discount)*(1+l_tax))
-      const std::vector<double>* src = nullptr;
-      switch (sum_emit++) {
-        case 0: src = &v_qty;    break;
-        case 1: src = &v_ep;     break;
-        case 2: src = &v_disc;   break;  // sum_disc_price
-        case 3: src = &v_charge; break;
-        default: src = &v_disc_placeholder; break;
-      }
-      write_double_col(i, *src);
-    } else {
-      throw NotImplementedException(
-          "magi_groupby M1: unsupported aggregate at index %d", i);
-    }
-  }
-}
-
-// ── Q5 dispatch (1 VARCHAR key + 1 SUM(DOUBLE)) ────────────────────────
-bool IsQ5Shape(const vector<shared_ptr<GPUColumn>>& keys,
-               const vector<shared_ptr<GPUColumn>>& aggs,
-               int                                  num_group_keys,
-               int                                  num_aggregates,
-               sirius::AggregationType*             agg_mode)
-{
-  if (num_group_keys != 1) return false;
-  if (num_aggregates  != 1) return false;
-  if (!keys[0] || keys[0]->data_wrapper.type.id() != GPUColumnTypeId::VARCHAR) return false;
-  if (!aggs[0] || aggs[0]->data_wrapper.type.id() != GPUColumnTypeId::FLOAT64) return false;
-  if (agg_mode[0] != sirius::AggregationType::SUM) return false;
-  return true;
-}
-
-magi_q5::PerGpuInputs BuildPerGpuInputs_Q5(
-    const vector<shared_ptr<GPUColumn>>& keys,
-    const vector<shared_ptr<GPUColumn>>& aggs)
-{
-  magi_q5::PerGpuInputs in{};
-  in.n_filtered     = keys[0]->column_length;
-  in.n_name_chars   = keys[0]->data_wrapper.data;
-  in.n_name_offsets = keys[0]->data_wrapper.offset;
-  in.d_revenue      = reinterpret_cast<const double*>(aggs[0]->data_wrapper.data);
-  return in;
-}
-
-void WriteSliceToColumns_Q5(int                                gpu_id,
-                            const std::vector<magi_q5::AggResultRow>& slice,
-                            vector<shared_ptr<GPUColumn>>&     keys,
-                            vector<shared_ptr<GPUColumn>>&     aggs,
-                            GPUBufferManager*                  gbm)
-{
-  const size_t N = slice.size();
-
-  // Empty-slice path: hand sirius nullptr-data columns so the operator's
-  // combine branch picks a peer's non-empty column (same pattern as Q1).
-  if (N == 0) {
-    keys[0] = make_shared_ptr<GPUColumn>(0,
-                                          GPUColumnType(GPUColumnTypeId::VARCHAR),
-                                          /*data=*/nullptr,
-                                          /*offset=*/nullptr,
-                                          /*num_bytes=*/0,
-                                          /*is_string_data=*/true,
-                                          /*validity_mask=*/nullptr);
-    keys[0]->row_id_count = 0;
-    aggs[0] = make_shared_ptr<GPUColumn>(0,
-                                          GPUColumnType(GPUColumnTypeId::FLOAT64),
-                                          /*data=*/nullptr,
-                                          /*validity_mask=*/nullptr);
-    aggs[0]->row_id_count = 0;
-    return;
-  }
-
-  // Q5 key column (VARCHAR n_name): unpack the packed first-8-chars back
-  // into a variable-length char buffer + N+1 offsets. Names with len > 8
-  // get truncated; for TPC-H 25 nations this only loses bytes 9.. of
-  // INDONESIA, which shares no prefix with peers so SUM stays correct.
-  // TODO: pass full name through wire tuple once we tackle longer keys.
-  std::vector<uint64_t> h_offsets(N + 1);
-  size_t total_bytes = 0;
-  h_offsets[0] = 0;
-  for (size_t i = 0; i < N; ++i) {
-    uint64_t k = slice[i].n_name_packed;
-    int len = 0;
-    for (int b = 0; b < 8; ++b) {
-      if (((k >> (b * 8)) & 0xff) == 0) break;
-      ++len;
-    }
-    total_bytes += len;
-    h_offsets[i + 1] = total_bytes;
-  }
-  std::vector<uint8_t> h_chars(total_bytes);
-  for (size_t i = 0; i < N; ++i) {
-    uint64_t k = slice[i].n_name_packed;
-    size_t dst = h_offsets[i];
-    for (int b = 0; b < 8; ++b) {
-      uint8_t c = static_cast<uint8_t>((k >> (b * 8)) & 0xff);
-      if (c == 0) break;
-      h_chars[dst++] = c;
-    }
-  }
-
-  auto* d_chars   = gbm->customCudaMalloc<uint8_t>(total_bytes == 0 ? 1 : total_bytes, gpu_id, false);
-  auto* d_offsets = gbm->customCudaMalloc<uint64_t>(N + 1, gpu_id, false);
-  if (total_bytes > 0)
-    cudaMemcpy(d_chars, h_chars.data(), total_bytes, cudaMemcpyHostToDevice);
-  cudaMemcpy(d_offsets, h_offsets.data(), (N + 1) * sizeof(uint64_t),
-             cudaMemcpyHostToDevice);
-  keys[0] = make_shared_ptr<GPUColumn>(N,
-                                        GPUColumnType(GPUColumnTypeId::VARCHAR),
-                                        d_chars,
-                                        d_offsets,
-                                        /*num_bytes=*/total_bytes,
-                                        /*is_string_data=*/true,
-                                        createNullMask(N));
-  keys[0]->row_id_count = 0;
-
-  // Q5 sum column.
-  std::vector<double> v_sum(N);
-  for (size_t i = 0; i < N; ++i) v_sum[i] = slice[i].sum_revenue;
-  auto* d_buf = gbm->customCudaMalloc<double>(N, gpu_id, false);
-  cudaMemcpy(d_buf, v_sum.data(), N * sizeof(double), cudaMemcpyHostToDevice);
-  aggs[0] = make_shared_ptr<GPUColumn>(N,
-                                        GPUColumnType(GPUColumnTypeId::FLOAT64),
-                                        reinterpret_cast<uint8_t*>(d_buf),
-                                        createNullMask(N));
-  aggs[0]->row_id_count = 0;
-}
 
 // ── Generic-path adapters ─────────────────────────────────────────────────
 // These translate sirius's per-GPU GPUColumn views into the magi-side
@@ -546,6 +227,10 @@ magi_generic::PerGpuInputs BuildGenericInputs(
   int i64a_idx = 0;
   for (int a = 0; a < num_aggregates; ++a) {
     switch (agg_mode[a]) {
+      // AVERAGE carries the same input column as a SUM would (it accumulates a
+      // SUM on the magi-direct path; the divide-by-count happens at emit). Keep
+      // it in lockstep with BuildAggOpsTable's AVERAGE branch.
+      case sirius::AggregationType::AVERAGE:
       case sirius::AggregationType::SUM: {
         const auto  id   = aggs[a] ? aggs[a]->data_wrapper.type.id()
                                    : GPUColumnTypeId::FLOAT64;
@@ -580,10 +265,14 @@ magi_generic::PerGpuInputs BuildGenericInputs(
 std::vector<magi_ops::AggOpEntry> BuildAggOpsTable(
     const vector<shared_ptr<GPUColumn>>& aggs,
     int                                  num_aggregates,
-    sirius::AggregationType*             agg_mode)
+    sirius::AggregationType*             agg_mode,
+    int&                                 avg_count_slot)  // out: slot holding the
+                                                          // per-group row count for
+                                                          // AVG divisors (-1 if none)
 {
   std::vector<magi_ops::AggOpEntry> ops;
-  ops.reserve(num_aggregates);
+  ops.reserve(num_aggregates + 1);
+  avg_count_slot = -1;
 
   // Source columns are typed-pool-co-numbered with their AggKind:
   //   SUM_DOUBLE   → d_idx into ColPack::d_cols
@@ -596,6 +285,12 @@ std::vector<magi_ops::AggOpEntry> BuildAggOpsTable(
   for (int a = 0; a < num_aggregates; ++a) {
     magi_ops::AggOpEntry e{};
     switch (agg_mode[a]) {
+      // AVERAGE accumulates exactly like SUM on the device (SUM_DOUBLE /
+      // SUM_INT64 by input type); WriteGenericSliceToColumns divides the
+      // accumulated sum by the per-group row count (avg_count_slot, a shared
+      // COUNT_STAR appended below). Must stay in lockstep with the AVERAGE
+      // branch in BuildGenericInputs (same column-slot consumption order).
+      case sirius::AggregationType::AVERAGE:
       case sirius::AggregationType::SUM: {
         // Build the op from the column TYPE (preserved even when this GPU's
         // post-filter slice is empty / data == nullptr) so dst_slot_idx and
@@ -654,6 +349,22 @@ std::vector<magi_ops::AggOpEntry> BuildAggOpsTable(
             static_cast<int>(agg_mode[a]), a);
     }
     ops.push_back(e);
+  }
+
+  // If any AVERAGE is present, append ONE shared COUNT_STAR carrier: the
+  // per-group row count is the same divisor for every AVG column, so a single
+  // extra slot serves them all. dst_idx continues past the real aggregates'
+  // slots; the widened AggSlot64 (128B → up to 14 double slots) has room.
+  bool has_avg = false;
+  for (int a = 0; a < num_aggregates; ++a)
+    if (agg_mode[a] == sirius::AggregationType::AVERAGE) { has_avg = true; break; }
+  if (has_avg) {
+    magi_ops::AggOpEntry ce{};
+    ce.kind         = magi_ops::AggKind::COUNT_STAR;
+    ce.src_col_idx  = -1;
+    ce.dst_slot_idx = static_cast<int8_t>(dst_idx++);
+    ops.push_back(ce);
+    avg_count_slot  = ce.dst_slot_idx;
   }
   return ops;
 }
@@ -776,6 +487,50 @@ void EmitInt64AggCol(int                                              gpu_id,
   out_col->row_id_count = 0;
 }
 
+// Emit an AVG output column = (accumulated SUM at sum_slot) / (per-group row
+// count at count_slot). The sum was accumulated either as a double (SUM_DOUBLE,
+// FLOAT64 input) or as raw int64 bits (SUM_INT64, INT64/DECIMAL input — divide
+// the raw int64 by 10^decimal_scale to recover the decimal value). The count
+// slot holds a uint64 counter in the double-sized field (COUNT_STAR). DuckDB's
+// avg() over these types yields DOUBLE, so the output column is FLOAT64.
+void EmitAvgCol(int                                              gpu_id,
+                size_t                                           N,
+                const std::vector<magi_generic::AggResultRow>&   slice,
+                int                                              sum_slot,
+                int                                              count_slot,
+                bool                                             sum_is_int64,
+                int                                              decimal_scale,
+                shared_ptr<GPUColumn>&                           out_col,
+                GPUBufferManager*                                gbm)
+{
+  if (N == 0) {
+    out_col = make_shared_ptr<GPUColumn>(0, GPUColumnType(GPUColumnTypeId::FLOAT64),
+                                         nullptr, nullptr);
+    out_col->row_id_count = 0;
+    return;
+  }
+  const double scale_div = decimal_scale > 0 ? std::pow(10.0, decimal_scale) : 1.0;
+  std::vector<double> v(N);
+  for (size_t i = 0; i < N; ++i) {
+    uint64_t cnt = 0;
+    std::memcpy(&cnt, &slice[i].values[count_slot], sizeof(uint64_t));
+    double sum;
+    if (sum_is_int64) {
+      int64_t raw = 0;
+      std::memcpy(&raw, &slice[i].values[sum_slot], sizeof(int64_t));
+      sum = static_cast<double>(raw) / scale_div;
+    } else {
+      sum = slice[i].values[sum_slot];
+    }
+    v[i] = (cnt != 0) ? (sum / static_cast<double>(cnt)) : 0.0;
+  }
+  auto* d_buf = gbm->customCudaMalloc<double>(N, gpu_id, false);
+  cudaMemcpy(d_buf, v.data(), N * sizeof(double), cudaMemcpyHostToDevice);
+  out_col = make_shared_ptr<GPUColumn>(N, GPUColumnType(GPUColumnTypeId::FLOAT64),
+                                       reinterpret_cast<uint8_t*>(d_buf), createNullMask(N));
+  out_col->row_id_count = 0;
+}
+
 void WriteGenericSliceToColumns(int                                              gpu_id,
                                 const std::vector<magi_generic::AggResultRow>&   slice,
                                 vector<shared_ptr<GPUColumn>>&                   keys,
@@ -784,6 +539,7 @@ void WriteGenericSliceToColumns(int                                             
                                 int                                              num_aggregates,
                                 sirius::AggregationType*                         agg_mode,
                                 const std::vector<magi_ops::KeyFieldEntry>&      key_fields,
+                                int                                              avg_count_slot,
                                 GPUBufferManager*                                gbm)
 {
   const size_t N = slice.size();
@@ -889,6 +645,26 @@ void WriteGenericSliceToColumns(int                                             
         }
         break;
       }
+      case sirius::AggregationType::AVERAGE: {
+        // AVG emit = sum_slot / per-group-count (avg_count_slot). The sum was
+        // accumulated as SUM_DOUBLE (FLOAT64) or SUM_INT64 (INT64/DECIMAL, with
+        // 10^scale to recover the decimal value). dst_idx is this AVG's sum slot
+        // (assigned in BuildAggOpsTable lockstep); avg_count_slot is the shared
+        // COUNT_STAR carrier appended after the real aggregates.
+        const auto in_id =
+            aggs[a] ? aggs[a]->data_wrapper.type.id() : GPUColumnTypeId::FLOAT64;
+        const bool sum_is_int64 =
+            (in_id == GPUColumnTypeId::INT64 || in_id == GPUColumnTypeId::DECIMAL);
+        int scale = 0;
+        if (in_id == GPUColumnTypeId::DECIMAL && aggs[a]) {
+          const auto* dti = aggs[a]->data_wrapper.type.GetDecimalTypeInfo();
+          if (dti) scale = dti->scale_;
+        }
+        EmitAvgCol(gpu_id, N, slice, /*sum_slot=*/dst_idx, /*count_slot=*/avg_count_slot,
+                   sum_is_int64, scale, aggs[a], gbm);
+        dst_idx++;
+        break;
+      }
       case sirius::AggregationType::COUNT_STAR:
       case sirius::AggregationType::COUNT:
         EmitInt64AggCol(gpu_id, N, slice, dst_idx++, aggs[a], gbm);
@@ -923,39 +699,7 @@ void Run(int                                gpu_id,
          int                                num_aggregates,
          sirius::AggregationType*           agg_mode)
 {
-  // ── Legacy A/B knob ────────────────────────────────────────────────────
-  // MAGI_LEGACY=1 falls back to the per-query Q1/Q5 paths so we can
-  // bit-compare them against the generic library. Production runs leave
-  // it unset.
-  static const bool legacy = std::getenv("MAGI_LEGACY") != nullptr;
-  if (legacy) {
-    if (IsQ5Shape(group_by_keys, aggregate_keys,
-                  num_group_keys, num_aggregates, agg_mode)) {
-      auto in = BuildPerGpuInputs_Q5(group_by_keys, aggregate_keys);
-      std::vector<magi_q5::AggResultRow> slice;
-      magi_q5::Q5MagiRunPerGpu(gpu_id, in, slice);
-      WriteSliceToColumns_Q5(gpu_id, slice,
-                             group_by_keys, aggregate_keys,
-                             &GPUBufferManager::GetInstance());
-      return;
-    }
-    if (IsQ1Shape(group_by_keys, aggregate_keys,
-                  num_group_keys, num_aggregates, agg_mode)) {
-      auto in = BuildPerGpuInputs(group_by_keys, aggregate_keys, num_aggregates);
-      std::vector<magi_q1::AggResultRow> slice;
-      magi_q1::Q1MagiRunPerGpu(gpu_id, in, slice);
-      WriteSliceToColumns(gpu_id, slice,
-                          group_by_keys, aggregate_keys,
-                          num_aggregates, agg_mode,
-                          &GPUBufferManager::GetInstance());
-      return;
-    }
-    throw NotImplementedException(
-        "MAGI_LEGACY=1 only covers Q1/Q5 shapes — unset MAGI_LEGACY to use "
-        "the generic distributed_hash_groupby path.");
-  }
-
-  // ── Generic path (default) ─────────────────────────────────────────────
+  // ── Generic path (table-driven; handles all supported GROUP BY shapes) ──
   magi_generic::KeyKind                 key_kind;
   std::vector<magi_ops::KeyFieldEntry>  key_fields;
   if (!DeriveKeyShape(group_by_keys, num_group_keys, key_kind, key_fields)) {
@@ -972,7 +716,9 @@ void Run(int                                gpu_id,
 
   auto in   = BuildGenericInputs(group_by_keys, aggregate_keys,
                                   num_group_keys, num_aggregates, agg_mode);
-  auto ops  = BuildAggOpsTable(aggregate_keys, num_aggregates, agg_mode);
+  int  avg_count_slot = -1;
+  auto ops  = BuildAggOpsTable(aggregate_keys, num_aggregates, agg_mode,
+                               avg_count_slot);
   std::vector<magi_generic::AggResultRow> slice;
   magi_generic::distributed_hash_groupby_run_per_gpu(
       gpu_id, in, key_fields, ops, key_kind, table_size, slice);
@@ -980,7 +726,7 @@ void Run(int                                gpu_id,
   WriteGenericSliceToColumns(gpu_id, slice,
                              group_by_keys, aggregate_keys,
                              num_group_keys, num_aggregates, agg_mode,
-                             key_fields,
+                             key_fields, avg_count_slot,
                              &GPUBufferManager::GetInstance());
 }
 

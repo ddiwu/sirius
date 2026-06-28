@@ -16,6 +16,10 @@
 
 #include "gpu_context.hpp"
 
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+
 #include "duckdb/execution/operator/helper/physical_result_collector.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/connection.hpp"
@@ -182,6 +186,8 @@ unique_ptr<QueryResult> GPUContext::GPUExecuteQuery(
   shared_ptr<GPUPreparedStatementData>& statement_p,
   const PendingQueryParameters& parameters)
 {
+  static const bool QT = std::getenv("MAGI_QUERY_TIME") != nullptr;
+  const auto qt0 = std::chrono::high_resolution_clock::now();
   auto pending_query =
     GPUPendingStatementOrPreparedStatement(context, query, statement_p, parameters);
   D_ASSERT(gpu_active_query->IsOpenResult(*pending_query));
@@ -193,6 +199,11 @@ unique_ptr<QueryResult> GPUContext::GPUExecuteQuery(
     current_result = GPUExecutePendingQueryResult(*pending_query);
   }
   SIRIUS_LOG_DEBUG("Done GPUExecuteQuery");
+  if (QT) {
+    const auto qt1 = std::chrono::high_resolution_clock::now();
+    std::fprintf(stderr, "[query-time] %.1fms\n",
+                 std::chrono::duration<double, std::milli>(qt1 - qt0).count());
+  }
   return current_result;
 }
 
