@@ -2,17 +2,17 @@
 // `GPUPhysicalGroupedAggregate` through the Magi NVLink-shuffle backend.
 //
 // Each legacy worker thread (one per GPU) calls Run() on its partition's
-// columns. The dispatch table inside Run() picks the kernel for the
-// current input shape; for M1 only Q1's shape is wired:
+// columns. This is a *generic* path: there are no per-query shape detectors.
+// Run() inspects the group keys and aggregates, packs them into the magi
+// data model (KeyFieldEntry[] + AggOpEntry[]), and calls the generic
+// magi_generic::distributed_hash_groupby_run_per_gpu, which std::barriers
+// across the per-GPU threads and NVLink-shuffles the partial aggregates.
+// On return it materialises this GPU's hash-partitioned slice back into a
+// fresh (chars+offsets) VARCHAR + DOUBLE/INT64 column set on the same GPU.
 //
-//     2 group keys, both VARCHAR(1)
-//     N aggregates ∈ {SUM(DOUBLE), COUNT_STAR, COUNT(DOUBLE)}
-//
-// Anything else throws NotImplementedException. Future queries widen the
-// dispatch by adding more shape branches. The Q1 path internally calls
-// magi_runtime::Q1MagiRunPerGpu (which std::barriers across the per-GPU
-// threads), then materialises this GPU's hash-partitioned slice as a
-// new (chars+offsets) VARCHAR + DOUBLE/INT64 column set on the same GPU.
+// Supported aggregates: SUM (INT64/DOUBLE), COUNT_STAR, COUNT, MIN, MAX, and
+// AVG (carried as SUM + a shared COUNT_STAR slot, divided at emit). Anything
+// the packer can't express falls back to DuckDB CPU.
 
 #include "operator/magi_groupby.hpp"
 

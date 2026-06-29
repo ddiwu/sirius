@@ -1,12 +1,12 @@
 // magi_runtime_shared.hpp — accessor surface to the shared magi runtime
-// singleton owned by q1_dispatcher.cu.
+// singleton owned by magi_runtime.cu.
 //
-// Sibling query dispatchers (q5_dispatcher.cu, future q9_dispatcher.cu, ...)
+// The per-query dispatchers (magi_groupby_runtime.cu, magi_join_runtime.cu)
 // pull these declarations in to reach into the magi runtime (Endpoints,
 // ChannelRuntime, P2P streams, identity row_ids cache) without seeing the
 // MagiState struct definition or the heavy magi template headers.
 //
-// All definitions live in q1_dispatcher.cu; this header just declares the
+// All definitions live in magi_runtime.cu; this header just declares the
 // function entry points.
 
 #pragma once
@@ -16,10 +16,16 @@
 
 #include <cuda_runtime.h>
 
-#include "legacy/operator/magi_q1.hpp"  // for NUM_GPUS
+#include "legacy/gpu_buffer_manager.hpp"  // for kSiriusLegacyNumGpus
 
 namespace duckdb {
 namespace magi_runtime {
+
+// Number of GPUs the legacy magi runtime targets, set at cmake configure
+// time via -DSIRIUS_LEGACY_NUM_GPUS=N (mirrored into kSiriusLegacyNumGpus).
+// The shared runtime and every per-query dispatcher size their per-GPU
+// arrays from this constant.
+constexpr int NUM_GPUS = kSiriusLegacyNumGpus;
 
 // One-shot init: builds Endpoints, ChannelRuntimes, P2P paths. Idempotent;
 // safe to call from any dispatcher's per-GPU entry.

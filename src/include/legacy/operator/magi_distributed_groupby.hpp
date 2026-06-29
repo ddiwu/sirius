@@ -22,7 +22,7 @@
 #include "data_plane/ops/agg_slot.cuh"
 #include "data_plane/ops/col_pack.cuh"
 
-#include "legacy/operator/magi_q1.hpp"  // for magi_runtime::NUM_GPUS
+#include "legacy/operator/magi_runtime_shared.hpp"  // for magi_runtime::NUM_GPUS
 
 namespace duckdb {
 namespace magi_generic {

@@ -260,9 +260,9 @@ struct GenericExchange {
 static GenericExchange& exchange() { static GenericExchange e; return e; }
 
 // ── Per-GPU launch (templated on KeyT and N_SLOTS tier) ───────────────────
-// Mirrors Q5MagiRunPerGpu's flow exactly; the only differences are the
-// kernel symbol (now selected by both KeyT and tier) and the slice
-// extraction loop.
+// Each per-GPU worker resets its agg slots, launches the generic
+// distributed_hash_groupby_kernel (selected by both KeyT and slot tier),
+// drains the magi session, and extracts its hash-partitioned slice.
 template <typename KeyT, int N_SLOTS, int SB>
 static std::size_t run_per_gpu_typed_tier(int                        gpu_id,
                                            std::vector<AggResultRow>& my_slice)
