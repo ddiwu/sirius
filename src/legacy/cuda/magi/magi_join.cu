@@ -85,27 +85,38 @@ BuildJoinInputs(const std::vector<shared_ptr<GPUColumn>>& keys,
   in.cols.n_int64s = i64_idx;
 
   out_payload_tbl.clear();
-  int i64a_idx = 0, d_idx = 0;
+  // dst_slot is a RUNNING wire/result slot index (NOT the column index): each
+  // numeric payload takes 1 slot, a VARCHAR takes VARCHAR_PAYLOAD_SLOTS. The
+  // pack kernel iterates payload ENTRIES; the build/probe kernels copy SLOTS.
+  int i64a_idx = 0, d_idx = 0, v_idx = 0, dst_slot = 0;
   for (int p = 0; p < static_cast<int>(payload.size()); ++p) {
     auto id      = payload[p]->data_wrapper.type.id();
     auto* data   = payload[p]->data_wrapper.data;
-    if (id == GPUColumnTypeId::FLOAT64) {
+    if (id == GPUColumnTypeId::VARCHAR) {  // inline length-prefixed string → 4 slots
+      in.cols.v_chars[v_idx] = reinterpret_cast<const uint8_t*>(data);
+      in.cols.v_offsets[v_idx] =
+          reinterpret_cast<const uint64_t*>(payload[p]->data_wrapper.offset);
+      out_payload_tbl.push_back({JoinPayloadEntry::Src::VARCHAR, (int16_t)v_idx, (int16_t)dst_slot});
+      ++v_idx;
+      dst_slot += magi_generic::VARCHAR_PAYLOAD_SLOTS;
+    } else if (id == GPUColumnTypeId::FLOAT64) {
       in.cols.d_cols[d_idx] = reinterpret_cast<const double*>(data);
-      out_payload_tbl.push_back({JoinPayloadEntry::Src::DOUBLE, (int16_t)d_idx, (int16_t)p});
-      ++d_idx;
+      out_payload_tbl.push_back({JoinPayloadEntry::Src::DOUBLE, (int16_t)d_idx, (int16_t)dst_slot});
+      ++d_idx; ++dst_slot;
     } else if (id == GPUColumnTypeId::INT32) {  // INTEGER — widened to int64 on the wire
       in.cols.i_cols[i_idx] = reinterpret_cast<const int32_t*>(data);
-      out_payload_tbl.push_back({JoinPayloadEntry::Src::INT32, (int16_t)i_idx, (int16_t)p});
-      ++i_idx;
+      out_payload_tbl.push_back({JoinPayloadEntry::Src::INT32, (int16_t)i_idx, (int16_t)dst_slot});
+      ++i_idx; ++dst_slot;
     } else {  // INT64 / DECIMAL(≤18) stored as int64
       in.cols.i64_agg_cols[i64a_idx] = reinterpret_cast<const int64_t*>(data);
-      out_payload_tbl.push_back({JoinPayloadEntry::Src::INT64, (int16_t)i64a_idx, (int16_t)p});
-      ++i64a_idx;
+      out_payload_tbl.push_back({JoinPayloadEntry::Src::INT64, (int16_t)i64a_idx, (int16_t)dst_slot});
+      ++i64a_idx; ++dst_slot;
     }
   }
   in.cols.n_ints       = i_idx;   // key INT32 cols + INT32 payload cols
   in.cols.n_doubles    = d_idx;
   in.cols.n_int64_aggs = i64a_idx;
+  in.cols.n_varchars   = v_idx;
 
   in.cols.row_validity =
       (!keys.empty() && keys[0] && keys[0]->data_wrapper.validity_mask)
@@ -163,6 +174,50 @@ shared_ptr<GPUColumn> EmitPayloadColumn(int gpu_id, const shared_ptr<GPUColumn>&
   auto val = [&](size_t i) -> double {
     return from_build ? slice[i].build_values[e.dst_idx] : slice[i].probe_values[e.dst_idx];
   };
+  if (e.src_kind == JoinPayloadEntry::Src::VARCHAR) {
+    // Inline string: VARCHAR_PAYLOAD_SLOTS 8-byte slots from dst_idx hold
+    // [byte0 = length][bytes 1.. = chars]. Rebuild a sirius VARCHAR column
+    // (chars + uint64 offsets[N+1] + num_bytes), like the groupby's
+    // EmitVarcharKeyFromPacked.
+    auto read_buf = [&](size_t i, unsigned char* buf) {
+      for (int s = 0; s < magi_generic::VARCHAR_PAYLOAD_SLOTS; ++s) {
+        double dv = from_build ? slice[i].build_values[e.dst_idx + s]
+                               : slice[i].probe_values[e.dst_idx + s];
+        std::memcpy(buf + s * 8, &dv, sizeof(double));
+      }
+    };
+    if (N == 0)
+      return make_shared_ptr<GPUColumn>(0, GPUColumnType(GPUColumnTypeId::VARCHAR),
+                                        nullptr, nullptr, 0, true, nullptr);
+    std::vector<uint64_t> h_offsets(N + 1, 0);
+    size_t total = 0;
+    for (size_t i = 0; i < N; ++i) {
+      unsigned char buf[magi_generic::VARCHAR_PAYLOAD_SLOTS * 8];
+      read_buf(i, buf);
+      unsigned len = buf[0];
+      if (len > magi_generic::VARCHAR_PAYLOAD_MAXLEN) len = magi_generic::VARCHAR_PAYLOAD_MAXLEN;
+      total += len;
+      h_offsets[i + 1] = total;
+    }
+    std::vector<uint8_t> h_chars(total == 0 ? 1 : total);
+    for (size_t i = 0; i < N; ++i) {
+      unsigned char buf[magi_generic::VARCHAR_PAYLOAD_SLOTS * 8];
+      read_buf(i, buf);
+      unsigned len = buf[0];
+      if (len > magi_generic::VARCHAR_PAYLOAD_MAXLEN) len = magi_generic::VARCHAR_PAYLOAD_MAXLEN;
+      size_t dst = h_offsets[i];
+      for (unsigned b = 0; b < len; ++b) h_chars[dst++] = buf[1 + b];
+    }
+    auto* d_chars   = gbm->customCudaMalloc<uint8_t>(total == 0 ? 1 : total, gpu_id, false);
+    auto* d_offsets = gbm->customCudaMalloc<uint64_t>(N + 1, gpu_id, false);
+    if (total > 0) cudaMemcpy(d_chars, h_chars.data(), total, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_offsets, h_offsets.data(), (N + 1) * sizeof(uint64_t), cudaMemcpyHostToDevice);
+    auto c = make_shared_ptr<GPUColumn>(N, GPUColumnType(GPUColumnTypeId::VARCHAR),
+                                        d_chars, d_offsets, total, /*is_string_data=*/true,
+                                        createNullMask(N));
+    c->row_id_count = 0;
+    return c;
+  }
   if (e.src_kind == JoinPayloadEntry::Src::DOUBLE) {
     if (N == 0)
       return make_shared_ptr<GPUColumn>(0, proto->data_wrapper.type, nullptr, nullptr);

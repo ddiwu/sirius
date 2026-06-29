@@ -52,11 +52,23 @@ struct PerGpuJoinInputs {
 struct JoinPayloadEntry {
   // INT64  → cols.i64_agg_cols[src] (8B);  DOUBLE → cols.d_cols[src] (8B);
   // INT32  → cols.i_cols[src] (4B, widened to int64 on the wire, narrowed on emit).
-  enum class Src : std::int8_t { INT64 = 0, DOUBLE = 1, INT32 = 2 };
+  // VARCHAR→ cols.v_chars[src]/v_offsets[src]; the string is inlined into
+  //          VARCHAR_PAYLOAD_SLOTS consecutive 8B wire slots (length-prefixed),
+  //          so it rides the fixed-width tuple through the key-partition shuffle
+  //          like any other payload — no separate string buffer / cross-GPU dict.
+  enum class Src : std::int8_t { INT64 = 0, DOUBLE = 1, INT32 = 2, VARCHAR = 3 };
   Src           src_kind;
-  std::int16_t  src_col_idx;
-  std::int16_t  dst_idx;
+  std::int16_t  src_col_idx;   // INT/DOUBLE: pool index; VARCHAR: v_chars/v_offsets index
+  std::int16_t  dst_idx;       // BASE wire/result slot (VARCHAR spans 4 from here)
 };
+
+// A VARCHAR payload is inlined into this many consecutive 8-byte wire slots:
+// byte 0 = length, bytes 1..31 = chars (zero-padded). v1 cap: strings longer
+// than VARCHAR_PAYLOAD_MAXLEN are truncated, and one VARCHAR payload consumes a
+// side's entire 4-slot wire payload budget (JOIN_MAX_PAYLOAD). A future widening
+// can make this a dynamic slot like the groupby's AggSlot64<64/128>.
+static constexpr int VARCHAR_PAYLOAD_SLOTS  = 4;
+static constexpr int VARCHAR_PAYLOAD_MAXLEN = VARCHAR_PAYLOAD_SLOTS * 8 - 1;  // 31
 
 // One emitted matched row. `key_packed` is the join key widened to 128 bits
 // (same convention as AggResultRow). `build_values` / `probe_values` carry the

@@ -609,21 +609,35 @@ OperatorResultType GPUPhysicalHashJoin::Execute(GPUIntermediateRelation& input_r
     // Payload carried as 8-byte wire slots (≤ JOIN_MAX_PAYLOAD=4 per side). Reject
     // wider projections / non-8-byte columns loudly → DuckDB fallback (avoids the
     // int64 force-fit OOB read for INT32/DATE payloads).
-    if (lhs_output_columns.col_idxs.size() > 4 || rhs_output_columns.col_idxs.size() > 4) {
-      throw NotImplementedException("magi shuffle join v1: > 4 output payload columns per side");
-    }
     auto is_supported = [](GPUColumnTypeId tid) {
       return tid == GPUColumnTypeId::INT32 || tid == GPUColumnTypeId::INT64 ||
-             tid == GPUColumnTypeId::FLOAT64 || tid == GPUColumnTypeId::DECIMAL;
+             tid == GPUColumnTypeId::FLOAT64 || tid == GPUColumnTypeId::DECIMAL ||
+             tid == GPUColumnTypeId::VARCHAR;
     };
-    for (auto col_idx : lhs_output_columns.col_idxs)
-      if (!is_supported(input_relation.columns[col_idx]->data_wrapper.type.id()))
+    // Wire-slot budget per side: a numeric payload is 1 slot, a VARCHAR is
+    // inlined into 4 (length-prefixed, ≤31 chars). Each side's total slots must
+    // fit JOIN_MAX_PAYLOAD = 4 — so a VARCHAR consumes a side's whole budget.
+    auto slot_width = [](GPUColumnTypeId tid) {
+      return tid == GPUColumnTypeId::VARCHAR ? 4 : 1;
+    };
+    int lhs_slots = 0, rhs_slots = 0;
+    for (auto col_idx : lhs_output_columns.col_idxs) {
+      auto tid = input_relation.columns[col_idx]->data_wrapper.type.id();
+      if (!is_supported(tid))
         throw NotImplementedException(
-          "magi shuffle join v1: LHS payload column type unsupported (INT32/INT64/DECIMAL/FLOAT64)");
-    for (idx_t i = 0; i < rhs_output_columns.col_idxs.size(); i++)
-      if (!is_supported(rstate.shuffle_build_payload->columns[i]->data_wrapper.type.id()))
+          "magi shuffle join v1: LHS payload column type unsupported (INT32/INT64/DECIMAL/FLOAT64/VARCHAR)");
+      lhs_slots += slot_width(tid);
+    }
+    for (idx_t i = 0; i < rhs_output_columns.col_idxs.size(); i++) {
+      auto tid = rstate.shuffle_build_payload->columns[i]->data_wrapper.type.id();
+      if (!is_supported(tid))
         throw NotImplementedException(
-          "magi shuffle join v1: RHS payload column type unsupported (INT32/INT64/DECIMAL/FLOAT64)");
+          "magi shuffle join v1: RHS payload column type unsupported (INT32/INT64/DECIMAL/FLOAT64/VARCHAR)");
+      rhs_slots += slot_width(tid);
+    }
+    if (lhs_slots > 4 || rhs_slots > 4)
+      throw NotImplementedException(
+        "magi shuffle join v1: payload exceeds 4 wire slots/side (a VARCHAR uses all 4)");
 
     vector<shared_ptr<GPUColumn>> build_key_cols;
     for (idx_t c = 0; c < conditions.size(); c++)

@@ -192,6 +192,14 @@ static std::size_t join_run_typed_tier(int gpu_id, std::vector<JoinResultRow>& m
                   sizeof(JoinPayloadEntry) * xc.n_bpl[gpu_id],
                   cudaMemcpyHostToDevice, st);
 
+  // BUILD payload SLOT count (a VARCHAR spans VARCHAR_PAYLOAD_SLOTS): the pack
+  // kernel iterates ENTRIES (xc.n_bpl), but BuildInsert / ProbeEmit copy SLOTS
+  // into H_build->values[] / JoinResultRow::build_values[].
+  int n_bpl_slots = 0;
+  for (int i = 0; i < xc.n_bpl[gpu_id]; ++i)
+    n_bpl_slots += (xc.bpl_ptr[gpu_id][i].src_kind == JoinPayloadEntry::Src::VARCHAR)
+                       ? VARCHAR_PAYLOAD_SLOTS : 1;
+
   // ── BUILD: pack rows → wire tuples ────────────────────────────────────────
   const std::uint64_t bn = xc.build_in[gpu_id].n_rows;
   magi_join::JoinBuildWire* bw = nullptr;
@@ -221,7 +229,7 @@ static std::size_t join_run_typed_tier(int gpu_id, std::vector<JoinResultRow>& m
                           KBUFFERING_INTRA_PARTITION_SIZE,
                           KBUFFERING_INTER_PARTITION_SIZE>
       <<<USER_KERNEL_GRID_SIZE, JOIN_BLOCK, 0, st>>>(
-          bw, bw_n, H, xc.n_bpl[gpu_id], /*just_load=*/false, g_joverflow_dev[gpu_id]);
+          bw, bw_n, H, n_bpl_slots, /*just_load=*/false, g_joverflow_dev[gpu_id]);
   cudaStreamSynchronize(st);
   chk("build_kernel");
   magi_runtime::magi_sync_after_session(gpu_id, xc.build_session);
@@ -274,7 +282,7 @@ static std::size_t join_run_typed_tier(int gpu_id, std::vector<JoinResultRow>& m
                           KBUFFERING_INTER_PARTITION_SIZE>
       <<<USER_KERNEL_GRID_SIZE, JOIN_BLOCK, 0, st>>>(
           pw, pw_n, H, out, out_count, static_cast<unsigned int>(out_cap),
-          xc.n_bpl[gpu_id], /*just_load=*/false, g_joverflow_dev[gpu_id],
+          n_bpl_slots, /*just_load=*/false, g_joverflow_dev[gpu_id],
           /*n_drained=*/pw_count);    // reuse pw_count (pw_n already read) as drained counter
   cudaStreamSynchronize(st);
   chk("probe_kernel");

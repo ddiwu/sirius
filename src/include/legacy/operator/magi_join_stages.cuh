@@ -205,7 +205,26 @@ join_pack_build_kernel(const std::uint64_t* __restrict__       row_ids,
       const int dst = build_pl[i].dst_idx;
       const int src = build_pl[i].src_col_idx;
       if (dst < 0 || dst >= duckdb::magi_join::JOIN_MAX_PAYLOAD) continue;
-      if (build_pl[i].src_kind == JoinPayloadEntry::Src::INT64) {
+      if (build_pl[i].src_kind == JoinPayloadEntry::Src::VARCHAR) {
+        // Inline the local string into VARCHAR_PAYLOAD_SLOTS slots: [len][chars…].
+        // Done here (before the key-partition shuffle), so the bytes ride the
+        // fixed-width tuple to the owner GPU like any other payload.
+        const std::uint8_t*  vch = cols.v_chars[src];
+        const std::uint64_t* vof = cols.v_offsets[src];
+        const std::uint64_t  s0  = vof[r];
+        std::uint32_t len = static_cast<std::uint32_t>(vof[r + 1] - s0);
+        if (len > duckdb::magi_generic::VARCHAR_PAYLOAD_MAXLEN)
+          len = duckdb::magi_generic::VARCHAR_PAYLOAD_MAXLEN;
+        unsigned char buf[duckdb::magi_generic::VARCHAR_PAYLOAD_SLOTS * 8];
+        #pragma unroll
+        for (int b = 0; b < duckdb::magi_generic::VARCHAR_PAYLOAD_SLOTS * 8; ++b) buf[b] = 0;
+        buf[0] = static_cast<unsigned char>(len);
+        for (std::uint32_t b = 0; b < len; ++b) buf[1 + b] = vch[s0 + b];
+        #pragma unroll
+        for (int ws = 0; ws < duckdb::magi_generic::VARCHAR_PAYLOAD_SLOTS; ++ws)
+          if (dst + ws < duckdb::magi_join::JOIN_MAX_PAYLOAD)
+            __builtin_memcpy(&w.payload[dst + ws], &buf[ws * 8], sizeof(std::int64_t));
+      } else if (build_pl[i].src_kind == JoinPayloadEntry::Src::INT64) {
         w.payload[dst] = cols.i64_agg_cols[src][r];
       } else if (build_pl[i].src_kind == JoinPayloadEntry::Src::INT32) {
         w.payload[dst] = static_cast<int64_t>(cols.i_cols[src][r]);  // widen INT32 → int64
@@ -325,7 +344,23 @@ join_pack_probe_kernel(const std::uint64_t* __restrict__       row_ids,
       const int dst = probe_pl[i].dst_idx;
       const int src = probe_pl[i].src_col_idx;
       if (dst < 0 || dst >= duckdb::magi_join::JOIN_MAX_PAYLOAD) continue;
-      if (probe_pl[i].src_kind == JoinPayloadEntry::Src::INT64) {
+      if (probe_pl[i].src_kind == JoinPayloadEntry::Src::VARCHAR) {
+        const std::uint8_t*  vch = cols.v_chars[src];
+        const std::uint64_t* vof = cols.v_offsets[src];
+        const std::uint64_t  s0  = vof[r];
+        std::uint32_t len = static_cast<std::uint32_t>(vof[r + 1] - s0);
+        if (len > duckdb::magi_generic::VARCHAR_PAYLOAD_MAXLEN)
+          len = duckdb::magi_generic::VARCHAR_PAYLOAD_MAXLEN;
+        unsigned char buf[duckdb::magi_generic::VARCHAR_PAYLOAD_SLOTS * 8];
+        #pragma unroll
+        for (int b = 0; b < duckdb::magi_generic::VARCHAR_PAYLOAD_SLOTS * 8; ++b) buf[b] = 0;
+        buf[0] = static_cast<unsigned char>(len);
+        for (std::uint32_t b = 0; b < len; ++b) buf[1 + b] = vch[s0 + b];
+        #pragma unroll
+        for (int ws = 0; ws < duckdb::magi_generic::VARCHAR_PAYLOAD_SLOTS; ++ws)
+          if (dst + ws < duckdb::magi_join::JOIN_MAX_PAYLOAD)
+            __builtin_memcpy(&w.payload[dst + ws], &buf[ws * 8], sizeof(std::int64_t));
+      } else if (probe_pl[i].src_kind == JoinPayloadEntry::Src::INT64) {
         w.payload[dst] = cols.i64_agg_cols[src][r];
       } else if (probe_pl[i].src_kind == JoinPayloadEntry::Src::INT32) {
         w.payload[dst] = static_cast<int64_t>(cols.i_cols[src][r]);  // widen INT32 → int64
