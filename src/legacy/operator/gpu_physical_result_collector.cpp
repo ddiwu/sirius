@@ -20,6 +20,7 @@
 #include "duckdb/common/hugeint.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/prepared_statement_data.hpp"
+#include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "gpu_buffer_manager.hpp"
 #include "gpu_context.hpp"
@@ -28,6 +29,7 @@
 #include "gpu_pipeline.hpp"
 #include "log/logging.hpp"
 #include "operator/gpu_materialize.hpp"
+#include "operator/gpu_physical_projection.hpp"
 #include "operator/gpu_physical_table_scan.hpp"
 #include "operator/gpu_physical_ungrouped_aggregate.hpp"
 #include "utils.hpp"
@@ -733,6 +735,43 @@ unique_ptr<GPUResultCollection> ReduceUngroupedAcrossGpus(
   return reduced;
 }
 
+// Build a GPUResultCollection holding one 1-row HOST DataChunk per GPU from the
+// UNGROUPED_AGGREGATE node's retained per-GPU RAW partials (the pre-projection
+// aggregate columns staged in UngroupedAggregateRuntimeState::aggregation_result
+// by GPUPhysicalUngroupedAggregate::Sink). Used by the PROJECTION-over-
+// UNGROUPED_AGGREGATE multi-GPU path: the per-GPU result_collection chunks hold
+// the (per-GPU, hence wrong) projected ratios, so we cannot reduce those; we
+// re-materialise the raw partials here and reduce THOSE instead.
+//
+// `agg_types` are the aggregate node's output types (NOT the collector's
+// projected types). The returned collection's write_idx equals the number of
+// GPUs that produced a partial.
+unique_ptr<GPUResultCollection> CollectUngroupedRawPartials(
+  const GPUPhysicalUngroupedAggregate& agg,
+  const vector<LogicalType>& agg_types,
+  GPUBufferManager* gbm)
+{
+  auto partials = make_uniq<GPUResultCollection>();
+  const int saved_gpu = sirius_current_gpu;
+  int prev_device     = 0;
+  cudaGetDevice(&prev_device);
+  for (int g = 0; g < GPUBufferManager::GetMaxGpus(); ++g) {
+    if (!agg.per_gpu_state[g]) continue;
+    auto& rstate = static_cast<UngroupedAggregateRuntimeState&>(*agg.per_gpu_state[g]);
+    if (!rstate.aggregation_result) continue;
+    // The conversion (and the cudf ops it may invoke) must target GPU g, and
+    // ConvertGPUTableToCPUCollection reads `sirius_current_gpu` for its
+    // device->host memcpy. Pin both for the duration of this GPU's partial.
+    sirius_current_gpu = g;
+    cudaSetDevice(g);
+    GPUPhysicalMaterializedCollector::ConvertGPUTableToCPUCollection(
+      *rstate.aggregation_result, agg_types, partials.get(), gbm);
+  }
+  cudaSetDevice(prev_device);
+  sirius_current_gpu = saved_gpu;
+  return partials;
+}
+
 }  // namespace
 
 unique_ptr<QueryResult> GPUPhysicalMaterializedCollector::GetResult(GlobalSinkState& state)
@@ -766,6 +805,45 @@ unique_ptr<QueryResult> GPUPhysicalMaterializedCollector::GetResult(GlobalSinkSt
   if (combined->write_idx > 1 && plan.type == PhysicalOperatorType::UNGROUPED_AGGREGATE) {
     combined = ReduceUngroupedAcrossGpus(
       *combined, plan.Cast<GPUPhysicalUngroupedAggregate>(), types, gpuBufferManager);
+  } else if (combined->write_idx > 1 && plan.type == PhysicalOperatorType::PROJECTION &&
+             !plan.children.empty() &&
+             plan.children[0]->type == PhysicalOperatorType::UNGROUPED_AGGREGATE) {
+    // PROJECTION over an UNGROUPED_AGGREGATE on multi-GPU: the per-GPU pipeline
+    // ran the projection on each GPU's PARTIAL aggregate, so the per-GPU
+    // result_collection chunks in `combined` are per-GPU ratios (e.g. Q14's
+    // 100*p_g/t_g) that must NOT be concatenated. Instead: (1) gather the RAW
+    // pre-projection aggregate partials retained per-GPU, (2) reduce those raw
+    // partials across GPUs into a single row, (3) apply the projection on the
+    // HOST over that single reduced row. See gpu_physical_result_collector.cpp
+    // history / MEMORY for the bug analysis.
+    auto& agg            = plan.children[0]->Cast<GPUPhysicalUngroupedAggregate>();
+    const auto& agg_types = plan.children[0]->types;
+
+    // (1) per-GPU raw aggregate partials, re-materialised host-side.
+    auto raw_partials = CollectUngroupedRawPartials(agg, agg_types, gpuBufferManager);
+
+    if (raw_partials->write_idx > 1) {
+      // (2) cross-GPU reduce of the RAW partials (sum/min/max/avg/count).
+      auto reduced =
+        ReduceUngroupedAcrossGpus(*raw_partials, agg, agg_types, gpuBufferManager);
+
+      // (3) apply the projection on the host over the single reduced row,
+      // producing the final 1-row chunk in the collector's projected `types`.
+      // `reduced->data_chunks[0]` is already a valid 1-row DataChunk in
+      // `agg_types`; feed it straight to the host ExpressionExecutor.
+      ExpressionExecutor executor(*gstate.context, plan.Cast<GPUPhysicalProjection>().select_list);
+      DataChunk projected;
+      projected.Initialize(*gstate.context, types);
+      executor.Execute(reduced->data_chunks[0], projected);
+
+      auto final_coll = make_uniq<GPUResultCollection>();
+      final_coll->SetCapacity(1);
+      final_coll->AddChunk(projected);
+      combined = std::move(final_coll);
+    }
+    // If raw_partials->write_idx <= 1 (only one GPU actually produced a
+    // partial), the existing per-GPU projected row in `combined` is already
+    // correct -- leave it untouched.
   }
 
   auto result = make_uniq<GPUQueryResult>(
