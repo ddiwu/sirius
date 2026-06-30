@@ -116,7 +116,10 @@ std::size_t distributed_hash_join_run_per_gpu(
     JoinResultRow*                              out_buf,        // device, wrapper-allocated (pool)
     unsigned int*                               out_count_buf,  // device, wrapper-allocated
     std::uint64_t                               out_cap,        // capacity of out_buf (rows)
-    std::vector<JoinResultRow>&                 my_slice);
+    std::vector<JoinResultRow>&                 my_slice,
+    // device_emit=true: skip the host-slice D2H/transpose and leave the matched
+    // rows in `out_buf` for the caller to columnize on-device (EmitKeyColumnDevice).
+    bool                                        device_emit = false);
 
 }  // namespace magi_generic
 }  // namespace duckdb

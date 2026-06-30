@@ -12,6 +12,8 @@
 #include <vector>
 
 #include <cuda_runtime.h>
+#include <thrust/scan.h>
+#include <thrust/execution_policy.h>
 
 #include "legacy/operator/magi_join.hpp"
 #include "legacy/operator/magi_distributed_join.hpp"
@@ -123,6 +125,153 @@ BuildJoinInputs(const std::vector<shared_ptr<GPUColumn>>& keys,
           ? reinterpret_cast<const uint32_t*>(keys[0]->data_wrapper.validity_mask)
           : nullptr;
   return in;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Device-side AoS→SoA emit: build the output GPUColumns directly from the device
+// JoinResultRow buffer (out_buf), with NO host round-trip. Replaces the
+// D2H(slice) + CPU transpose + H2D path for join outputs (which is O(rows) on the
+// host and dominates join→agg latency). Each kernel is a trivial data-parallel
+// pass over the matched rows; VARCHAR needs a length pass + prefix sum + chars.
+// ════════════════════════════════════════════════════════════════════════════
+namespace {
+__device__ __forceinline__ double jrr_slot(const magi_generic::JoinResultRow& r,
+                                            int dst, bool from_build) {
+  return from_build ? r.build_values[dst] : r.probe_values[dst];
+}
+__global__ void k_emit_key_i32(const magi_generic::JoinResultRow* in, size_t N,
+                               int shift, int32_t* out) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < N) out[i] = (int32_t)((in[i].key_packed >> shift) & 0xFFFFFFFFull);
+}
+__global__ void k_emit_key_i64(const magi_generic::JoinResultRow* in, size_t N,
+                               int shift, int64_t* out) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < N) out[i] = (int64_t)(in[i].key_packed >> shift);
+}
+__global__ void k_emit_f64(const magi_generic::JoinResultRow* in, size_t N,
+                           int dst, bool fb, double* out) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < N) out[i] = jrr_slot(in[i], dst, fb);
+}
+__global__ void k_emit_i32(const magi_generic::JoinResultRow* in, size_t N,
+                           int dst, bool fb, int32_t* out) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < N) { double dv = jrr_slot(in[i], dst, fb); int64_t x;
+               __builtin_memcpy(&x, &dv, 8); out[i] = (int32_t)x; }
+}
+__global__ void k_emit_i64(const magi_generic::JoinResultRow* in, size_t N,
+                           int dst, bool fb, int64_t* out) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < N) { double dv = jrr_slot(in[i], dst, fb); int64_t x;
+               __builtin_memcpy(&x, &dv, 8); out[i] = x; }
+}
+__global__ void k_emit_vc_len(const magi_generic::JoinResultRow* in, size_t N,
+                              int dst, bool fb, uint64_t* len) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < N) {
+    double dv = jrr_slot(in[i], dst, fb);
+    unsigned char b8[8]; __builtin_memcpy(b8, &dv, 8);
+    unsigned l = b8[0];
+    if (l > magi_generic::VARCHAR_PAYLOAD_MAXLEN) l = magi_generic::VARCHAR_PAYLOAD_MAXLEN;
+    len[i] = l;
+  }
+}
+__global__ void k_emit_vc_chars(const magi_generic::JoinResultRow* in, size_t N,
+                                int dst, bool fb, const uint64_t* offsets, uint8_t* chars) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < N) {
+    unsigned char buf[magi_generic::VARCHAR_PAYLOAD_SLOTS * 8];
+    for (int s = 0; s < magi_generic::VARCHAR_PAYLOAD_SLOTS; ++s) {
+      double dv = jrr_slot(in[i], dst + s, fb);
+      __builtin_memcpy(buf + s * 8, &dv, 8);
+    }
+    unsigned l = buf[0];
+    if (l > magi_generic::VARCHAR_PAYLOAD_MAXLEN) l = magi_generic::VARCHAR_PAYLOAD_MAXLEN;
+    uint64_t o = offsets[i];
+    for (unsigned b = 0; b < l; ++b) chars[o + b] = buf[1 + b];
+  }
+}
+inline void emit_cfg(size_t N, int& tpb, unsigned& grid) {
+  tpb = 256; grid = (unsigned)((N + tpb - 1) / tpb); if (grid == 0) grid = 1;
+}
+}  // namespace
+
+shared_ptr<GPUColumn> EmitKeyColumnDevice(int gpu_id, const KeyFieldEntry& f,
+                                          const magi_generic::JoinResultRow* d_in, size_t N,
+                                          GPUBufferManager* gbm) {
+  const int shift = f.byte_offset * 8;
+  int tpb; unsigned grid; emit_cfg(N, tpb, grid);
+  if (f.kind == KeyFieldKind::INT32) {
+    if (N == 0)
+      return make_shared_ptr<GPUColumn>(0, GPUColumnType(GPUColumnTypeId::INT32), nullptr, nullptr);
+    auto* d = gbm->customCudaMalloc<int32_t>(N, gpu_id, false);
+    k_emit_key_i32<<<grid, tpb>>>(d_in, N, shift, d);
+    auto c = make_shared_ptr<GPUColumn>(N, GPUColumnType(GPUColumnTypeId::INT32),
+                                        reinterpret_cast<uint8_t*>(d), createNullMask(N));
+    c->row_id_count = 0;
+    return c;
+  }
+  if (N == 0)
+    return make_shared_ptr<GPUColumn>(0, GPUColumnType(GPUColumnTypeId::INT64), nullptr, nullptr);
+  auto* d = gbm->customCudaMalloc<int64_t>(N, gpu_id, false);
+  k_emit_key_i64<<<grid, tpb>>>(d_in, N, shift, d);
+  auto c = make_shared_ptr<GPUColumn>(N, GPUColumnType(GPUColumnTypeId::INT64),
+                                      reinterpret_cast<uint8_t*>(d), createNullMask(N));
+  c->row_id_count = 0;
+  return c;
+}
+
+shared_ptr<GPUColumn> EmitPayloadColumnDevice(int gpu_id, const shared_ptr<GPUColumn>& proto,
+                                              const JoinPayloadEntry& e,
+                                              const magi_generic::JoinResultRow* d_in, size_t N,
+                                              bool from_build, GPUBufferManager* gbm) {
+  int tpb; unsigned grid; emit_cfg(N, tpb, grid);
+  if (e.src_kind == JoinPayloadEntry::Src::VARCHAR) {
+    if (N == 0)
+      return make_shared_ptr<GPUColumn>(0, GPUColumnType(GPUColumnTypeId::VARCHAR),
+                                        nullptr, nullptr, 0, true, nullptr);
+    auto* d_len = gbm->customCudaMalloc<uint64_t>(N, gpu_id, false);
+    k_emit_vc_len<<<grid, tpb>>>(d_in, N, e.dst_idx, from_build, d_len);
+    auto* d_offsets = gbm->customCudaMalloc<uint64_t>(N + 1, gpu_id, false);
+    cudaMemset(d_offsets, 0, sizeof(uint64_t));
+    thrust::inclusive_scan(thrust::device, d_len, d_len + N, d_offsets + 1);
+    uint64_t total = 0;
+    cudaMemcpy(&total, d_offsets + N, sizeof(uint64_t), cudaMemcpyDeviceToHost);
+    auto* d_chars = gbm->customCudaMalloc<uint8_t>(total == 0 ? 1 : total, gpu_id, false);
+    k_emit_vc_chars<<<grid, tpb>>>(d_in, N, e.dst_idx, from_build, d_offsets, d_chars);
+    auto c = make_shared_ptr<GPUColumn>(N, GPUColumnType(GPUColumnTypeId::VARCHAR),
+                                        d_chars, d_offsets, total, /*is_string_data=*/true,
+                                        createNullMask(N));
+    c->row_id_count = 0;
+    return c;
+  }
+  if (e.src_kind == JoinPayloadEntry::Src::DOUBLE) {
+    if (N == 0) return make_shared_ptr<GPUColumn>(0, proto->data_wrapper.type, nullptr, nullptr);
+    auto* d = gbm->customCudaMalloc<double>(N, gpu_id, false);
+    k_emit_f64<<<grid, tpb>>>(d_in, N, e.dst_idx, from_build, d);
+    auto c = make_shared_ptr<GPUColumn>(N, proto->data_wrapper.type,
+                                        reinterpret_cast<uint8_t*>(d), createNullMask(N));
+    c->row_id_count = 0;
+    return c;
+  }
+  if (e.src_kind == JoinPayloadEntry::Src::INT32) {
+    if (N == 0) return make_shared_ptr<GPUColumn>(0, proto->data_wrapper.type, nullptr, nullptr);
+    auto* d = gbm->customCudaMalloc<int32_t>(N, gpu_id, false);
+    k_emit_i32<<<grid, tpb>>>(d_in, N, e.dst_idx, from_build, d);
+    auto c = make_shared_ptr<GPUColumn>(N, proto->data_wrapper.type,
+                                        reinterpret_cast<uint8_t*>(d), createNullMask(N));
+    c->row_id_count = 0;
+    return c;
+  }
+  // INT64 / DECIMAL — recover the int64 bit-pattern from the double slot.
+  if (N == 0) return make_shared_ptr<GPUColumn>(0, proto->data_wrapper.type, nullptr, nullptr);
+  auto* d = gbm->customCudaMalloc<int64_t>(N, gpu_id, false);
+  k_emit_i64<<<grid, tpb>>>(d_in, N, e.dst_idx, from_build, d);
+  auto c = make_shared_ptr<GPUColumn>(N, proto->data_wrapper.type,
+                                      reinterpret_cast<uint8_t*>(d), createNullMask(N));
+  c->row_id_count = 0;
+  return c;
 }
 
 // ── Emit one key column from the result slice (inverse of pack_key_from_fields) ──
@@ -319,23 +468,29 @@ void Run(int                                       gpu_id,
   static const bool DBG = std::getenv("MAGI_JOIN_DEBUG") != nullptr;
   const auto t0 = std::chrono::high_resolution_clock::now();
 
-  std::vector<magi_generic::JoinResultRow> slice;
-  magi_generic::distributed_hash_join_run_per_gpu(
+  std::vector<magi_generic::JoinResultRow> slice;  // unused under device_emit (API-required ref)
+  const std::size_t emitted = magi_generic::distributed_hash_join_run_per_gpu(
       gpu_id, build_in, probe_in, key_fields,
-      build_pl_tbl, probe_pl_tbl, key_kind, ts, out_buf, out_count_buf, out_cap, slice);
+      build_pl_tbl, probe_pl_tbl, key_kind, ts, out_buf, out_count_buf, out_cap, slice,
+      /*device_emit=*/true);
   const auto t1 = std::chrono::high_resolution_clock::now();
 
-  // Emit key + payload output columns from the matched rows.
+  // Emit key + payload output columns ON-DEVICE, directly from the matched rows
+  // still resident in `out_buf` (no D2H slice + host transpose round-trip).
   out_key.clear();
-  for (auto& f : key_fields) out_key.push_back(EmitKeyColumn(gpu_id, f, slice, gbm));
+  for (auto& f : key_fields)
+    out_key.push_back(EmitKeyColumnDevice(gpu_id, f, out_buf, emitted, gbm));
   out_payload.clear();
   for (int p = 0; p < static_cast<int>(probe_payload.size()); ++p)
-    out_payload.push_back(
-        EmitPayloadColumn(gpu_id, probe_payload[p], probe_pl_tbl[p], slice, /*from_build=*/false, gbm));
+    out_payload.push_back(EmitPayloadColumnDevice(
+        gpu_id, probe_payload[p], probe_pl_tbl[p], out_buf, emitted, /*from_build=*/false, gbm));
   out_build_payload.clear();
   for (int p = 0; p < static_cast<int>(build_payload.size()); ++p)
-    out_build_payload.push_back(
-        EmitPayloadColumn(gpu_id, build_payload[p], build_pl_tbl[p], slice, /*from_build=*/true, gbm));
+    out_build_payload.push_back(EmitPayloadColumnDevice(
+        gpu_id, build_payload[p], build_pl_tbl[p], out_buf, emitted, /*from_build=*/true, gbm));
+  // The emit kernels + their thrust scans run on the default stream; make their
+  // results visible before the columns are consumed downstream.
+  cudaDeviceSynchronize();
   const auto t2 = std::chrono::high_resolution_clock::now();
 
   if (DBG) {
@@ -343,8 +498,8 @@ void Run(int                                       gpu_id,
       return std::chrono::duration<double, std::milli>(b - a).count();
     };
     std::fprintf(stderr,
-                 "[magi-join g%d] JOIN(build+probe+D2H)=%.1fms  HOST-EMIT(cols)=%.1fms  slice=%zu\n",
-                 gpu_id, ms(t0, t1), ms(t1, t2), slice.size());
+                 "[magi-join g%d] JOIN(build+probe)=%.1fms  DEVICE-EMIT(cols)=%.1fms  rows=%zu\n",
+                 gpu_id, ms(t0, t1), ms(t1, t2), emitted);
   }
 }
 

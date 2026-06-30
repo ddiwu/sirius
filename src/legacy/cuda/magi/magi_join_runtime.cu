@@ -163,7 +163,8 @@ static JoinExchange& jexchange() { static JoinExchange e; return e; }
 
 // ── Per-GPU run (templated on KeyT and tier) ────────────────────────────────
 template <typename KeyT, int N_SLOTS>
-static std::size_t join_run_typed_tier(int gpu_id, std::vector<JoinResultRow>& my_slice)
+static std::size_t join_run_typed_tier(int gpu_id, std::vector<JoinResultRow>& my_slice,
+                                       bool device_emit)
 {
   auto&             xc  = jexchange();
   const int         gpu = magi_runtime::magi_phys_gpu(gpu_id);
@@ -299,10 +300,15 @@ static std::size_t join_run_typed_tier(int gpu_id, std::vector<JoinResultRow>& m
   if (DBG) std::fprintf(stderr, "[magi-join g%d] emitted=%u (cap=%lu)\n",
                         gpu_id, emitted, (unsigned long)out_cap);
   if (emitted > out_cap) emitted = static_cast<unsigned int>(out_cap);
-  my_slice.resize(emitted);
-  if (emitted > 0)
-    cudaMemcpy(my_slice.data(), out, sizeof(JoinResultRow) * emitted,
-               cudaMemcpyDeviceToHost);
+  // device_emit: leave the matched rows in the device `out` buffer and let the
+  // caller build the output GPUColumns on-device (EmitKeyColumnDevice etc.),
+  // skipping the O(rows) D2H + host transpose that dominates join->agg latency.
+  if (!device_emit) {
+    my_slice.resize(emitted);
+    if (emitted > 0)
+      cudaMemcpy(my_slice.data(), out, sizeof(JoinResultRow) * emitted,
+                 cudaMemcpyDeviceToHost);
+  }
 
   unsigned int overflow_count = 0;
   cudaMemcpy(&overflow_count, g_joverflow_dev[gpu_id], sizeof(unsigned int),
@@ -320,27 +326,27 @@ static std::size_t join_run_typed_tier(int gpu_id, std::vector<JoinResultRow>& m
         std::to_string(overflow_count) + " on GPU " + std::to_string(gpu_id) +
         "); falling back to DuckDB.");
   }
-  return my_slice.size();
+  return emitted;
 }
 
 // ── Dispatch over (KeyKind, TableSize) — v1: int32/uint64 × S/M/L ──────────
 static std::size_t join_dispatch(int gpu_id, KeyKind kk, TableSize ts,
-                                 std::vector<JoinResultRow>& my_slice)
+                                 std::vector<JoinResultRow>& my_slice, bool device_emit)
 {
   switch (kk) {
     case KeyKind::INT32:
       switch (ts) {
-        case TableSize::SMALL:  return join_run_typed_tier<std::int32_t, N_SLOTS_SMALL >(gpu_id, my_slice);
-        case TableSize::MEDIUM: return join_run_typed_tier<std::int32_t, N_SLOTS_MEDIUM>(gpu_id, my_slice);
-        case TableSize::LARGE:  return join_run_typed_tier<std::int32_t, N_SLOTS_LARGE >(gpu_id, my_slice);
-        default:                return join_run_typed_tier<std::int32_t, N_SLOTS_XLARGE>(gpu_id, my_slice);
+        case TableSize::SMALL:  return join_run_typed_tier<std::int32_t, N_SLOTS_SMALL >(gpu_id, my_slice, device_emit);
+        case TableSize::MEDIUM: return join_run_typed_tier<std::int32_t, N_SLOTS_MEDIUM>(gpu_id, my_slice, device_emit);
+        case TableSize::LARGE:  return join_run_typed_tier<std::int32_t, N_SLOTS_LARGE >(gpu_id, my_slice, device_emit);
+        default:                return join_run_typed_tier<std::int32_t, N_SLOTS_XLARGE>(gpu_id, my_slice, device_emit);
       }
     case KeyKind::UINT64:
       switch (ts) {
-        case TableSize::SMALL:  return join_run_typed_tier<std::uint64_t, N_SLOTS_SMALL >(gpu_id, my_slice);
-        case TableSize::MEDIUM: return join_run_typed_tier<std::uint64_t, N_SLOTS_MEDIUM>(gpu_id, my_slice);
-        case TableSize::LARGE:  return join_run_typed_tier<std::uint64_t, N_SLOTS_LARGE >(gpu_id, my_slice);
-        default:                return join_run_typed_tier<std::uint64_t, N_SLOTS_XLARGE>(gpu_id, my_slice);
+        case TableSize::SMALL:  return join_run_typed_tier<std::uint64_t, N_SLOTS_SMALL >(gpu_id, my_slice, device_emit);
+        case TableSize::MEDIUM: return join_run_typed_tier<std::uint64_t, N_SLOTS_MEDIUM>(gpu_id, my_slice, device_emit);
+        case TableSize::LARGE:  return join_run_typed_tier<std::uint64_t, N_SLOTS_LARGE >(gpu_id, my_slice, device_emit);
+        default:                return join_run_typed_tier<std::uint64_t, N_SLOTS_XLARGE>(gpu_id, my_slice, device_emit);
       }
     default:
       throw std::runtime_error("magi_join: unsupported key kind for v1 (int32/uint64 only)");
@@ -360,7 +366,8 @@ std::size_t distributed_hash_join_run_per_gpu(
     JoinResultRow*                              out_buf,
     unsigned int*                               out_count_buf,
     std::uint64_t                               out_cap,
-    std::vector<JoinResultRow>&                 my_slice)
+    std::vector<JoinResultRow>&                 my_slice,
+    bool                                        device_emit)
 {
   if (gpu_id < 0 || gpu_id >= NUM_GPUS) {
     std::fprintf(stderr, "[magi-join] bad gpu_id=%d (NUM_GPUS=%d)\n", gpu_id, NUM_GPUS);
@@ -392,7 +399,7 @@ std::size_t distributed_hash_join_run_per_gpu(
   xc.begin.arrive_and_wait();
   // After `begin`, every GPU's probe_in is stashed and visible — each GPU
   // computes the same output cap (Σ probe n_rows) itself, no extra barrier.
-  return join_dispatch(gpu_id, xc.key_kind, xc.table_size, my_slice);
+  return join_dispatch(gpu_id, xc.key_kind, xc.table_size, my_slice, device_emit);
 }
 
 }  // namespace magi_generic
