@@ -109,7 +109,11 @@ std::size_t distributed_hash_groupby_run_per_gpu(
     const std::vector<magi_ops::AggOpEntry>&         ops,
     KeyKind                                          key_kind,
     TableSize                                        table_size,
-    std::vector<AggResultRow>&                       my_slice);
+    std::vector<AggResultRow>&                       my_slice,
+    // device_emit=true: skip the host slice build and instead return (via
+    // d_rows_out) a device AggResultRow buffer for on-device column emit.
+    bool                                             device_emit = false,
+    AggResultRow**                                   d_rows_out  = nullptr);
 
 // Number of GPUs the runtime expects, mirrored from
 // `magi_runtime::NUM_GPUS` (= `kSiriusLegacyNumGpus`). Exposed so sirius

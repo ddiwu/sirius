@@ -23,6 +23,8 @@
 #include <vector>
 
 #include <cuda_runtime.h>
+#include <thrust/scan.h>
+#include <thrust/execution_policy.h>
 
 #include "gpu_buffer_manager.hpp"
 #include "operator/magi_distributed_groupby.hpp"
@@ -531,6 +533,174 @@ void EmitAvgCol(int                                              gpu_id,
   out_col->row_id_count = 0;
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// Device-side emit: build output GPUColumns directly from a device AggResultRow
+// buffer (produced by the runtime's aggslot_to_resultrow), with NO D2H of the
+// slots + host slice construction + per-column host transpose. Mirrors the host
+// Emit* helpers above. Wins on high-cardinality GROUP BY (host emit is O(groups)).
+// ════════════════════════════════════════════════════════════════════════════
+__global__ void k_gb_key_i32(const magi_generic::AggResultRow* in, size_t N, int shift, int32_t* out) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < N) out[i] = (int32_t)((in[i].key_packed >> shift) & 0xFFFFFFFFull);
+}
+__global__ void k_gb_key_i64(const magi_generic::AggResultRow* in, size_t N, int shift, int64_t* out) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < N) out[i] = (int64_t)(in[i].key_packed >> shift);
+}
+__global__ void k_gb_double(const magi_generic::AggResultRow* in, size_t N, int slot, double* out) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < N) out[i] = in[i].values[slot];
+}
+__global__ void k_gb_int64(const magi_generic::AggResultRow* in, size_t N, int slot, uint64_t* out) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < N) { uint64_t x; __builtin_memcpy(&x, &in[i].values[slot], 8); out[i] = x; }
+}
+__global__ void k_gb_avg(const magi_generic::AggResultRow* in, size_t N, int sum_slot, int count_slot,
+                         bool sum_is_int64, double scale_div, double* out) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= N) return;
+  uint64_t cnt; __builtin_memcpy(&cnt, &in[i].values[count_slot], 8);
+  double sum;
+  if (sum_is_int64) { int64_t raw; __builtin_memcpy(&raw, &in[i].values[sum_slot], 8); sum = (double)raw / scale_div; }
+  else sum = in[i].values[sum_slot];
+  out[i] = cnt ? (sum / (double)cnt) : 0.0;
+}
+__global__ void k_gb_vc_len(const magi_generic::AggResultRow* in, size_t N, int off, int len_max, uint64_t* len) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= N) return;
+  uint64_t k = (uint64_t)in[i].key_packed;
+  int l = 0;
+  for (int b = 0; b < len_max; ++b) { uint8_t c = (uint8_t)((k >> ((off + b) * 8)) & 0xff); if (c == 0) break; ++l; }
+  len[i] = (uint64_t)l;
+}
+__global__ void k_gb_vc_chars(const magi_generic::AggResultRow* in, size_t N, int off, int len_max,
+                              const uint64_t* offsets, uint8_t* chars) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= N) return;
+  uint64_t k = (uint64_t)in[i].key_packed;
+  uint64_t o = offsets[i];
+  for (int b = 0; b < len_max; ++b) { uint8_t c = (uint8_t)((k >> ((off + b) * 8)) & 0xff); if (c == 0) break; chars[o++] = c; }
+}
+static inline void gb_cfg(size_t N, int& tpb, unsigned& grid) {
+  tpb = 256; grid = (unsigned)((N + tpb - 1) / tpb); if (grid == 0) grid = 1;
+}
+
+void EmitVarcharKeyDevice(int gpu_id, size_t N, const magi_generic::AggResultRow* d_in,
+                          shared_ptr<GPUColumn>& out_col, int key_byte_offset, int key_byte_len,
+                          GPUBufferManager* gbm) {
+  if (N == 0) { out_col = make_shared_ptr<GPUColumn>(0, GPUColumnType(GPUColumnTypeId::VARCHAR), nullptr, nullptr, 0, true, nullptr); out_col->row_id_count = 0; return; }
+  int tpb; unsigned grid; gb_cfg(N, tpb, grid);
+  auto* d_len = gbm->customCudaMalloc<uint64_t>(N, gpu_id, false);
+  k_gb_vc_len<<<grid, tpb>>>(d_in, N, key_byte_offset, key_byte_len, d_len);
+  auto* d_off = gbm->customCudaMalloc<uint64_t>(N + 1, gpu_id, false);
+  cudaMemset(d_off, 0, sizeof(uint64_t));
+  thrust::inclusive_scan(thrust::device, d_len, d_len + N, d_off + 1);
+  uint64_t total = 0; cudaMemcpy(&total, d_off + N, sizeof(uint64_t), cudaMemcpyDeviceToHost);
+  auto* d_chars = gbm->customCudaMalloc<uint8_t>(total == 0 ? 1 : total, gpu_id, false);
+  k_gb_vc_chars<<<grid, tpb>>>(d_in, N, key_byte_offset, key_byte_len, d_off, d_chars);
+  out_col = make_shared_ptr<GPUColumn>(N, GPUColumnType(GPUColumnTypeId::VARCHAR), d_chars, d_off, total, true, createNullMask(N));
+  out_col->row_id_count = 0;
+}
+void EmitDoubleAggColDevice(int gpu_id, size_t N, const magi_generic::AggResultRow* d_in, int slot, shared_ptr<GPUColumn>& out_col, GPUBufferManager* gbm) {
+  if (N == 0) { out_col = make_shared_ptr<GPUColumn>(0, GPUColumnType(GPUColumnTypeId::FLOAT64), nullptr, nullptr); out_col->row_id_count = 0; return; }
+  int tpb; unsigned grid; gb_cfg(N, tpb, grid);
+  auto* d = gbm->customCudaMalloc<double>(N, gpu_id, false);
+  k_gb_double<<<grid, tpb>>>(d_in, N, slot, d);
+  out_col = make_shared_ptr<GPUColumn>(N, GPUColumnType(GPUColumnTypeId::FLOAT64), reinterpret_cast<uint8_t*>(d), createNullMask(N));
+  out_col->row_id_count = 0;
+}
+void EmitInt64AggColDevice(int gpu_id, size_t N, const magi_generic::AggResultRow* d_in, int slot, shared_ptr<GPUColumn>& out_col, GPUBufferManager* gbm) {
+  if (N == 0) { out_col = make_shared_ptr<GPUColumn>(0, GPUColumnType(GPUColumnTypeId::INT64), nullptr, nullptr); out_col->row_id_count = 0; return; }
+  int tpb; unsigned grid; gb_cfg(N, tpb, grid);
+  auto* d = gbm->customCudaMalloc<uint64_t>(N, gpu_id, false);
+  k_gb_int64<<<grid, tpb>>>(d_in, N, slot, d);
+  out_col = make_shared_ptr<GPUColumn>(N, GPUColumnType(GPUColumnTypeId::INT64), reinterpret_cast<uint8_t*>(d), createNullMask(N));
+  out_col->row_id_count = 0;
+}
+void EmitAvgColDevice(int gpu_id, size_t N, const magi_generic::AggResultRow* d_in, int sum_slot, int count_slot,
+                      bool sum_is_int64, int decimal_scale, shared_ptr<GPUColumn>& out_col, GPUBufferManager* gbm) {
+  if (N == 0) { out_col = make_shared_ptr<GPUColumn>(0, GPUColumnType(GPUColumnTypeId::FLOAT64), nullptr, nullptr); out_col->row_id_count = 0; return; }
+  int tpb; unsigned grid; gb_cfg(N, tpb, grid);
+  const double scale_div = decimal_scale > 0 ? std::pow(10.0, decimal_scale) : 1.0;
+  auto* d = gbm->customCudaMalloc<double>(N, gpu_id, false);
+  k_gb_avg<<<grid, tpb>>>(d_in, N, sum_slot, count_slot, sum_is_int64, scale_div, d);
+  out_col = make_shared_ptr<GPUColumn>(N, GPUColumnType(GPUColumnTypeId::FLOAT64), reinterpret_cast<uint8_t*>(d), createNullMask(N));
+  out_col->row_id_count = 0;
+}
+
+// Device analog of WriteGenericSliceToColumns: identical orchestration, reads the
+// device AggResultRow buffer `d_in` (N rows) via the Emit*Device helpers.
+void WriteGenericSliceToColumnsDevice(int gpu_id, const magi_generic::AggResultRow* d_in, size_t N,
+                                      vector<shared_ptr<GPUColumn>>& keys, vector<shared_ptr<GPUColumn>>& aggs,
+                                      int num_group_keys, int num_aggregates, sirius::AggregationType* agg_mode,
+                                      const std::vector<magi_ops::KeyFieldEntry>& key_fields, int avg_count_slot,
+                                      GPUBufferManager* gbm) {
+  if ((int)key_fields.size() != num_group_keys)
+    throw NotImplementedException("magi_groupby (generic device): key_fields/num_group_keys mismatch (%zu vs %d)", key_fields.size(), num_group_keys);
+  int tpb; unsigned grid; gb_cfg(N, tpb, grid);
+  for (int ki = 0; ki < num_group_keys; ++ki) {
+    const magi_ops::KeyFieldEntry& f = key_fields[ki];
+    const int shift = f.byte_offset * 8;
+    switch (f.kind) {
+      case magi_ops::KeyFieldKind::VARCHAR_PREFIX:
+        EmitVarcharKeyDevice(gpu_id, N, d_in, keys[ki], f.byte_offset, f.byte_len, gbm);
+        break;
+      case magi_ops::KeyFieldKind::INT32: {
+        if (N == 0) { keys[ki] = make_shared_ptr<GPUColumn>(0, GPUColumnType(GPUColumnTypeId::INT32), nullptr, nullptr); keys[ki]->row_id_count = 0; break; }
+        auto* d = gbm->customCudaMalloc<int32_t>(N, gpu_id, false);
+        k_gb_key_i32<<<grid, tpb>>>(d_in, N, shift, d);
+        keys[ki] = make_shared_ptr<GPUColumn>(N, GPUColumnType(GPUColumnTypeId::INT32), reinterpret_cast<uint8_t*>(d), createNullMask(N));
+        keys[ki]->row_id_count = 0;
+      } break;
+      case magi_ops::KeyFieldKind::INT64: {
+        if (N == 0) { keys[ki] = make_shared_ptr<GPUColumn>(0, GPUColumnType(GPUColumnTypeId::INT64), nullptr, nullptr); keys[ki]->row_id_count = 0; break; }
+        auto* d = gbm->customCudaMalloc<int64_t>(N, gpu_id, false);
+        k_gb_key_i64<<<grid, tpb>>>(d_in, N, shift, d);
+        keys[ki] = make_shared_ptr<GPUColumn>(N, GPUColumnType(GPUColumnTypeId::INT64), reinterpret_cast<uint8_t*>(d), createNullMask(N));
+        keys[ki]->row_id_count = 0;
+      } break;
+    }
+  }
+  int dst_idx = 0;
+  for (int a = 0; a < num_aggregates; ++a) {
+    switch (agg_mode[a]) {
+      case sirius::AggregationType::SUM:
+      case sirius::AggregationType::MIN:
+      case sirius::AggregationType::MAX: {
+        const auto in_id = aggs[a] ? aggs[a]->data_wrapper.type.id() : GPUColumnTypeId::FLOAT64;
+        const auto* in_dti = (in_id == GPUColumnTypeId::DECIMAL && aggs[a]) ? aggs[a]->data_wrapper.type.GetDecimalTypeInfo() : nullptr;
+        const int dti_w = in_dti ? in_dti->width_ : 0;
+        const int dti_s = in_dti ? in_dti->scale_ : 0;
+        if (in_id == GPUColumnTypeId::INT64 || in_id == GPUColumnTypeId::DECIMAL) {
+          EmitInt64AggColDevice(gpu_id, N, d_in, dst_idx++, aggs[a], gbm);
+          if (in_id == GPUColumnTypeId::DECIMAL && in_dti && aggs[a]) {
+            aggs[a]->data_wrapper.type = GPUColumnType(GPUColumnTypeId::DECIMAL);
+            aggs[a]->data_wrapper.type.SetDecimalTypeInfo(dti_w, dti_s);
+          }
+        } else {
+          EmitDoubleAggColDevice(gpu_id, N, d_in, dst_idx++, aggs[a], gbm);
+        }
+        break;
+      }
+      case sirius::AggregationType::AVERAGE: {
+        const auto in_id = aggs[a] ? aggs[a]->data_wrapper.type.id() : GPUColumnTypeId::FLOAT64;
+        const bool sum_is_int64 = (in_id == GPUColumnTypeId::INT64 || in_id == GPUColumnTypeId::DECIMAL);
+        int scale = 0;
+        if (in_id == GPUColumnTypeId::DECIMAL && aggs[a]) { const auto* dti = aggs[a]->data_wrapper.type.GetDecimalTypeInfo(); if (dti) scale = dti->scale_; }
+        EmitAvgColDevice(gpu_id, N, d_in, /*sum_slot=*/dst_idx, /*count_slot=*/avg_count_slot, sum_is_int64, scale, aggs[a], gbm);
+        dst_idx++;
+        break;
+      }
+      case sirius::AggregationType::COUNT_STAR:
+      case sirius::AggregationType::COUNT:
+        EmitInt64AggColDevice(gpu_id, N, d_in, dst_idx++, aggs[a], gbm);
+        break;
+      default:
+        throw NotImplementedException("magi_groupby (generic device): unsupported AggregationType %d at idx %d during result emit", static_cast<int>(agg_mode[a]), a);
+    }
+  }
+}
+
 void WriteGenericSliceToColumns(int                                              gpu_id,
                                 const std::vector<magi_generic::AggResultRow>&   slice,
                                 vector<shared_ptr<GPUColumn>>&                   keys,
@@ -719,15 +889,23 @@ void Run(int                                gpu_id,
   int  avg_count_slot = -1;
   auto ops  = BuildAggOpsTable(aggregate_keys, num_aggregates, agg_mode,
                                avg_count_slot);
-  std::vector<magi_generic::AggResultRow> slice;
-  magi_generic::distributed_hash_groupby_run_per_gpu(
-      gpu_id, in, key_fields, ops, key_kind, table_size, slice);
+  std::vector<magi_generic::AggResultRow> slice;  // unused under device_emit (API ref)
+  magi_generic::AggResultRow* d_rows = nullptr;
+  const std::size_t n_rows = magi_generic::distributed_hash_groupby_run_per_gpu(
+      gpu_id, in, key_fields, ops, key_kind, table_size, slice,
+      /*device_emit=*/true, &d_rows);
 
-  WriteGenericSliceToColumns(gpu_id, slice,
-                             group_by_keys, aggregate_keys,
-                             num_group_keys, num_aggregates, agg_mode,
-                             key_fields, avg_count_slot,
-                             &GPUBufferManager::GetInstance());
+  // Build the output GPUColumns ON-DEVICE directly from the device AggResultRow
+  // buffer (no D2H of slots + host slice construction + per-column host transpose).
+  WriteGenericSliceToColumnsDevice(gpu_id, d_rows, n_rows,
+                                   group_by_keys, aggregate_keys,
+                                   num_group_keys, num_aggregates, agg_mode,
+                                   key_fields, avg_count_slot,
+                                   &GPUBufferManager::GetInstance());
+  // The emit kernels + thrust scans run on the default stream; flush before the
+  // columns are consumed downstream and before the device buffer is freed.
+  cudaDeviceSynchronize();
+  if (d_rows) cudaFree(d_rows);
 }
 
 }  // namespace magi_groupby

@@ -259,13 +259,37 @@ struct GenericExchange {
 };
 static GenericExchange& exchange() { static GenericExchange e; return e; }
 
+// Device-side conversion of the compacted slot buffer (AggSlot64<KeyT,SB>) into a
+// flat, non-templated AggResultRow buffer — the on-device analog of the host loop
+// below. Lets the caller build output GPUColumns directly on-device (no D2H of the
+// slots + host AggResultRow construction), which dominates high-cardinality GROUP BY.
+template <typename KeyT, int SB>
+__global__ void aggslot_to_resultrow(const magi_ops::AggSlot64<KeyT, SB>* dense,
+                                     unsigned live, AggResultRow* out)
+{
+  unsigned j = blockIdx.x * blockDim.x + threadIdx.x;
+  if (j >= live) return;
+  if constexpr (sizeof(KeyT) > 8) {
+    out[j].key_packed = static_cast<unsigned __int128>(dense[j].key);
+  } else {
+    out[j].key_packed = static_cast<unsigned __int128>(
+        static_cast<typename std::make_unsigned<KeyT>::type>(dense[j].key));
+  }
+  constexpr int ND = magi_ops::AggSlot64<KeyT, SB>::N_DOUBLES;
+  for (int v = 0; v < ND; ++v) out[j].values[v] = dense[j].values[v];
+  for (int v = ND; v < AggResultRow::N_VALUES; ++v) out[j].values[v] = 0.0;
+  out[j].partial_count = dense[j].partial_count;
+}
+
 // ── Per-GPU launch (templated on KeyT and N_SLOTS tier) ───────────────────
 // Each per-GPU worker resets its agg slots, launches the generic
 // distributed_hash_groupby_kernel (selected by both KeyT and slot tier),
 // drains the magi session, and extracts its hash-partitioned slice.
 template <typename KeyT, int N_SLOTS, int SB>
 static std::size_t run_per_gpu_typed_tier(int                        gpu_id,
-                                           std::vector<AggResultRow>& my_slice)
+                                           std::vector<AggResultRow>& my_slice,
+                                           bool                       device_emit,
+                                           AggResultRow**             d_rows_out)
 {
   auto& xc = exchange();
   const int gpu = magi_runtime::magi_phys_gpu(gpu_id);
@@ -424,29 +448,47 @@ static std::size_t run_per_gpu_typed_tier(int                        gpu_id,
   cudaMemcpyAsync(&live, g_overflow_dev[gpu_id], sizeof(unsigned int),
                   cudaMemcpyDeviceToHost, st);
   cudaStreamSynchronize(st);
-  std::vector<magi_ops::AggSlot64<KeyT, SB>> host(live);
-  cudaMemcpy(host.data(), dense,
-             static_cast<size_t>(live) * sizeof(magi_ops::AggSlot64<KeyT, SB>),
-             cudaMemcpyDeviceToHost);
+  if (device_emit) {
+    // On-device: convert the compacted slots to a flat device AggResultRow buffer
+    // and hand it to the caller (no D2H of slots + host slice construction). Raw
+    // cudaMalloc — this .cu is deliberately free of the buffer-manager/duckdb
+    // headers; ~live*sizeof(AggResultRow) is well within the free headroom beyond
+    // the reserved caching/processing pools.
+    AggResultRow* d_rows = nullptr;
+    if (live > 0) {
+      cudaMalloc(reinterpret_cast<void**>(&d_rows),
+                 static_cast<size_t>(live) * sizeof(AggResultRow));
+      constexpr int RB = 256;
+      const unsigned rg = static_cast<unsigned>((live + RB - 1) / RB);
+      aggslot_to_resultrow<KeyT, SB><<<rg, RB, 0, st>>>(dense, live, d_rows);
+      cudaStreamSynchronize(st);
+    }
+    if (d_rows_out) *d_rows_out = d_rows;
+  } else {
+    std::vector<magi_ops::AggSlot64<KeyT, SB>> host(live);
+    cudaMemcpy(host.data(), dense,
+               static_cast<size_t>(live) * sizeof(magi_ops::AggSlot64<KeyT, SB>),
+               cudaMemcpyDeviceToHost);
 
-  my_slice.clear();
-  my_slice.reserve(live);
-  for (unsigned int j = 0; j < live; ++j) {
-    AggResultRow row{};
-    // Widen KeyT to the 128-bit result key. For int32/uint64 zero-extend via
-    // the unsigned cast (the caller re-narrows on emit; sign-extension would
-    // corrupt high bits for negative keys). 16-byte keys pass through as-is.
-    if constexpr (sizeof(KeyT) > 8) {
-      row.key_packed = static_cast<unsigned __int128>(host[j].key);
-    } else {
-      row.key_packed = static_cast<unsigned __int128>(
-          static_cast<std::make_unsigned_t<KeyT>>(host[j].key));
+    my_slice.clear();
+    my_slice.reserve(live);
+    for (unsigned int j = 0; j < live; ++j) {
+      AggResultRow row{};
+      // Widen KeyT to the 128-bit result key. For int32/uint64 zero-extend via
+      // the unsigned cast (the caller re-narrows on emit; sign-extension would
+      // corrupt high bits for negative keys). 16-byte keys pass through as-is.
+      if constexpr (sizeof(KeyT) > 8) {
+        row.key_packed = static_cast<unsigned __int128>(host[j].key);
+      } else {
+        row.key_packed = static_cast<unsigned __int128>(
+            static_cast<std::make_unsigned_t<KeyT>>(host[j].key));
+      }
+      for (int v = 0; v < magi_ops::AggSlot64<KeyT, SB>::N_DOUBLES; ++v) {
+        row.values[v] = host[j].values[v];
+      }
+      row.partial_count = host[j].partial_count;
+      my_slice.push_back(row);
     }
-    for (int v = 0; v < magi_ops::AggSlot64<KeyT, SB>::N_DOUBLES; ++v) {
-      row.values[v] = host[j].values[v];
-    }
-    row.partial_count = host[j].partial_count;
-    my_slice.push_back(row);
   }
 
   xc.end.arrive_and_wait();
@@ -467,7 +509,7 @@ static std::size_t run_per_gpu_typed_tier(int                        gpu_id,
         "); falling back to DuckDB. A high-cardinality (cuco-style) global "
         "hashagg is needed to run this on the GPU.");
   }
-  return my_slice.size();
+  return device_emit ? static_cast<std::size_t>(live) : my_slice.size();
 }
 
 // Pick the narrowest slot that fits the query's agg-slot count, then run.
@@ -480,15 +522,16 @@ static std::size_t run_per_gpu_typed_tier(int                        gpu_id,
 // identical per-query ops table.
 template <typename KeyT, int N_SLOTS>
 static std::size_t run_tier(int gpu_id, int n_slots,
-                            std::vector<AggResultRow>& my_slice)
+                            std::vector<AggResultRow>& my_slice,
+                            bool device_emit, AggResultRow** d_rows_out)
 {
   constexpr int N64 = magi_ops::AggSlot64<KeyT, 64>::N_DOUBLES;
   const int sb = (n_slots <= N64) ? 64 : 128;
   if (std::getenv("MAGI_SB_DEBUG"))
     std::fprintf(stderr, "[magi-sb] gpu=%d n_slots=%d N64=%d -> SB=%dB\n",
                  gpu_id, n_slots, N64, sb);
-  if (n_slots <= N64) return run_per_gpu_typed_tier<KeyT, N_SLOTS, 64 >(gpu_id, my_slice);
-  return              run_per_gpu_typed_tier<KeyT, N_SLOTS, 128>(gpu_id, my_slice);
+  if (n_slots <= N64) return run_per_gpu_typed_tier<KeyT, N_SLOTS, 64 >(gpu_id, my_slice, device_emit, d_rows_out);
+  return              run_per_gpu_typed_tier<KeyT, N_SLOTS, 128>(gpu_id, my_slice, device_emit, d_rows_out);
 }
 
 // ── dispatch over (KeyKind, TableSize) × runtime SlotSize ────────────────
@@ -496,31 +539,33 @@ static std::size_t dispatch_by_kind_and_tier(int                        gpu_id,
                                               KeyKind                    kk,
                                               TableSize                  ts,
                                               int                        n_slots,
-                                              std::vector<AggResultRow>& my_slice)
+                                              std::vector<AggResultRow>& my_slice,
+                                              bool                       device_emit,
+                                              AggResultRow**             d_rows_out)
 {
   switch (kk) {
     case KeyKind::INT32:
       switch (ts) {
-        case TableSize::SMALL:  return run_tier<std::int32_t, N_SLOTS_SMALL >(gpu_id, n_slots, my_slice);
-        case TableSize::MEDIUM: return run_tier<std::int32_t, N_SLOTS_MEDIUM>(gpu_id, n_slots, my_slice);
-        case TableSize::LARGE:  return run_tier<std::int32_t, N_SLOTS_LARGE >(gpu_id, n_slots, my_slice);
-        case TableSize::XLARGE: return run_tier<std::int32_t, N_SLOTS_XLARGE>(gpu_id, n_slots, my_slice);
+        case TableSize::SMALL:  return run_tier<std::int32_t, N_SLOTS_SMALL >(gpu_id, n_slots, my_slice, device_emit, d_rows_out);
+        case TableSize::MEDIUM: return run_tier<std::int32_t, N_SLOTS_MEDIUM>(gpu_id, n_slots, my_slice, device_emit, d_rows_out);
+        case TableSize::LARGE:  return run_tier<std::int32_t, N_SLOTS_LARGE >(gpu_id, n_slots, my_slice, device_emit, d_rows_out);
+        case TableSize::XLARGE: return run_tier<std::int32_t, N_SLOTS_XLARGE>(gpu_id, n_slots, my_slice, device_emit, d_rows_out);
       }
       break;
     case KeyKind::UINT64:
       switch (ts) {
-        case TableSize::SMALL:  return run_tier<std::uint64_t, N_SLOTS_SMALL >(gpu_id, n_slots, my_slice);
-        case TableSize::MEDIUM: return run_tier<std::uint64_t, N_SLOTS_MEDIUM>(gpu_id, n_slots, my_slice);
-        case TableSize::LARGE:  return run_tier<std::uint64_t, N_SLOTS_LARGE >(gpu_id, n_slots, my_slice);
-        case TableSize::XLARGE: return run_tier<std::uint64_t, N_SLOTS_XLARGE>(gpu_id, n_slots, my_slice);
+        case TableSize::SMALL:  return run_tier<std::uint64_t, N_SLOTS_SMALL >(gpu_id, n_slots, my_slice, device_emit, d_rows_out);
+        case TableSize::MEDIUM: return run_tier<std::uint64_t, N_SLOTS_MEDIUM>(gpu_id, n_slots, my_slice, device_emit, d_rows_out);
+        case TableSize::LARGE:  return run_tier<std::uint64_t, N_SLOTS_LARGE >(gpu_id, n_slots, my_slice, device_emit, d_rows_out);
+        case TableSize::XLARGE: return run_tier<std::uint64_t, N_SLOTS_XLARGE>(gpu_id, n_slots, my_slice, device_emit, d_rows_out);
       }
       break;
     case KeyKind::UINT128:
       switch (ts) {
-        case TableSize::SMALL:  return run_tier<unsigned __int128, N_SLOTS_SMALL >(gpu_id, n_slots, my_slice);
-        case TableSize::MEDIUM: return run_tier<unsigned __int128, N_SLOTS_MEDIUM>(gpu_id, n_slots, my_slice);
-        case TableSize::LARGE:  return run_tier<unsigned __int128, N_SLOTS_LARGE >(gpu_id, n_slots, my_slice);
-        case TableSize::XLARGE: return run_tier<unsigned __int128, N_SLOTS_XLARGE>(gpu_id, n_slots, my_slice);
+        case TableSize::SMALL:  return run_tier<unsigned __int128, N_SLOTS_SMALL >(gpu_id, n_slots, my_slice, device_emit, d_rows_out);
+        case TableSize::MEDIUM: return run_tier<unsigned __int128, N_SLOTS_MEDIUM>(gpu_id, n_slots, my_slice, device_emit, d_rows_out);
+        case TableSize::LARGE:  return run_tier<unsigned __int128, N_SLOTS_LARGE >(gpu_id, n_slots, my_slice, device_emit, d_rows_out);
+        case TableSize::XLARGE: return run_tier<unsigned __int128, N_SLOTS_XLARGE>(gpu_id, n_slots, my_slice, device_emit, d_rows_out);
       }
       break;
   }
@@ -535,7 +580,9 @@ std::size_t distributed_hash_groupby_run_per_gpu(
     const std::vector<magi_ops::AggOpEntry>&         ops,
     KeyKind                                          key_kind,
     TableSize                                        table_size,
-    std::vector<AggResultRow>&                       my_slice)
+    std::vector<AggResultRow>&                       my_slice,
+    bool                                             device_emit,
+    AggResultRow**                                   d_rows_out)
 {
   if (gpu_id < 0 || gpu_id >= NUM_GPUS) {
     std::fprintf(stderr,
@@ -587,7 +634,9 @@ std::size_t distributed_hash_groupby_run_per_gpu(
                                     xc.key_kind_for_this_query,
                                     xc.table_size_for_this_query,
                                     n_slots,
-                                    my_slice);
+                                    my_slice,
+                                    device_emit,
+                                    d_rows_out);
 }
 
 }}  // namespace duckdb::magi_generic
