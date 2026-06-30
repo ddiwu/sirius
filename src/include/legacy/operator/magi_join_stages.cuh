@@ -37,6 +37,7 @@
 #include "data_plane/ops/groupby_stages.cuh"  // global_find_or_insert
 
 #include "legacy/operator/magi_distributed_join.hpp"  // JoinResultRow
+#include "legacy/operator/magi_fused_agg.hpp"          // FusedAggProgram + device VM
 
 namespace duckdb {
 namespace magi_join {
@@ -140,12 +141,31 @@ struct ProbeEmit {
   int                                  n_build_pl;
   unsigned int*                        overflow;
   unsigned int*                        n_drained;   // debug: count every drained probe tuple
+  // Fused join->aggregate (Option 3): when agg_prog != nullptr, evaluate each
+  // aggregate-input expression on this match and accumulate directly into the
+  // per-GPU `agg_accum` — overlapping the agg with the shuffle, no out_buf needed.
+  double*                                       agg_accum;
+  const duckdb::magi_fused::FusedAggProgram*    agg_prog;
   __device__ __forceinline__ void operator()(JoinProbeWire& t) const {
     if (t.index == -1) return;
     if (n_drained) atomicAdd(n_drained, 1u);
     magi_ops::AggSlot64<KeyT>* slot =
         global_find<KeyT, N_SLOTS>(H_build, static_cast<KeyT>(t.key));
     if (slot == nullptr) return;                 // no match (INNER → drop)
+    if (agg_prog != nullptr) {
+      double probe_d[JOIN_MAX_PAYLOAD];
+#pragma unroll
+      for (int i = 0; i < JOIN_MAX_PAYLOAD; ++i)
+        __builtin_memcpy(&probe_d[i], &t.payload[i], sizeof(double));
+      for (int a = 0; a < agg_prog->n_aggs; ++a) {
+        double v = (agg_prog->kind[a] == duckdb::magi_fused::AGG_COUNT)
+                       ? 1.0
+                       : duckdb::magi_fused::magi_vm_eval(*agg_prog, a,
+                                                          slot->values, probe_d);
+        atomicAdd(&agg_accum[a], v);
+      }
+      return;  // fused: the match is consumed into agg_accum — skip out_buf entirely
+    }
     const unsigned pos = atomicAdd(out_count, 1u);
     if (pos >= out_cap) { if (overflow) atomicAdd(overflow, 1u); return; }
     duckdb::magi_generic::JoinResultRow& r = out[pos];
@@ -391,7 +411,9 @@ join_probe_kernel(const duckdb::magi_join::JoinProbeWire* __restrict__ tuples,
                   int                                      n_build_pl,
                   bool                                     just_load,
                   unsigned int* __restrict__               overflow,
-                  unsigned int* __restrict__               n_drained)
+                  unsigned int* __restrict__               n_drained,
+                  double* __restrict__                     agg_accum,
+                  const duckdb::magi_fused::FusedAggProgram* __restrict__ agg_prog)
 {
   if (just_load) return;
   using Wire = duckdb::magi_join::JoinProbeWire;
@@ -402,8 +424,9 @@ join_probe_kernel(const duckdb::magi_join::JoinProbeWire* __restrict__ tuples,
   const std::uint64_t rows           = (start_row >= n) ? 0 : (end_row - start_row);
 
   bool recv_eof = false;
-  duckdb::magi_join::ProbeEmit<KeyT, N_SLOTS> emit{H_build, out, out_count,
-                                                   out_cap, n_build_pl, overflow, n_drained};
+  duckdb::magi_join::ProbeEmit<KeyT, N_SLOTS> emit{H_build,  out,       out_count,
+                                                   out_cap,  n_build_pl, overflow,
+                                                   n_drained, agg_accum, agg_prog};
   duckdb::magi_join::JoinKeyPartition<Wire>   part;
 
   std::uint64_t offset = 0;

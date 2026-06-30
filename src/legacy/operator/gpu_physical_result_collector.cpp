@@ -30,6 +30,7 @@
 #include "log/logging.hpp"
 #include "operator/gpu_materialize.hpp"
 #include "operator/gpu_physical_projection.hpp"
+#include "legacy/operator/magi_fused_agg.hpp"   // Option 3 fused join->agg side channel
 #include "operator/gpu_physical_table_scan.hpp"
 #include "operator/gpu_physical_ungrouped_aggregate.hpp"
 #include "utils.hpp"
@@ -797,6 +798,39 @@ unique_ptr<QueryResult> GPUPhysicalMaterializedCollector::GetResult(GlobalSinkSt
     }
     // Release the per-GPU collection now that we've moved its content.
     rstate.result_collection.reset();
+  }
+
+  // Option 3 fused join->aggregate: the magi join evaluated the aggregate-input
+  // expression(s) per match and accumulated per-GPU partial sums into the side
+  // channel (no materialized join output, no separate projection/aggregate pass).
+  // Reduce those partials across GPUs and apply the query's top projection here,
+  // overriding the sentinel-row output the trivial downstream pipeline produced.
+  {
+    auto& ch = duckdb::magi_fused::fused_channel();
+    if (ch.active && plan.type == PhysicalOperatorType::PROJECTION && !plan.children.empty()) {
+      const auto& agg_types = plan.children[0]->types;
+      DataChunk agg_chunk;
+      agg_chunk.Initialize(*gstate.context, agg_types);
+      for (int a = 0; a < ch.n_aggs; ++a) {
+        double g = 0.0;
+        for (int gpu = 0; gpu < duckdb::magi_fused::FUSED_MAX_GPUS; ++gpu)
+          g += ch.partials[gpu][a];
+        agg_chunk.SetValue(a, 0, Value::DOUBLE(g));
+      }
+      agg_chunk.SetCardinality(1);
+      ExpressionExecutor executor(*gstate.context,
+                                  plan.Cast<GPUPhysicalProjection>().select_list);
+      DataChunk projected;
+      projected.Initialize(*gstate.context, types);
+      executor.Execute(agg_chunk, projected);
+      auto final_coll = make_uniq<GPUResultCollection>();
+      final_coll->SetCapacity(1);
+      final_coll->AddChunk(projected);
+      combined = std::move(final_coll);
+      for (int gpu = 0; gpu < duckdb::magi_fused::FUSED_MAX_GPUS; ++gpu)
+        for (int a = 0; a < duckdb::magi_fused::MAX_FUSED_AGGS; ++a) ch.partials[gpu][a] = 0.0;
+      ch.active = false;
+    }
   }
 
   // Cross-GPU final reduce: each per-GPU run of an UNGROUPED_AGGREGATE

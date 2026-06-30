@@ -64,7 +64,8 @@ namespace magi {
       const duckdb::magi_join::JoinProbeWire*, std::uint64_t,                   \
       magi_ops::AggSlot64<KEY_TYPE>*,                                           \
       duckdb::magi_generic::JoinResultRow*, unsigned int*, unsigned int, int,   \
-      bool, unsigned int*, unsigned int*)
+      bool, unsigned int*, unsigned int*,                                       \
+      double*, const duckdb::magi_fused::FusedAggProgram*)
 
 #define MAGI_JOIN_INST_ALL(KEY_TYPE)                                            \
   MAGI_JOIN_INST_PACK_BUILD(KEY_TYPE);                                          \
@@ -95,6 +96,13 @@ template __global__ void join_clear_hbuild<std::uint64_t>(magi_ops::AggSlot64<st
 }  // namespace magi
 
 namespace duckdb {
+
+namespace magi_fused {
+// Singleton side channel (Option 3): the fused join publishes per-GPU partial
+// sums here; the result collector reduces them + applies the top projection.
+FusedResultChannel& fused_channel() { static FusedResultChannel c{}; return c; }
+}  // namespace magi_fused
+
 namespace magi_generic {
 
 // ── Per-GPU persistent buffers ──────────────────────────────────────────────
@@ -164,7 +172,8 @@ static JoinExchange& jexchange() { static JoinExchange e; return e; }
 // ── Per-GPU run (templated on KeyT and tier) ────────────────────────────────
 template <typename KeyT, int N_SLOTS>
 static std::size_t join_run_typed_tier(int gpu_id, std::vector<JoinResultRow>& my_slice,
-                                       bool device_emit)
+                                       bool device_emit,
+                                       const duckdb::magi_fused::FusedAggProgram* agg_prog_host)
 {
   auto&             xc  = jexchange();
   const int         gpu = magi_runtime::magi_phys_gpu(gpu_id);
@@ -278,15 +287,50 @@ static std::size_t join_run_typed_tier(int gpu_id, std::vector<JoinResultRow>& m
   magi_runtime::magi_set_tuple_size(gpu_id, sizeof(magi_join::JoinProbeWire));
   if (gpu_id == 0) xc.probe_session = magi_runtime::magi_bump_session();
   xc.probe_start.arrive_and_wait();
+  // Option 3: fused join->aggregate. When a program is supplied, allocate a small
+  // per-GPU accumulator + copy the opcode program to device; the probe kernel
+  // evaluates each agg-input expression per match and atomicAdds into the accum
+  // (overlapping the agg with the shuffle, no out_buf materialization needed).
+  double*                                    d_accum = nullptr;
+  duckdb::magi_fused::FusedAggProgram*       d_prog  = nullptr;
+  if (agg_prog_host) {
+    cudaMalloc(reinterpret_cast<void**>(&d_accum),
+               sizeof(double) * agg_prog_host->n_aggs);
+    cudaMemsetAsync(d_accum, 0, sizeof(double) * agg_prog_host->n_aggs, st);
+    cudaMalloc(reinterpret_cast<void**>(&d_prog),
+               sizeof(duckdb::magi_fused::FusedAggProgram));
+    cudaMemcpyAsync(d_prog, agg_prog_host,
+                    sizeof(duckdb::magi_fused::FusedAggProgram),
+                    cudaMemcpyHostToDevice, st);
+  }
   magi::join_probe_kernel<KeyT, N_SLOTS,
                           KBUFFERING_INTRA_PARTITION_SIZE,
                           KBUFFERING_INTER_PARTITION_SIZE>
       <<<USER_KERNEL_GRID_SIZE, JOIN_BLOCK, 0, st>>>(
           pw, pw_n, H, out, out_count, static_cast<unsigned int>(out_cap),
           n_bpl_slots, /*just_load=*/false, g_joverflow_dev[gpu_id],
-          /*n_drained=*/pw_count);    // reuse pw_count (pw_n already read) as drained counter
+          /*n_drained=*/pw_count,     // reuse pw_count (pw_n already read) as drained counter
+          d_accum, d_prog);
   cudaStreamSynchronize(st);
   chk("probe_kernel");
+  if (agg_prog_host) {
+    double h_accum[duckdb::magi_fused::MAX_FUSED_AGGS] = {0};
+    cudaMemcpy(h_accum, d_accum, sizeof(double) * agg_prog_host->n_aggs,
+               cudaMemcpyDeviceToHost);
+    // Publish this GPU's partial sums to the side channel for the result collector.
+    auto& ch = duckdb::magi_fused::fused_channel();
+    for (int a = 0; a < agg_prog_host->n_aggs; ++a) ch.partials[gpu_id][a] = h_accum[a];
+    ch.n_aggs = agg_prog_host->n_aggs;
+    ch.active = true;
+    if (DBG) {
+      std::fprintf(stderr, "[fused-agg g%d]", gpu_id);
+      for (int a = 0; a < agg_prog_host->n_aggs; ++a)
+        std::fprintf(stderr, " a%d=%.4f", a, h_accum[a]);
+      std::fprintf(stderr, "\n");
+    }
+    cudaFree(d_accum);
+    cudaFree(d_prog);
+  }
   if (DBG) {
     unsigned int dr = 0;
     cudaMemcpy(&dr, pw_count, sizeof(unsigned int), cudaMemcpyDeviceToHost);
@@ -331,22 +375,23 @@ static std::size_t join_run_typed_tier(int gpu_id, std::vector<JoinResultRow>& m
 
 // ── Dispatch over (KeyKind, TableSize) — v1: int32/uint64 × S/M/L ──────────
 static std::size_t join_dispatch(int gpu_id, KeyKind kk, TableSize ts,
-                                 std::vector<JoinResultRow>& my_slice, bool device_emit)
+                                 std::vector<JoinResultRow>& my_slice, bool device_emit,
+                                 const duckdb::magi_fused::FusedAggProgram* agg_prog_host)
 {
   switch (kk) {
     case KeyKind::INT32:
       switch (ts) {
-        case TableSize::SMALL:  return join_run_typed_tier<std::int32_t, N_SLOTS_SMALL >(gpu_id, my_slice, device_emit);
-        case TableSize::MEDIUM: return join_run_typed_tier<std::int32_t, N_SLOTS_MEDIUM>(gpu_id, my_slice, device_emit);
-        case TableSize::LARGE:  return join_run_typed_tier<std::int32_t, N_SLOTS_LARGE >(gpu_id, my_slice, device_emit);
-        default:                return join_run_typed_tier<std::int32_t, N_SLOTS_XLARGE>(gpu_id, my_slice, device_emit);
+        case TableSize::SMALL:  return join_run_typed_tier<std::int32_t, N_SLOTS_SMALL >(gpu_id, my_slice, device_emit, agg_prog_host);
+        case TableSize::MEDIUM: return join_run_typed_tier<std::int32_t, N_SLOTS_MEDIUM>(gpu_id, my_slice, device_emit, agg_prog_host);
+        case TableSize::LARGE:  return join_run_typed_tier<std::int32_t, N_SLOTS_LARGE >(gpu_id, my_slice, device_emit, agg_prog_host);
+        default:                return join_run_typed_tier<std::int32_t, N_SLOTS_XLARGE>(gpu_id, my_slice, device_emit, agg_prog_host);
       }
     case KeyKind::UINT64:
       switch (ts) {
-        case TableSize::SMALL:  return join_run_typed_tier<std::uint64_t, N_SLOTS_SMALL >(gpu_id, my_slice, device_emit);
-        case TableSize::MEDIUM: return join_run_typed_tier<std::uint64_t, N_SLOTS_MEDIUM>(gpu_id, my_slice, device_emit);
-        case TableSize::LARGE:  return join_run_typed_tier<std::uint64_t, N_SLOTS_LARGE >(gpu_id, my_slice, device_emit);
-        default:                return join_run_typed_tier<std::uint64_t, N_SLOTS_XLARGE>(gpu_id, my_slice, device_emit);
+        case TableSize::SMALL:  return join_run_typed_tier<std::uint64_t, N_SLOTS_SMALL >(gpu_id, my_slice, device_emit, agg_prog_host);
+        case TableSize::MEDIUM: return join_run_typed_tier<std::uint64_t, N_SLOTS_MEDIUM>(gpu_id, my_slice, device_emit, agg_prog_host);
+        case TableSize::LARGE:  return join_run_typed_tier<std::uint64_t, N_SLOTS_LARGE >(gpu_id, my_slice, device_emit, agg_prog_host);
+        default:                return join_run_typed_tier<std::uint64_t, N_SLOTS_XLARGE>(gpu_id, my_slice, device_emit, agg_prog_host);
       }
     default:
       throw std::runtime_error("magi_join: unsupported key kind for v1 (int32/uint64 only)");
@@ -367,7 +412,8 @@ std::size_t distributed_hash_join_run_per_gpu(
     unsigned int*                               out_count_buf,
     std::uint64_t                               out_cap,
     std::vector<JoinResultRow>&                 my_slice,
-    bool                                        device_emit)
+    bool                                        device_emit,
+    const duckdb::magi_fused::FusedAggProgram*  agg_prog_host)
 {
   if (gpu_id < 0 || gpu_id >= NUM_GPUS) {
     std::fprintf(stderr, "[magi-join] bad gpu_id=%d (NUM_GPUS=%d)\n", gpu_id, NUM_GPUS);
@@ -399,7 +445,8 @@ std::size_t distributed_hash_join_run_per_gpu(
   xc.begin.arrive_and_wait();
   // After `begin`, every GPU's probe_in is stashed and visible — each GPU
   // computes the same output cap (Σ probe n_rows) itself, no extra barrier.
-  return join_dispatch(gpu_id, xc.key_kind, xc.table_size, my_slice, device_emit);
+  return join_dispatch(gpu_id, xc.key_kind, xc.table_size, my_slice, device_emit,
+                       agg_prog_host);
 }
 
 }  // namespace magi_generic

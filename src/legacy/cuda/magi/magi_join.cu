@@ -468,26 +468,83 @@ void Run(int                                       gpu_id,
   static const bool DBG = std::getenv("MAGI_JOIN_DEBUG") != nullptr;
   const auto t0 = std::chrono::high_resolution_clock::now();
 
+  // ── Option 3 S2-validate: hardcoded Q14 fused-agg program (env-gated). Builds
+  // the opcode program from the actual payload-slot layout so it survives slot
+  // reordering; ep/disc semantic order is assumed [probe0, probe1] and checked
+  // against the known sums. DECIMAL payloads (Src::INT64) use the /dec_div loads.
+  namespace mf = duckdb::magi_fused;
+  if (DBG) {
+    for (size_t i = 0; i < probe_pl_tbl.size(); ++i)
+      std::fprintf(stderr, "[fuse-dbg g%d] probe_pl[%zu] src=%d dst=%d coltype=%d\n",
+                   gpu_id, i, (int)probe_pl_tbl[i].src_kind, (int)probe_pl_tbl[i].dst_idx,
+                   (int)probe_payload[i]->data_wrapper.type.id());
+    for (size_t i = 0; i < build_pl_tbl.size(); ++i)
+      std::fprintf(stderr, "[fuse-dbg g%d] build_pl[%zu] src=%d dst=%d coltype=%d\n",
+                   gpu_id, i, (int)build_pl_tbl[i].src_kind, (int)build_pl_tbl[i].dst_idx,
+                   (int)build_payload[i]->data_wrapper.type.id());
+  }
+  mf::FusedAggProgram q14prog{};
+  const mf::FusedAggProgram* prog_ptr = nullptr;
+  if (std::getenv("MAGI_FUSE_Q14") && probe_pl_tbl.size() >= 2 && build_pl_tbl.size() >= 1) {
+    const int  ep   = probe_pl_tbl[0].dst_idx;
+    const int  disc = probe_pl_tbl[1].dst_idx;
+    const int  pt   = build_pl_tbl[0].dst_idx;
+    using S = JoinPayloadEntry::Src;
+    const uint8_t LE = (probe_pl_tbl[0].src_kind == S::INT64) ? mf::OP_LOAD_PROBE_DEC : mf::OP_LOAD_PROBE;
+    const uint8_t LD = (probe_pl_tbl[1].src_kind == S::INT64) ? mf::OP_LOAD_PROBE_DEC : mf::OP_LOAD_PROBE;
+    q14prog.n_aggs = 2; q14prog.kind[0] = mf::AGG_SUM; q14prog.kind[1] = mf::AGG_SUM;
+    q14prog.dec_div = 100.0;  // DECIMAL(15,2)
+    q14prog.consts[0] = 1.0; q14prog.consts[1] = 0.0;
+    q14prog.n_patterns = 1; q14prog.patterns[0].build_slot = pt; q14prog.patterns[0].plen = 5;
+    q14prog.patterns[0].pat[0]='P'; q14prog.patterns[0].pat[1]='R'; q14prog.patterns[0].pat[2]='O';
+    q14prog.patterns[0].pat[3]='M'; q14prog.patterns[0].pat[4]='O';
+    int k = 0; q14prog.prog_off[0] = 0;
+    // agg0 = case when p_type like 'PROMO%' then ep*(1-disc) else 0
+    q14prog.instrs[k++] = {mf::OP_LIKE_PREFIX, 0};
+    q14prog.instrs[k++] = {LE, (uint8_t)ep};
+    q14prog.instrs[k++] = {mf::OP_LOAD_CONST, 0};
+    q14prog.instrs[k++] = {LD, (uint8_t)disc};
+    q14prog.instrs[k++] = {mf::OP_SUB, 0};
+    q14prog.instrs[k++] = {mf::OP_MUL, 0};
+    q14prog.instrs[k++] = {mf::OP_LOAD_CONST, 1};
+    q14prog.instrs[k++] = {mf::OP_SELECT, 0};
+    q14prog.prog_off[1] = k;
+    // agg1 = ep*(1-disc)
+    q14prog.instrs[k++] = {LE, (uint8_t)ep};
+    q14prog.instrs[k++] = {mf::OP_LOAD_CONST, 0};
+    q14prog.instrs[k++] = {LD, (uint8_t)disc};
+    q14prog.instrs[k++] = {mf::OP_SUB, 0};
+    q14prog.instrs[k++] = {mf::OP_MUL, 0};
+    q14prog.prog_off[2] = k;
+    prog_ptr = &q14prog;
+  }
+
   std::vector<magi_generic::JoinResultRow> slice;  // unused under device_emit (API-required ref)
   const std::size_t emitted = magi_generic::distributed_hash_join_run_per_gpu(
       gpu_id, build_in, probe_in, key_fields,
       build_pl_tbl, probe_pl_tbl, key_kind, ts, out_buf, out_count_buf, out_cap, slice,
-      /*device_emit=*/true);
+      /*device_emit=*/true, /*agg_prog_host=*/prog_ptr);
   const auto t1 = std::chrono::high_resolution_clock::now();
 
   // Emit key + payload output columns ON-DEVICE, directly from the matched rows
   // still resident in `out_buf` (no D2H slice + host transpose round-trip).
+  // FUSED (Option 3): the per-match aggregate was already accumulated into the
+  // side channel, so the full join output is dead — emit a single sentinel row so
+  // the (now trivial) downstream projection + aggregate run on ~0 rows; the result
+  // collector overrides the final result from the side channel. This is what skips
+  // the ~13ms projection+agg+full-emit pass.
+  const std::size_t emit_n = prog_ptr ? (emitted > 0 ? std::size_t{1} : std::size_t{0}) : emitted;
   out_key.clear();
   for (auto& f : key_fields)
-    out_key.push_back(EmitKeyColumnDevice(gpu_id, f, out_buf, emitted, gbm));
+    out_key.push_back(EmitKeyColumnDevice(gpu_id, f, out_buf, emit_n, gbm));
   out_payload.clear();
   for (int p = 0; p < static_cast<int>(probe_payload.size()); ++p)
     out_payload.push_back(EmitPayloadColumnDevice(
-        gpu_id, probe_payload[p], probe_pl_tbl[p], out_buf, emitted, /*from_build=*/false, gbm));
+        gpu_id, probe_payload[p], probe_pl_tbl[p], out_buf, emit_n, /*from_build=*/false, gbm));
   out_build_payload.clear();
   for (int p = 0; p < static_cast<int>(build_payload.size()); ++p)
     out_build_payload.push_back(EmitPayloadColumnDevice(
-        gpu_id, build_payload[p], build_pl_tbl[p], out_buf, emitted, /*from_build=*/true, gbm));
+        gpu_id, build_payload[p], build_pl_tbl[p], out_buf, emit_n, /*from_build=*/true, gbm));
   // The emit kernels + their thrust scans run on the default stream; make their
   // results visible before the columns are consumed downstream.
   cudaDeviceSynchronize();

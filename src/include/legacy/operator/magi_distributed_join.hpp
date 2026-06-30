@@ -32,6 +32,7 @@
 #include "data_plane/ops/agg_kinds.cuh"
 
 #include "legacy/operator/magi_distributed_groupby.hpp"  // KeyKind, TableSize, NUM_GPUS
+#include "legacy/operator/magi_fused_agg.hpp"             // FusedAggProgram (Option 3)
 
 namespace duckdb {
 namespace magi_generic {
@@ -119,7 +120,10 @@ std::size_t distributed_hash_join_run_per_gpu(
     std::vector<JoinResultRow>&                 my_slice,
     // device_emit=true: skip the host-slice D2H/transpose and leave the matched
     // rows in `out_buf` for the caller to columnize on-device (EmitKeyColumnDevice).
-    bool                                        device_emit = false);
+    bool                                        device_emit = false,
+    // agg_prog_host != null: fused join->aggregate (Option 3) — the probe kernel
+    // evaluates the program per match and accumulates into a per-GPU buffer.
+    const duckdb::magi_fused::FusedAggProgram*  agg_prog_host = nullptr);
 
 }  // namespace magi_generic
 }  // namespace duckdb
