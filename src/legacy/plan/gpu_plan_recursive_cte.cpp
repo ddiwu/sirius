@@ -133,7 +133,7 @@ unique_ptr<GPUPhysicalOperator> GPUPhysicalPlanGenerator::CreatePlan(LogicalCTER
     if (gpu_cte == gpu_recursive_cte_tables.end()) {
       throw InvalidInputException("Referenced materialized CTE does not exist.");
     }
-    chunk_scan->intermediate_relation = gpu_cte->second;
+    chunk_scan->per_gpu_relations = gpu_cte->second;
 
     materialized_cte->second.push_back(*chunk_scan.get());
 

@@ -20,6 +20,7 @@
 #include "operator/gpu_physical_cte.hpp"
 
 #include "gpu_buffer_manager.hpp"
+#include "operator/gpu_materialize.hpp"
 #include "gpu_meta_pipeline.hpp"
 #include "gpu_pipeline.hpp"
 #include "log/logging.hpp"
@@ -48,21 +49,35 @@ SinkResultType GPUPhysicalCTE::Sink(GPUIntermediateRelation& input_relation) con
   // lstate.lhs_data.Append(lstate.append_state, chunk);
 
   // return SinkResultType::NEED_MORE_INPUT;
-  SIRIUS_LOG_DEBUG("Sinking data into CTE");
+  SIRIUS_LOG_DEBUG("Sinking data into CTE (GPU {})", sirius_current_gpu);
   GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
+  // Each worker materialises ITS GPU's partition into its own slot. (A single
+  // shared relation here was a multi-GPU race: last writer won and every
+  // CTE_SCAN consumer then read ONE GPU's partition on BOTH GPUs.)
+  auto& slot = (*working_table_gpu)[sirius_current_gpu];
+  if (!slot) {
+    slot = make_shared_ptr<GPUIntermediateRelation>(input_relation.columns.size());
+  }
   for (int col_idx = 0; col_idx < input_relation.columns.size(); col_idx++) {
-    // working_table_gpu->columns[col_idx] =
-    // make_shared_ptr<GPUColumn>(input_relation.columns[col_idx]->column_length,
-    // input_relation.columns[col_idx]->data_wrapper.type,
-    // input_relation.columns[col_idx]->data_wrapper.data);
-    // working_table_gpu->columns[col_idx]->is_unique = input_relation.columns[col_idx]->is_unique;
-    working_table_gpu->columns[col_idx] =
-      make_shared_ptr<GPUColumn>(input_relation.columns[col_idx]);
-    gpuBufferManager->lockAllocation(working_table_gpu->columns[col_idx]->data_wrapper.data, 0);
-    gpuBufferManager->lockAllocation(working_table_gpu->columns[col_idx]->row_ids, 0);
+    auto col_ref = make_shared_ptr<GPUColumn>(input_relation.columns[col_idx]);
+    // Materialize late-materialized (row_ids) columns ONCE at CTE build time:
+    // otherwise EVERY CTE_SCAN consumer re-gathers the full base column per
+    // use (Q11: two consumers each paid a 20M-row gather of two columns).
+    if (col_ref->row_ids != nullptr && col_ref->data_wrapper.data != nullptr) {
+      col_ref = HandleMaterializeExpression(col_ref, gpuBufferManager);
+    }
+    slot->columns[col_idx] = col_ref;
+    // Processing-pool bookkeeping may register a pointer under this GPU's
+    // index or under 0 depending on the allocation path; lockAllocation is a
+    // no-op for pointers not in the given table, so cover both.
+    gpuBufferManager->lockAllocation(slot->columns[col_idx]->data_wrapper.data, sirius_current_gpu);
+    gpuBufferManager->lockAllocation(slot->columns[col_idx]->data_wrapper.data, 0);
+    gpuBufferManager->lockAllocation(slot->columns[col_idx]->row_ids, sirius_current_gpu);
+    gpuBufferManager->lockAllocation(slot->columns[col_idx]->row_ids, 0);
     // If the column type is VARCHAR, also lock the offset allocation
-    if (working_table_gpu->columns[col_idx]->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR) {
-      gpuBufferManager->lockAllocation(working_table_gpu->columns[col_idx]->data_wrapper.offset, 0);
+    if (slot->columns[col_idx]->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR) {
+      gpuBufferManager->lockAllocation(slot->columns[col_idx]->data_wrapper.offset, sirius_current_gpu);
+      gpuBufferManager->lockAllocation(slot->columns[col_idx]->data_wrapper.offset, 0);
     }
   }
   return SinkResultType::FINISHED;

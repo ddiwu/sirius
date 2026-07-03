@@ -47,6 +47,11 @@ class GPUPhysicalColumnDataScan : public GPUPhysicalOperator {
 
   shared_ptr<GPUIntermediateRelation> intermediate_relation;
 
+  //! Per-GPU relations for CTE_SCAN under multi-GPU, indexed by
+  //! sirius_current_gpu (shared with GPUPhysicalCTE::working_table_gpu).
+  //! When set it takes precedence over intermediate_relation.
+  shared_ptr<vector<shared_ptr<GPUIntermediateRelation>>> per_gpu_relations;
+
  public:
   SourceResultType GetData(GPUIntermediateRelation& output_relation) const override;
 

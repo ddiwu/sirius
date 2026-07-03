@@ -20,7 +20,12 @@
 #include "gpu_buffer_manager.hpp"
 #include "log/logging.hpp"
 #include "operator/gpu_materialize.hpp"
+#include "operator/gpu_physical_result_collector.hpp"
 #include "operator/gpu_physical_table_scan.hpp"
+
+#include <chrono>
+#include <cstdlib>
+#include <cuda_runtime.h>
 
 namespace duckdb {
 using sirius::AggregationType;
@@ -168,6 +173,18 @@ SinkResultType GPUPhysicalUngroupedAggregate::Sink(GPUIntermediateRelation& inpu
     }
   }
 
+  // Diagnostic (debug level): per-GPU aggregate-input fingerprint. Two workers
+  // logging IDENTICAL row counts here (for a partitioned input) points at an
+  // upstream partition-routing problem, not at the aggregate itself.
+  if (interior_cross_gpu_merge && GPUBufferManager::GetMaxGpus() > 1) {
+    SIRIUS_LOG_DEBUG(
+      "Interior agg SINK-INPUT gpu={} rows={} col0_data={} col0_rowids={}",
+      sirius_current_gpu, column_size,
+      (void*)(input_relation.columns[0] ? input_relation.columns[0]->data_wrapper.data
+                                        : nullptr),
+      (void*)(input_relation.columns[0] ? input_relation.columns[0]->row_ids : nullptr));
+  }
+
   idx_t payload_idx                  = 0;
   idx_t next_payload_idx             = 0;
   GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
@@ -269,16 +286,170 @@ SinkResultType GPUPhysicalUngroupedAggregate::Sink(GPUIntermediateRelation& inpu
     }
   }
 
+  // Interior multi-GPU merge: signal this GPU's partial is staged so peer
+  // GPUs' GetDataInteriorMerged can proceed once every partial exists.
+  if (interior_cross_gpu_merge && GPUBufferManager::GetMaxGpus() > 1) {
+    // Diagnostic (debug level): staged device pointer + value readback for
+    // the single-DOUBLE-aggregate case.
+    if (types.size() == 1 && types[0].InternalType() == PhysicalType::DOUBLE &&
+        aggregation_result->columns[0] &&
+        aggregation_result->columns[0]->data_wrapper.data) {
+      double staged_val = 0;
+      cudaMemcpy(&staged_val, aggregation_result->columns[0]->data_wrapper.data,
+                 sizeof(double), cudaMemcpyDeviceToHost);
+      SIRIUS_LOG_DEBUG("Interior agg STAGED gpu={} ptr={} val={:.6f}",
+                       sirius_current_gpu,
+                       (void*)aggregation_result->columns[0]->data_wrapper.data,
+                       staged_val);
+    }
+    std::lock_guard<std::mutex> lk(sink_mutex);
+    ++gpus_sunk;
+    sink_cv.notify_all();
+  }
+
   auto end      = std::chrono::high_resolution_clock::now();
   auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
   SIRIUS_LOG_DEBUG("Ungrouped aggregate Sink time: {:.2f} ms", duration.count() / 1000.0);
   return SinkResultType::FINISHED;
 }
 
+// Interior multi-GPU path: this aggregate's output feeds another operator
+// (e.g. a scalar-subquery threshold consumed by a join), so the per-GPU
+// PARTIAL staged by Sink must NOT go downstream — every GPU has to see the
+// GLOBAL value. Wait until all execution GPUs staged their partial, merge
+// them host-side with the same helpers the collector uses for top-level
+// aggregates, and upload the merged row onto the calling GPU. Each GPU
+// worker merges independently (the merge is deterministic, inputs are
+// read-only by then, and sirius_current_gpu is thread_local).
+SourceResultType GPUPhysicalUngroupedAggregate::GetDataInteriorMerged(
+  GPUIntermediateRelation& output_relation) const
+{
+  auto& rstate = runtime_state<UngroupedAggregateRuntimeState>(sirius_current_gpu);
+  if (!rstate.merged_result) {
+    // The sequential per-GPU executor (SIRIUS_LEGACY_PARALLEL=0) runs GPU g's
+    // whole plan before GPU g+1 starts, so peer partials cannot exist yet at
+    // this point. Refuse loudly -> DuckDB CPU fallback stays correct.
+    const char* parallel_env = std::getenv("SIRIUS_LEGACY_PARALLEL");
+    if (parallel_env && std::string(parallel_env) == "0") {
+      throw NotImplementedException(
+        "Interior multi-GPU ungrouped aggregate requires the parallel executor");
+    }
+    GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
+    const int expected = static_cast<int>(gpuBufferManager->tables_per_gpu.size());
+    {
+      std::unique_lock<std::mutex> lk(sink_mutex);
+      if (!sink_cv.wait_for(lk, std::chrono::seconds(60),
+                            [&] { return gpus_sunk >= expected; })) {
+        // A peer GPU never staged its partial (its pipeline failed or stalled);
+        // don't hang the query -- fail over to DuckDB.
+        throw NotImplementedException(
+          "Timed out waiting for peer GPUs' ungrouped-aggregate partials");
+      }
+    }
+
+    // Make every GPU's staged partial coherent before reading it from this
+    // thread: the peer worker's cudf reduction ran on ITS stream and may not
+    // have landed in device memory yet when it signalled Sink completion.
+    // Same fix as the cross-GPU input sync in magi_groupby_runtime.cu (stale
+    // cross-device reads there produced wrong, run-to-run-varying sums).
+    {
+      int prev_device = 0;
+      cudaGetDevice(&prev_device);
+      for (int g = 0; g < GPUBufferManager::GetMaxGpus(); ++g) {
+        if (!per_gpu_state[g]) continue;
+        cudaSetDevice(g);
+        cudaDeviceSynchronize();
+      }
+      cudaSetDevice(prev_device);
+    }
+
+    // Diagnostic (debug level): re-read every GPU's staged pointer + value at
+    // merge time, to compare against the STAGED logs from Sink.
+    if (types.size() == 1 && types[0].InternalType() == PhysicalType::DOUBLE) {
+      for (int g = 0; g < GPUBufferManager::GetMaxGpus(); ++g) {
+        if (!per_gpu_state[g]) continue;
+        auto& rs = static_cast<UngroupedAggregateRuntimeState&>(*per_gpu_state[g]);
+        if (!rs.aggregation_result || !rs.aggregation_result->columns[0] ||
+            !rs.aggregation_result->columns[0]->data_wrapper.data)
+          continue;
+        double mv = 0;
+        cudaMemcpy(&mv, rs.aggregation_result->columns[0]->data_wrapper.data,
+                   sizeof(double), cudaMemcpyDeviceToHost);
+        SIRIUS_LOG_DEBUG("Interior agg MERGE-READ reader_gpu={} src_gpu={} ptr={} val={:.6f}",
+                         sirius_current_gpu, g,
+                         (void*)rs.aggregation_result->columns[0]->data_wrapper.data, mv);
+      }
+    }
+
+    // Re-materialise every GPU's 1-row raw partial host-side and reduce them
+    // to the single global row (COUNT/SUM add, MIN/MAX, AVG count-weighted).
+    auto raw = CollectUngroupedRawPartials(*this, types, gpuBufferManager);
+    unique_ptr<GPUResultCollection> merged_coll;
+    if (raw->write_idx > 1) {
+      // Diagnostic (debug level only): per-GPU partials for the common
+      // single-DOUBLE-aggregate case (e.g. a SUM threshold subquery).
+      if (types.size() == 1 && types[0].InternalType() == PhysicalType::DOUBLE) {
+        for (size_t g = 0; g < raw->write_idx; ++g) {
+          SIRIUS_LOG_DEBUG(
+            "Interior ungrouped-agg partial[{}] = {:.6f}", g,
+            FlatVector::GetData<double>(raw->data_chunks[g].data[0])[0]);
+        }
+      }
+      merged_coll = ReduceUngroupedAcrossGpus(*raw, *this, types, gpuBufferManager);
+      if (types.size() == 1 && types[0].InternalType() == PhysicalType::DOUBLE) {
+        SIRIUS_LOG_DEBUG(
+          "Interior ungrouped-agg merged = {:.6f}",
+          FlatVector::GetData<double>(merged_coll->data_chunks[0].data[0])[0]);
+      }
+    } else {
+      merged_coll = std::move(raw);  // single partial -> already global
+    }
+    if (merged_coll->write_idx == 0) {
+      throw NotImplementedException(
+        "Interior multi-GPU ungrouped aggregate produced no partials");
+    }
+
+    // Upload the merged host row onto THIS GPU as 1-row device columns
+    // (same pattern as cudf_aggregate's COUNT_STAR result construction).
+    // Fixed-width types only: a VARCHAR row would upload a dangling string_t.
+    auto& chunk  = merged_coll->data_chunks[0];
+    auto merged  = make_shared_ptr<GPUIntermediateRelation>(types.size());
+    for (size_t col = 0; col < types.size(); ++col) {
+      if (types[col].InternalType() == PhysicalType::VARCHAR) {
+        throw NotImplementedException(
+          "Interior multi-GPU ungrouped aggregate over VARCHAR not supported");
+      }
+      const PhysicalType pt   = types[col].InternalType();
+      const size_t value_size = GetTypeIdSize(pt);
+      auto& v                 = chunk.data[col];
+      const bool valid        = FlatVector::Validity(v).RowIsValid(0);
+      uint8_t* dev = gpuBufferManager->customCudaMalloc<uint8_t>(value_size, 0, 0);
+      // Untyped data pointer: the typed FlatVector::GetData<T> asserts the
+      // vector's physical type matches T and would throw here (v is e.g.
+      // DOUBLE). We copy raw bytes, so the untyped accessor is the right one.
+      cudaMemcpy(dev, FlatVector::GetData(v), value_size, cudaMemcpyHostToDevice);
+      auto mask = createNullMask(
+        1, valid ? cudf::mask_state::ALL_VALID : cudf::mask_state::ALL_NULL);
+      merged->columns[col] = make_shared_ptr<GPUColumn>(
+        1, convertLogicalTypeToColumnType(types[col]), dev, mask);
+    }
+    rstate.merged_result = std::move(merged);
+  }
+
+  for (int col = 0; col < rstate.merged_result->columns.size(); col++) {
+    output_relation.columns[col] =
+      make_shared_ptr<GPUColumn>(rstate.merged_result->columns[col]);
+  }
+  return SourceResultType::FINISHED;
+}
+
 SourceResultType GPUPhysicalUngroupedAggregate::GetData(
   GPUIntermediateRelation& output_relation) const
 {
   auto start = std::chrono::high_resolution_clock::now();
+  if (interior_cross_gpu_merge && GPUBufferManager::GetMaxGpus() > 1) {
+    return GetDataInteriorMerged(output_relation);
+  }
   // Read this GPU's partial aggregate from per-GPU runtime state.
   auto& rstate = runtime_state<UngroupedAggregateRuntimeState>(sirius_current_gpu);
   if (!rstate.aggregation_result) {

@@ -37,6 +37,57 @@
 
 namespace duckdb {
 
+// Multi-GPU: compute whether `node`'s per-GPU output is REPLICATED (identical
+// rows on every GPU) as opposed to PARTITIONED (each GPU holds a slice), and
+// mark interior UNGROUPED_AGGREGATEs that need the cross-GPU merge along the
+// way. The collector-side reduce in GetResult only pattern-matches the top of
+// the plan; an interior aggregate (e.g. a scalar-subquery threshold feeding a
+// join) would otherwise hand its per-GPU PARTIAL downstream and every GPU
+// would filter against a wrong, partition-local scalar.
+//   - A scan is replicated iff the cached table is replicated (small tables).
+//   - An interior ungrouped aggregate over PARTITIONED input is marked for the
+//     GetData merge; its output is then the global row on every GPU, i.e.
+//     REPLICATED.
+//   - An ungrouped aggregate over REPLICATED input already holds the global
+//     value on every GPU — it must NOT be merged (e.g. the cardinality-check
+//     COUNT DuckDB plans around scalar subqueries would double-count).
+//   - Any other node is replicated iff all its children are; unknown leaves
+//     are assumed partitioned (matches SubtreeAllReplicated).
+// `reduce_visible` is the one aggregate (if any) that GetResult WILL reduce.
+static bool ComputeReplicationAndMark(GPUPhysicalOperator& node,
+                                      const GPUPhysicalOperator* reduce_visible)
+{
+  if (node.type == PhysicalOperatorType::TABLE_SCAN) {
+    auto& scan      = node.Cast<GPUPhysicalTableScan>();
+    auto table_name = scan.GetCatalogTableName();
+    auto& tables    = GPUBufferManager::GetInstance().tables_per_gpu[0];
+    auto it         = tables.find(table_name);
+    return it != tables.end() && it->second->is_replicated;
+  }
+  if (node.type == PhysicalOperatorType::UNGROUPED_AGGREGATE) {
+    bool child_replicated = true;
+    for (auto& child : node.children) {
+      child_replicated = ComputeReplicationAndMark(*child, reduce_visible) && child_replicated;
+    }
+    if (&node != reduce_visible && !child_replicated) {
+      node.Cast<GPUPhysicalUngroupedAggregate>().interior_cross_gpu_merge = true;
+    }
+    // Whether merged here or already fed replicated input, every GPU ends up
+    // holding the same single row. (For reduce_visible the collector merges at
+    // GetResult; nothing inside the plan consumes it, so the value is moot.)
+    return true;
+  }
+  if (node.children.empty()) {
+    // Unknown leaf (DELIM_SCAN, CTE, ...): assume partitioned.
+    return false;
+  }
+  bool replicated = true;
+  for (auto& child : node.children) {
+    replicated = ComputeReplicationAndMark(*child, reduce_visible) && replicated;
+  }
+  return replicated;
+}
+
 GPUPhysicalResultCollector::GPUPhysicalResultCollector(GPUPreparedStatementData& data)
   : GPUPhysicalOperator(PhysicalOperatorType::RESULT_COLLECTOR, {LogicalType::BOOLEAN}, 0),
     statement_type(data.prepared->statement_type),
@@ -46,6 +97,17 @@ GPUPhysicalResultCollector::GPUPhysicalResultCollector(GPUPreparedStatementData&
 {
   this->types      = data.prepared->types;
   gpuBufferManager = &(GPUBufferManager::GetInstance());
+
+  if (GPUBufferManager::GetMaxGpus() > 1) {
+    const GPUPhysicalOperator* reduce_visible = nullptr;
+    if (plan.type == PhysicalOperatorType::UNGROUPED_AGGREGATE) {
+      reduce_visible = &plan;
+    } else if (plan.type == PhysicalOperatorType::PROJECTION && !plan.children.empty() &&
+               plan.children[0]->type == PhysicalOperatorType::UNGROUPED_AGGREGATE) {
+      reduce_visible = plan.children[0].get();
+    }
+    ComputeReplicationAndMark(plan, reduce_visible);
+  }
 }
 
 vector<const_reference<GPUPhysicalOperator>> GPUPhysicalResultCollector::GetChildren() const
@@ -603,6 +665,8 @@ void MinOrMaxValueInPlace(
   }
 }
 
+}  // namespace
+
 // Cross-GPU final reduce of an UNGROUPED_AGGREGATE. Each per-GPU pipeline
 // produced a 1-row partial. Collapse those N rows into a single row by
 // applying each aggregate's reducer:
@@ -682,6 +746,25 @@ unique_ptr<GPUResultCollection> ReduceUngroupedAcrossGpus(
         auto& vsrc = combined.data_chunks[g].data[col];
         if (!FlatVector::Validity(vsrc).RowIsValid(0)) continue;
         MinOrMaxValueInPlace(pt, dst_data, vsrc, 0, /*is_first=*/!any_valid, take_min);
+        any_valid = true;
+      }
+      if (!any_valid) *dst_mask = 0x00;
+    } else if (fname == "first" || fname == "arbitrary") {
+      // DuckDB plans an uncorrelated scalar subquery as FIRST() over the
+      // subquery's 1-row result, so on the interior-merge path every GPU's
+      // partial carries the SAME already-merged scalar — any valid partial is
+      // the answer. (FIRST without ORDER BY is order-arbitrary by SQL
+      // semantics, so taking the first valid partial is a valid instance in
+      // the general case too.)
+      if (pt == PhysicalType::VARCHAR) {
+        throw NotImplementedException(
+          "Cross-GPU FIRST not supported for VARCHAR");
+      }
+      bool any_valid = false;
+      for (size_t g = 0; g < num_gpus && !any_valid; ++g) {
+        auto& vsrc = combined.data_chunks[g].data[col];
+        if (!FlatVector::Validity(vsrc).RowIsValid(0)) continue;
+        memcpy(dst_data, FlatVector::GetData(vsrc), value_size);
         any_valid = true;
       }
       if (!any_valid) *dst_mask = 0x00;
@@ -772,8 +855,6 @@ unique_ptr<GPUResultCollection> CollectUngroupedRawPartials(
   sirius_current_gpu = saved_gpu;
   return partials;
 }
-
-}  // namespace
 
 unique_ptr<QueryResult> GPUPhysicalMaterializedCollector::GetResult(GlobalSinkState& state)
 {

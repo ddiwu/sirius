@@ -17,6 +17,7 @@
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/planner/operator/logical_materialized_cte.hpp"
+#include "gpu_buffer_manager.hpp"
 #include "gpu_physical_plan_generator.hpp"
 #include "operator/gpu_physical_cte.hpp"
 
@@ -28,7 +29,9 @@ unique_ptr<GPUPhysicalOperator> GPUPhysicalPlanGenerator::CreatePlan(LogicalMate
 
   // Create the working_table that the PhysicalCTE will use for evaluation.
   auto working_table     = make_shared_ptr<ColumnDataCollection>(context, op.children[0]->types);
-  auto working_table_gpu = make_shared_ptr<GPUIntermediateRelation>(op.children[0]->types.size());
+  // One slot per GPU (lazily filled by GPUPhysicalCTE::Sink on each worker).
+  auto working_table_gpu = make_shared_ptr<vector<shared_ptr<GPUIntermediateRelation>>>(
+    GPUBufferManager::GetMaxGpus());
 
   // Add the ColumnDataCollection to the context of this PhysicalPlanGenerator
   recursive_cte_tables[op.table_index]     = working_table;

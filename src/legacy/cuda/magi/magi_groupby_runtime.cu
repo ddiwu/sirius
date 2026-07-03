@@ -21,6 +21,7 @@
 
 #include <array>
 #include <barrier>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -295,6 +296,15 @@ static std::size_t run_per_gpu_typed_tier(int                        gpu_id,
   const int gpu = magi_runtime::magi_phys_gpu(gpu_id);
   cudaSetDevice(gpu);
 
+  // Coarse per-phase wall timing, enabled by MAGI_PHASE_TIME=1 (one fprintf
+  // per GPU per query at the end; no hot-loop instrumentation).
+  const bool phase_time = std::getenv("MAGI_PHASE_TIME") != nullptr;
+  using pt_clock = std::chrono::steady_clock;
+  auto pt_t0 = pt_clock::now();
+  auto pt_ms = [](pt_clock::time_point a, pt_clock::time_point b) {
+    return std::chrono::duration<double, std::milli>(b - a).count();
+  };
+
   // Clear receiver global agg (writes empty_key_v<KeyT> per slot — a plain
   // memset to 0 would mis-mark int32 slots as "occupied" since
   // empty_key_v<int32_t> = -1). Only touch the prefix this tier uses.
@@ -330,14 +340,17 @@ static std::size_t run_per_gpu_typed_tier(int                        gpu_id,
   // for slots wider than one cell (128B). For 64B slots CELL_SIZE == sizeof,
   // so this is unchanged behaviour.
   magi_runtime::magi_set_tuple_size(gpu_id, magi::CELL_SIZE);
+  auto pt_t1 = pt_clock::now();
 
   // Session bump (thread 0) + sync.
   if (gpu_id == 0) xc.session_id = magi_runtime::magi_bump_session();
   xc.after_session_start.arrive_and_wait();
+  auto pt_t2 = pt_clock::now();
 
   // Launch the generic kernel for (KeyT, N_SLOTS) tier.
   const auto&         in      = xc.inputs[gpu_id];
   std::uint64_t*      row_ids = magi_runtime::GetIdentityRowIdsShared(gpu, in.n_filtered);
+  auto pt_t3 = pt_clock::now();
 
   // Make this GPU's cached aggregate input coherent before the kernel reads it.
   // sirius uploads each GPU's cache slice with a cudaMemcpyAsync issued on a
@@ -348,6 +361,7 @@ static std::size_t run_per_gpu_typed_tier(int                        gpu_id,
   // produced wrong, run-to-run-varying sums (e.g. Q5 was correct only ~2/8
   // runs; with this sync it is 10/10).
   cudaDeviceSynchronize();
+  auto pt_t4 = pt_clock::now();
   auto* global_agg_typed =
       reinterpret_cast<magi_ops::AggSlot64<KeyT, SB>*>(g_agg_dev[gpu_id]);
   auto* stage_typed =
@@ -421,7 +435,9 @@ static std::size_t run_per_gpu_typed_tier(int                        gpu_id,
                                             g_overflow_dev[gpu_id]);
   }
   cudaStreamSynchronize(magi_runtime::magi_stream(gpu_id));
+  auto pt_t5 = pt_clock::now();
   magi_runtime::magi_sync_after_session(gpu_id, xc.session_id);
+  auto pt_t6 = pt_clock::now();
 
   // Read the overflow counter back. A non-zero value means the hash dropped
   // rows (cardinality > N_SLOTS, i.e. beyond the LARGE tier) and this GPU's
@@ -489,6 +505,16 @@ static std::size_t run_per_gpu_typed_tier(int                        gpu_id,
       row.partial_count = host[j].partial_count;
       my_slice.push_back(row);
     }
+  }
+
+  if (phase_time) {
+    auto pt_t7 = pt_clock::now();
+    std::fprintf(stderr,
+      "[magi-phase gpu=%d] setup=%.2f barrier=%.2f rowids=%.2f devsync=%.2f "
+      "kernels=%.2f session=%.2f extract=%.2f total=%.2f ms\n",
+      gpu_id, pt_ms(pt_t0, pt_t1), pt_ms(pt_t1, pt_t2), pt_ms(pt_t2, pt_t3),
+      pt_ms(pt_t3, pt_t4), pt_ms(pt_t4, pt_t5), pt_ms(pt_t5, pt_t6),
+      pt_ms(pt_t6, pt_t7), pt_ms(pt_t0, pt_t7));
   }
 
   xc.end.arrive_and_wait();

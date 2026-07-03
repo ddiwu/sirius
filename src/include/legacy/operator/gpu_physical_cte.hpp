@@ -41,7 +41,10 @@ class GPUPhysicalCTE : public GPUPhysicalOperator {
 
   shared_ptr<ColumnDataCollection> working_table;
 
-  shared_ptr<GPUIntermediateRelation> working_table_gpu;
+  //! Per-GPU materialized CTE data, indexed by sirius_current_gpu; shared
+  //! with the CTE_SCAN readers (GPUPhysicalColumnDataScan::per_gpu_relations).
+  //! A single shared relation here was a multi-GPU race (last-writer-wins).
+  shared_ptr<vector<shared_ptr<GPUIntermediateRelation>>> working_table_gpu;
 
   idx_t table_index;
   string ctename;

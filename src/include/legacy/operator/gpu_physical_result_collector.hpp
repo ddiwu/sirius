@@ -64,6 +64,24 @@ struct ResultCollectorRuntimeState : OpRuntimeState {
   unique_ptr<GPUResultCollection> result_collection;
 };
 
+class GPUPhysicalUngroupedAggregate;
+
+// Cross-GPU helpers for UNGROUPED_AGGREGATE partials. Shared by the
+// collector's GetResult (top-level aggregates) and
+// GPUPhysicalUngroupedAggregate::GetData (interior aggregates, e.g. a
+// scalar-subquery threshold feeding a join). Defined in
+// gpu_physical_result_collector.cpp.
+unique_ptr<GPUResultCollection> ReduceUngroupedAcrossGpus(
+  GPUResultCollection& combined,
+  const GPUPhysicalUngroupedAggregate& agg,
+  const vector<LogicalType>& types,
+  GPUBufferManager* gbm);
+
+unique_ptr<GPUResultCollection> CollectUngroupedRawPartials(
+  const GPUPhysicalUngroupedAggregate& agg,
+  const vector<LogicalType>& agg_types,
+  GPUBufferManager* gbm);
+
 class GPUPhysicalMaterializedCollector : public GPUPhysicalResultCollector {
  public:
   GPUPhysicalMaterializedCollector(GPUPreparedStatementData& data);

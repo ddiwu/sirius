@@ -23,6 +23,9 @@
 #include "duckdb/parser/group_by_node.hpp"
 #include "gpu_physical_operator.hpp"
 
+#include <condition_variable>
+#include <mutex>
+
 namespace duckdb {
 using sirius::AggregationType;
 
@@ -41,6 +44,11 @@ struct UngroupedAggregateRuntimeState : OpRuntimeState {
   // reduce uses this to compute a count-weighted average from the per-GPU
   // means (cuDF MEAN reduction discards the count after producing the mean).
   vector<uint64_t> avg_valid_counts;
+  // Interior multi-GPU merge (see interior_cross_gpu_merge below): the merged
+  // GLOBAL 1-row result uploaded onto this GPU, built lazily by GetData once
+  // every GPU's Sink has staged its partial. Cached so repeated GetData calls
+  // re-emit without re-merging.
+  shared_ptr<GPUIntermediateRelation> merged_result;
 };
 
 class GPUPhysicalUngroupedAggregate : public GPUPhysicalOperator {
@@ -58,7 +66,25 @@ class GPUPhysicalUngroupedAggregate : public GPUPhysicalOperator {
   unique_ptr<DistinctAggregateData> distinct_data;
   unique_ptr<DistinctAggregateCollectionInfo> distinct_collection_info;
 
+  //! Set at result-collector construction when this aggregate is an INTERIOR
+  //! node of a multi-GPU plan (its output feeds another operator rather than
+  //! the result collector). GetData then performs the cross-GPU merge of the
+  //! per-GPU partials itself; top-level aggregates keep the collector-side
+  //! reduce in GPUPhysicalMaterializedCollector::GetResult.
+  bool interior_cross_gpu_merge = false;
+  //! Sink-completion tracking for the interior merge: how many GPUs have
+  //! staged their 1-row partial. Guarded by sink_mutex; GetData waits on
+  //! sink_cv until all execution GPUs have sunk (or times out -> fallback).
+  mutable std::mutex sink_mutex;
+  mutable std::condition_variable sink_cv;
+  mutable int gpus_sunk = 0;
+
   SourceResultType GetData(GPUIntermediateRelation& output_relation) const override;
+
+  //! Interior multi-GPU path of GetData: wait for every GPU's partial, merge
+  //! them into the global 1-row result (reusing the collector's helpers), and
+  //! emit that merged row on the calling GPU.
+  SourceResultType GetDataInteriorMerged(GPUIntermediateRelation& output_relation) const;
 
   bool IsSource() const override { return true; }
 

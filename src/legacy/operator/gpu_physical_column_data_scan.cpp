@@ -16,6 +16,7 @@
 
 #include "operator/gpu_physical_column_data_scan.hpp"
 
+#include "gpu_buffer_manager.hpp"
 #include "gpu_meta_pipeline.hpp"
 #include "gpu_pipeline.hpp"
 #include "log/logging.hpp"
@@ -59,17 +60,20 @@ SourceResultType GPUPhysicalColumnDataScan::GetData(GPUIntermediateRelation& out
 
   // return chunk.size() == 0 ? SourceResultType::FINISHED : SourceResultType::HAVE_MORE_OUTPUT;
 
-  SIRIUS_LOG_DEBUG("Reading data from column data scan");
+  SIRIUS_LOG_DEBUG("Reading data from column data scan (GPU {})", sirius_current_gpu);
+  // CTE_SCAN under multi-GPU reads THIS GPU's materialized slot; other users
+  // of this operator (e.g. expression_get) keep the shared relation.
+  const shared_ptr<GPUIntermediateRelation>& source_relation =
+    per_gpu_relations ? (*per_gpu_relations)[sirius_current_gpu] : intermediate_relation;
+  if (!source_relation) {
+    throw InternalException("Column data scan: no materialized data for GPU %d",
+                            sirius_current_gpu);
+  }
   for (int col_idx = 0; col_idx < output_relation.columns.size(); col_idx++) {
-    // output_relation.columns[col_idx] = intermediate_relation->columns[col_idx];
-    // output_relation.columns[col_idx] =
-    // make_shared_ptr<GPUColumn>(intermediate_relation->columns[col_idx]->column_length,
-    // intermediate_relation->columns[col_idx]->data_wrapper.type,
-    // intermediate_relation->columns[col_idx]->data_wrapper.data);
     output_relation.columns[col_idx] =
-      make_shared_ptr<GPUColumn>(intermediate_relation->columns[col_idx]);
+      make_shared_ptr<GPUColumn>(source_relation->columns[col_idx]);
     output_relation.columns[col_idx]->is_unique =
-      intermediate_relation->columns[col_idx]->is_unique;
+      source_relation->columns[col_idx]->is_unique;
   }
 
   return SourceResultType::FINISHED;
