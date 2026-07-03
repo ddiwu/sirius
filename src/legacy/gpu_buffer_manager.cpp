@@ -41,6 +41,13 @@ namespace {
 inline void set_current_gpu_resource(gpu_pool_memory_resource& mr)
 {
   cudf::set_current_device_resource_ref(rmm::device_async_resource_ref{mr});
+  // ALSO register on rmm's legacy (non-_ref) registry: parts of cudf/rmm
+  // resolve allocations through rmm::mr::get_current_device_resource(), which
+  // is a SEPARATE registry from the _ref one in this rmm version. Leaving it
+  // unset routed every cudf temporary through the default
+  // cuda_memory_resource — ~200 raw cudaMalloc/cudaFree per warm query
+  // (~85 us each) that dominated small-query latency.
+  rmm::mr::set_current_device_resource(&mr);
 }
 
 inline gpu_pool_memory_resource* make_gpu_pool_memory_resource(

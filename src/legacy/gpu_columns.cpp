@@ -307,7 +307,13 @@ void GPUColumn::setFromCudfColumn(cudf::column& cudf_column,
   is_unique               = _is_unique;
 
   if (cont.null_mask->data() == nullptr || nullable == false) {
-    data_wrapper.validity_mask = createNullMask(column_length);
+    // All-valid: use a nullptr mask (the engine-wide convention — scan columns
+    // already flow this way, and convertToCudfColumn maps nullptr to
+    // null_count=0 without touching the GPU). Allocating a physical all-valid
+    // mask here forced every later convertToCudfColumn of this column through
+    // the masked path (cudaPointerGetAttributes + cudf::null_count kernel +
+    // sync): a fixed per-op-input tax that dominated warm small-query time.
+    data_wrapper.validity_mask = nullptr;
   } else {
     data_wrapper.validity_mask = reinterpret_cast<cudf::bitmask_type*>(
       gpuBufferManager->storeRmmBuffer(std::move(cont.null_mask)));
