@@ -26,8 +26,14 @@
 #include "duckdb/parallel/thread_context.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/common/types/timestamp.hpp"
+#include "duckdb/planner/expression/bound_cast_expression.hpp"
+#include "duckdb/planner/expression/bound_comparison_expression.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/filter/conjunction_filter.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
+#include "duckdb/planner/filter/expression_filter.hpp"
+#include <unordered_map>
 #include "gpu_buffer_manager.hpp"
 #include "gpu_columns.hpp"
 #include "legacy/expression_executor/gpu_dispatcher.hpp"
@@ -1220,6 +1226,59 @@ bool SubtreeAllReplicated(const GPUPhysicalOperator& op)
   return true;
 }
 
+// DuckDB's optimizer folds `date_col < DATE 'x' + INTERVAL ...` into
+// `CAST(date_col AS TIMESTAMP) <op> TIMESTAMP_CONST` and pushes it down as an
+// EXPRESSION_FILTER, which knocked the whole scan off the fused constant-
+// comparison fast path (Q14 interval form: warm 16.7ms vs 12.9ms with bare
+// dates; hits most TPC-H date-range queries). When the timestamp constant is
+// exactly midnight the predicate is equivalent to a DATE constant comparison,
+// so synthesize a ConstantFilter; otherwise return null and keep the general
+// expression path (correctness preserved).
+static unique_ptr<ConstantFilter> TryNormalizeCastTimestampFilter(const TableFilter& tf)
+{
+  if (tf.filter_type != TableFilterType::EXPRESSION_FILTER) { return nullptr; }
+  auto& ef = tf.Cast<ExpressionFilter>();
+  if (!ef.expr || ef.expr->GetExpressionClass() != ExpressionClass::BOUND_COMPARISON) {
+    return nullptr;
+  }
+  auto& cmp          = ef.expr->Cast<BoundComparisonExpression>();
+  ExpressionType et  = cmp.GetExpressionType();
+  Expression* side_a = cmp.left.get();
+  Expression* side_b = cmp.right.get();
+  auto is_cast_of_date_col = [](Expression* e) {
+    if (!e || e->GetExpressionClass() != ExpressionClass::BOUND_CAST) { return false; }
+    auto& cast = e->Cast<BoundCastExpression>();
+    return cast.return_type.id() == LogicalTypeId::TIMESTAMP && cast.child &&
+           cast.child->GetExpressionClass() == ExpressionClass::BOUND_REF &&
+           cast.child->return_type.id() == LogicalTypeId::DATE;
+  };
+  bool flipped = false;
+  if (!is_cast_of_date_col(side_a)) {
+    std::swap(side_a, side_b);
+    flipped = true;
+  }
+  if (!is_cast_of_date_col(side_a)) { return nullptr; }
+  if (!side_b || side_b->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
+    return nullptr;
+  }
+  auto& cval = side_b->Cast<BoundConstantExpression>().value;
+  if (cval.IsNull() || cval.type().id() != LogicalTypeId::TIMESTAMP) { return nullptr; }
+  date_t  d;
+  dtime_t t;
+  Timestamp::Convert(cval.GetValue<timestamp_t>(), d, t);
+  if (t.micros != 0) { return nullptr; }  // non-midnight: not DATE-equivalent
+  if (flipped) { et = FlipComparisonExpression(et); }
+  switch (et) {
+    case ExpressionType::COMPARE_EQUAL:
+    case ExpressionType::COMPARE_LESSTHAN:
+    case ExpressionType::COMPARE_LESSTHANOREQUALTO:
+    case ExpressionType::COMPARE_GREATERTHAN:
+    case ExpressionType::COMPARE_GREATERTHANOREQUALTO: break;
+    default: return nullptr;
+  }
+  return make_uniq<ConstantFilter>(et, Value::DATE(d));
+}
+
 void GPUPhysicalTableScan::ScanDataDuckDBOpt(ExecutionContext& exec_context,
                                              GPUBufferManager* gpuBufferManager,
                                              string table_name)
@@ -2082,6 +2141,20 @@ SourceResultType GPUPhysicalTableScan::GetData(GPUIntermediateRelation& output_r
     // significantly faster than the general GpuExpressionExecutor for simple predicates.
     bool all_constant_comparison = true;
     int num_expr                 = 0;
+    // EXPRESSION_FILTERs of shape CAST(date_col AS TIMESTAMP) <op> midnight-ts
+    // are normalized into synthesized ConstantFilters so they keep the fused
+    // fast path. Storage must outlive HandleArbitraryConstantExpression.
+    vector<unique_ptr<ConstantFilter>> normalized_storage;
+    std::unordered_map<const TableFilter*, ConstantFilter*> normalized_filters;
+    auto normalize = [&](const TableFilter& tf) -> ConstantFilter* {
+      auto it = normalized_filters.find(&tf);
+      if (it != normalized_filters.end()) { return it->second; }
+      auto cf = TryNormalizeCastTimestampFilter(tf);
+      if (!cf) { return nullptr; }
+      normalized_storage.push_back(std::move(cf));
+      normalized_filters.emplace(&tf, normalized_storage.back().get());
+      return normalized_storage.back().get();
+    };
     for (auto& [column_index, filter] : table_filters->filters) {
       if (filter->filter_type == TableFilterType::OPTIONAL_FILTER ||
           filter->filter_type == TableFilterType::IS_NOT_NULL) {
@@ -2089,10 +2162,16 @@ SourceResultType GPUPhysicalTableScan::GetData(GPUIntermediateRelation& output_r
       }
       if (filter->filter_type == TableFilterType::CONSTANT_COMPARISON) {
         num_expr++;
+      } else if (filter->filter_type == TableFilterType::EXPRESSION_FILTER &&
+                 normalize(*filter)) {
+        num_expr++;
       } else if (filter->filter_type == TableFilterType::CONJUNCTION_AND) {
         auto& conjunction = filter->Cast<ConjunctionAndFilter>();
         for (auto& child : conjunction.child_filters) {
           if (child->filter_type == TableFilterType::CONSTANT_COMPARISON) {
+            num_expr++;
+          } else if (child->filter_type == TableFilterType::EXPRESSION_FILTER &&
+                     normalize(*child)) {
             num_expr++;
           } else if (child->filter_type != TableFilterType::IS_NOT_NULL &&
                      child->filter_type != TableFilterType::OPTIONAL_FILTER) {
@@ -2127,10 +2206,21 @@ SourceResultType GPUPhysicalTableScan::GetData(GPUIntermediateRelation& output_r
               expression_columns[expr_idx] =
                 table->columns[column_ids[column_index].GetPrimaryIndex()];
               expr_idx++;
+            } else if (child->filter_type == TableFilterType::EXPRESSION_FILTER &&
+                       normalized_filters.count(child.get())) {
+              filter_constants[expr_idx] = normalized_filters.at(child.get());
+              expression_columns[expr_idx] =
+                table->columns[column_ids[column_index].GetPrimaryIndex()];
+              expr_idx++;
             }
           }
         } else if (filter->filter_type == TableFilterType::CONSTANT_COMPARISON) {
           filter_constants[expr_idx]   = &(filter->Cast<ConstantFilter>());
+          expression_columns[expr_idx] = table->columns[column_ids[column_index].GetPrimaryIndex()];
+          expr_idx++;
+        } else if (filter->filter_type == TableFilterType::EXPRESSION_FILTER &&
+                   normalized_filters.count(filter.get())) {
+          filter_constants[expr_idx]   = normalized_filters.at(filter.get());
           expression_columns[expr_idx] = table->columns[column_ids[column_index].GetPrimaryIndex()];
           expr_idx++;
         }

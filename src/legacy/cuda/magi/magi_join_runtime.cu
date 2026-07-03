@@ -16,7 +16,9 @@
 #include <barrier>
 #include <cstddef>
 #include <cstdint>
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -178,6 +180,15 @@ static std::size_t join_run_typed_tier(int gpu_id, std::vector<JoinResultRow>& m
   auto&             xc  = jexchange();
   const int         gpu = magi_runtime::magi_phys_gpu(gpu_id);
   cudaSetDevice(gpu);
+
+  // Coarse per-phase wall timing, enabled by MAGI_PHASE_TIME=1 (one fprintf
+  // per GPU per query at the end; no hot-loop instrumentation).
+  const bool phase_time = std::getenv("MAGI_PHASE_TIME") != nullptr;
+  using pt_clock = std::chrono::steady_clock;
+  auto pt_t0 = pt_clock::now();
+  auto pt_ms = [](pt_clock::time_point a, pt_clock::time_point b) {
+    return std::chrono::duration<double, std::milli>(b - a).count();
+  };
   cudaStream_t      st  = magi_runtime::magi_stream(gpu_id);
   auto*             H   = reinterpret_cast<magi_ops::AggSlot64<KeyT>*>(g_hbuild_dev[gpu_id]);
 
@@ -226,6 +237,7 @@ static std::size_t join_run_typed_tier(int gpu_id, std::vector<JoinResultRow>& m
       g_jbpl_dev[gpu_id], xc.n_bpl[gpu_id], bw, bw_count);
   cudaStreamSynchronize(st);
   chk("pack_build");
+  auto pt_t1 = pt_clock::now();
   unsigned int bw_n = 0;
   cudaMemcpy(&bw_n, bw_count, sizeof(unsigned int), cudaMemcpyDeviceToHost);
   if (DBG) std::fprintf(stderr, "[magi-join g%d] bn=%lu bw_n=%u n_bpl=%d n_ppl=%d\n",
@@ -235,6 +247,7 @@ static std::size_t join_run_typed_tier(int gpu_id, std::vector<JoinResultRow>& m
   magi_runtime::magi_set_tuple_size(gpu_id, sizeof(magi_join::JoinBuildWire));
   if (gpu_id == 0) xc.build_session = magi_runtime::magi_bump_session();
   xc.build_start.arrive_and_wait();
+  auto pt_t2 = pt_clock::now();
   magi::join_build_kernel<KeyT, N_SLOTS,
                           KBUFFERING_INTRA_PARTITION_SIZE,
                           KBUFFERING_INTER_PARTITION_SIZE>
@@ -242,8 +255,10 @@ static std::size_t join_run_typed_tier(int gpu_id, std::vector<JoinResultRow>& m
           bw, bw_n, H, n_bpl_slots, /*just_load=*/false, g_joverflow_dev[gpu_id]);
   cudaStreamSynchronize(st);
   chk("build_kernel");
+  auto pt_t3 = pt_clock::now();
   magi_runtime::magi_sync_after_session(gpu_id, xc.build_session);
   xc.after_build.arrive_and_wait();   // every owner's H_build is complete
+  auto pt_t4 = pt_clock::now();
 
   // ── PROBE: pack rows → wire tuples ────────────────────────────────────────
   const std::uint64_t pn = xc.probe_in[gpu_id].n_rows;
@@ -264,6 +279,7 @@ static std::size_t join_run_typed_tier(int gpu_id, std::vector<JoinResultRow>& m
       g_jppl_dev[gpu_id], xc.n_ppl[gpu_id], pw, pw_count);
   cudaStreamSynchronize(st);
   chk("pack_probe");
+  auto pt_t5 = pt_clock::now();
   unsigned int pw_n = 0;
   cudaMemcpy(&pw_n, pw_count, sizeof(unsigned int), cudaMemcpyDeviceToHost);
 
@@ -287,6 +303,7 @@ static std::size_t join_run_typed_tier(int gpu_id, std::vector<JoinResultRow>& m
   magi_runtime::magi_set_tuple_size(gpu_id, sizeof(magi_join::JoinProbeWire));
   if (gpu_id == 0) xc.probe_session = magi_runtime::magi_bump_session();
   xc.probe_start.arrive_and_wait();
+  auto pt_t6 = pt_clock::now();
   // Option 3: fused join->aggregate. When a program is supplied, allocate a small
   // per-GPU accumulator + copy the opcode program to device; the probe kernel
   // evaluates each agg-input expression per match and atomicAdds into the accum
@@ -313,6 +330,7 @@ static std::size_t join_run_typed_tier(int gpu_id, std::vector<JoinResultRow>& m
           d_accum, d_prog);
   cudaStreamSynchronize(st);
   chk("probe_kernel");
+  auto pt_t7 = pt_clock::now();
   if (agg_prog_host) {
     double h_accum[duckdb::magi_fused::MAX_FUSED_AGGS] = {0};
     cudaMemcpy(h_accum, d_accum, sizeof(double) * agg_prog_host->n_aggs,
@@ -337,6 +355,7 @@ static std::size_t join_run_typed_tier(int gpu_id, std::vector<JoinResultRow>& m
     std::fprintf(stderr, "[magi-join g%d] DRAINED=%u (sent pw_n=%u)\n", gpu_id, dr, pw_n);
   }
   magi_runtime::magi_sync_after_session(gpu_id, xc.probe_session);
+  auto pt_t8 = pt_clock::now();
 
   // ── Collect this GPU's emitted join rows ─────────────────────────────────
   unsigned int emitted = 0;
@@ -361,6 +380,18 @@ static std::size_t join_run_typed_tier(int gpu_id, std::vector<JoinResultRow>& m
   cudaFree(bw); cudaFree(bw_count);
   cudaFree(pw); cudaFree(pw_count);
   // out / out_count are wrapper-owned (sirius processing pool) — not freed here.
+
+  if (phase_time) {
+    auto pt_t9 = pt_clock::now();
+    std::fprintf(stderr,
+      "[magi-join-phase gpu=%d] pack_build=%.2f bar1=%.2f build_kern=%.2f "
+      "build_sess=%.2f pack_probe=%.2f bar2=%.2f probe_kern=%.2f "
+      "probe_sess=%.2f extract=%.2f total=%.2f ms\n",
+      gpu_id, pt_ms(pt_t0, pt_t1), pt_ms(pt_t1, pt_t2), pt_ms(pt_t2, pt_t3),
+      pt_ms(pt_t3, pt_t4), pt_ms(pt_t4, pt_t5), pt_ms(pt_t5, pt_t6),
+      pt_ms(pt_t6, pt_t7), pt_ms(pt_t7, pt_t8), pt_ms(pt_t8, pt_t9),
+      pt_ms(pt_t0, pt_t9));
+  }
 
   xc.end.arrive_and_wait();
 
