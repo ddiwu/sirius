@@ -148,6 +148,19 @@ struct HashJoinRuntimeState : OpRuntimeState {
   //! Set in Sink when the build side is not replicated (or MAGI_FORCE_SHUFFLE_JOIN):
   //! Execute then runs the magi NVLink shuffle join instead of the cudf probe.
   bool use_shuffle_join              = false;
+  //! Broadcast-probe strategy (build side partitioned, probe side estimated
+  //! small): Sink keeps the build LOCAL (each GPU joins only its own build
+  //! partition); Execute allgathers the probe columns across GPUs and runs the
+  //! unchanged local cudf probe on the FULL probe set. INNER-only — build
+  //! partitions are disjoint, so each probe row matches on exactly one GPU and
+  //! the concatenated per-GPU outputs form the exact join.
+  bool broadcast_probe               = false;
+  //! Set in Sink for INNER partitioned-build joins whose probe columns are
+  //! broadcast-eligible (fixed-width, plan-checked): Sink stages BOTH the
+  //! shuffle inputs and the local-path structures; Execute exchanges ACTUAL
+  //! per-GPU row counts (plan estimates proved wildly off for filtered
+  //! probes) and picks shuffle vs broadcast-probe consistently across workers.
+  bool bcast_candidate               = false;
   //! Build-side (RHS) output columns, materialized in Sink and carried through
   //! the shuffle as build payload so Execute can emit them (e.g. Q11's s_nationkey).
   shared_ptr<GPUIntermediateRelation> shuffle_build_payload;

@@ -16,7 +16,14 @@
 
 #include "operator/gpu_physical_hash_join.hpp"
 
+#include <array>
+#include <barrier>
+#include <cstdio>
 #include <cstdlib>
+#include <cuda_runtime.h>
+#include <memory>
+#include <mutex>
+#include <vector>
 
 #include "duckdb/common/enums/physical_operator_type.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
@@ -29,6 +36,157 @@
 #include "operator/gpu_physical_table_scan.hpp"
 
 namespace duckdb {
+
+// Allgather one dense fixed-width probe column across the per-GPU workers for
+// the broadcast-probe join strategy: every worker publishes its partition's
+// device pointer + row count, waits, then copies every partition (UVA
+// device-to-device) into a full-length local buffer. Both workers call this
+// the same number of times in the same order (identical plans), so the
+// static rendezvous slots + barrier stay in lockstep.
+static shared_ptr<GPUColumn> AllgatherProbeColumn(const shared_ptr<GPUColumn>& col,
+                                                  GPUBufferManager* gpuBufferManager)
+{
+  const int num_gpus = static_cast<int>(gpuBufferManager->tables_per_gpu.size());
+  if (num_gpus <= 1) { return col; }
+  // Without peer access a UVA device-to-device cudaMemcpy is staged through
+  // host memory (~25 GB/s); over NVLink it's ~10x that. magi enables its own
+  // peer access, but a broadcast-only query never initializes magi — so
+  // enable it lazily here, once per (current device, peer) pair.
+  {
+    static std::array<std::once_flag, 64> peer_once;
+    const int g0 = sirius_current_gpu;
+    for (int i = 0; i < num_gpus; ++i) {
+      if (i == g0) { continue; }
+      std::call_once(peer_once[g0 * 8 + i], [&] {
+        cudaError_t e = cudaDeviceEnablePeerAccess(i, 0);
+        if (e != cudaSuccess && e != cudaErrorPeerAccessAlreadyEnabled) {
+          SIRIUS_LOG_DEBUG("broadcast-probe: peer access {} -> {} unavailable ({}), "
+                           "falling back to staged copies", g0, i, (int)e);
+        }
+        (void)cudaGetLastError();  // clear a sticky already-enabled error
+      });
+    }
+  }
+  // A validity mask may still be attached, but the broadcast eligibility
+  // exchange only picks this path after verifying every partition's mask is
+  // ALL-VALID (MaskAllValid) — so the mask carries no information and the
+  // gathered output is emitted dense (mask dropped).
+  if (col->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR) {
+    throw NotImplementedException(
+      "broadcast-probe join: VARCHAR probe column not supported yet");
+  }
+
+  struct Slot {
+    const uint8_t* ptr;
+    uint64_t       rows;
+  };
+  static std::array<Slot, 8>            slots;
+  static std::unique_ptr<std::barrier<>> bar;
+  static std::once_flag                  bar_once;
+  std::call_once(bar_once, [&] { bar = std::make_unique<std::barrier<>>(num_gpus); });
+
+  const int g = sirius_current_gpu;
+  // Our own materialization kernels must have landed before peers read the
+  // buffer (same coherence rule as the magi runtimes).
+  cudaDeviceSynchronize();
+  slots[g] = {col->data_wrapper.data, col->column_length};
+  bar->arrive_and_wait();  // every partition published
+
+  uint64_t total = 0;
+  for (int i = 0; i < num_gpus; ++i) { total += slots[i].rows; }
+  const size_t esz = col->data_wrapper.getColumnTypeSize();
+  uint8_t*     dst = gpuBufferManager->customCudaMalloc<uint8_t>(total * esz, g, 0);
+  uint64_t     off = 0;
+  for (int i = 0; i < num_gpus; ++i) {
+    if (slots[i].rows > 0) {
+      // UVA resolves the source device; goes over NVLink when P2P is enabled.
+      cudaMemcpy(dst + off * esz, slots[i].ptr, slots[i].rows * esz, cudaMemcpyDeviceToDevice);
+    }
+    off += slots[i].rows;
+  }
+  bar->arrive_and_wait();  // all copies done before the slots are reused
+
+  auto out = make_shared_ptr<GPUColumn>(total, col->data_wrapper.type, dst, nullptr);
+  return out;
+}
+
+// TPC-H-style data routinely carries an ALL-VALID validity mask (no actual
+// nulls; e.g. masks attached at cache load for nullable-typed storage).
+// Broadcasting drops the mask, which is exact iff no bit is unset — verified
+// host-side (the mask for a ≤64M-row probe is ≤8MB, a one-off sync D2H).
+static bool MaskAllValid(const shared_ptr<GPUColumn>& col)
+{
+  if (col->data_wrapper.validity_mask == nullptr) { return true; }
+  const uint64_t rows = col->column_length;
+  if (rows == 0) { return true; }
+  const size_t words = (rows + 31) / 32;
+  std::vector<uint32_t> host(words);
+  if (cudaMemcpy(host.data(), col->data_wrapper.validity_mask, words * sizeof(uint32_t),
+                 cudaMemcpyDeviceToHost) != cudaSuccess) {
+    return false;
+  }
+  for (size_t w = 0; w + 1 < words; ++w) {
+    if (host[w] != 0xffffffffu) { return false; }
+  }
+  const uint32_t tail_bits = rows % 32 == 0 ? 32u : static_cast<uint32_t>(rows % 32);
+  const uint32_t tail_mask = tail_bits == 32 ? 0xffffffffu : ((1u << tail_bits) - 1u);
+  return (host[words - 1] & tail_mask) == tail_mask;
+}
+
+// Runtime shuffle-vs-broadcast decision for candidate joins. DuckDB's plan
+// estimates are wildly off for filtered probe sides (Q14: 60M estimated vs
+// 3.6M actual date-filtered lineitem), so the choice is made at Execute time
+// from ACTUAL row counts. Every worker publishes its partition's sizes plus a
+// local eligibility bit (nullable/VARCHAR columns can differ per partition),
+// then all workers compute the same totals and the same verdict — the branch
+// stays worker-consistent, which the collective paths require (divergence
+// would strand one worker on a barrier).
+struct BroadcastDecision {
+  uint64_t probe          = 0;
+  uint64_t build          = 0;
+  bool     eligible       = true;
+  bool     take_broadcast = false;
+};
+static BroadcastDecision ExchangeBroadcastDecision(GPUBufferManager* gpuBufferManager,
+                                                   uint64_t probe_rows,
+                                                   uint64_t build_rows,
+                                                   bool local_eligible)
+{
+  const int num_gpus = static_cast<int>(gpuBufferManager->tables_per_gpu.size());
+  BroadcastDecision d;
+  struct Slot {
+    uint64_t probe;
+    uint64_t build;
+    bool     ok;
+  };
+  static std::array<Slot, 8>             slots;
+  static std::unique_ptr<std::barrier<>> bar;
+  static std::once_flag                  bar_once;
+  if (num_gpus > 1) {
+    std::call_once(bar_once, [&] { bar = std::make_unique<std::barrier<>>(num_gpus); });
+    slots[sirius_current_gpu] = {probe_rows, build_rows, local_eligible};
+    bar->arrive_and_wait();  // every partition published
+    for (int i = 0; i < num_gpus; ++i) {
+      d.probe += slots[i].probe;
+      d.build += slots[i].build;
+      d.eligible = d.eligible && slots[i].ok;
+    }
+    bar->arrive_and_wait();  // all reads done before the slots are reused
+  } else {
+    d = {probe_rows, build_rows, local_eligible, false};
+  }
+  static const uint64_t max_rows = [] {
+    const char* e = std::getenv("MAGI_BCAST_PROBE_MAX");
+    return e ? std::strtoull(e, nullptr, 10) : uint64_t(64'000'000);
+  }();
+  // Broadcasting the probe moves |P|x(N-1) bytes and duplicates the probe
+  // work, but skips shuffling BOTH sides and the two magi session fixed costs
+  // — worth it whenever the probe is not much bigger than the build.
+  d.take_broadcast = num_gpus > 1 && d.eligible && d.probe > 0 && d.build > 0 &&
+                     d.probe <= max_rows && d.probe * 2 <= d.build * 3;
+  return d;
+}
+
 
 template <typename T>
 void ResolveTypeProbeExpression(vector<shared_ptr<GPUColumn>>& probe_keys,
@@ -594,6 +752,99 @@ OperatorResultType GPUPhysicalHashJoin::Execute(GPUIntermediateRelation& input_r
       HandleMaterializeExpression(input_relation.columns[join_key_index], gpuBufferManager);
   }
 
+  // ── broadcast-probe runtime decision (candidates only) ────────────────────
+  // Workers exchange ACTUAL per-partition probe/build sizes plus a local
+  // eligibility bit (nullability can differ per partition) and all apply the
+  // same rule to the same totals — the collective path stays worker-consistent.
+  vector<shared_ptr<GPUColumn>> bcast_lhs_dense;
+  static const bool bcast_phase_time = std::getenv("MAGI_PHASE_TIME") != nullptr;
+  if (rstate.bcast_candidate) {
+    const auto bt0 = std::chrono::steady_clock::now();
+    const uint64_t local_probe = probe_key.empty() ? 0 : probe_key[0]->column_length;
+    const uint64_t local_build =
+      (rstate.materialized_build_key && !rstate.materialized_build_key->columns.empty() &&
+       rstate.materialized_build_key->columns[0])
+        ? rstate.materialized_build_key->columns[0]->column_length
+        : 0;
+    // Round 1: sizes only (~µs). Most large-probe candidates are rejected
+    // here, before paying the mask D2H checks and the LHS materialization.
+    // All workers see the same totals, so they consistently run (or skip)
+    // round 2's rendezvous.
+    const auto d1 = ExchangeBroadcastDecision(gpuBufferManager, local_probe, local_build, true);
+    const auto bt1 = std::chrono::steady_clock::now();
+    BroadcastDecision d = d1;
+    int masked_cols = 0;
+    double mask_key_ms = 0.0, mat_lhs_ms = 0.0;
+    auto ms = [](auto a, auto b) {
+      return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+    if (d1.take_broadcast) {
+      // Round 2: per-partition eligibility (nullability can differ across
+      // partitions, so it must be exchanged, not decided locally).
+      bool eligible = true;
+      for (auto& pk : probe_key) {
+        if (pk->data_wrapper.validity_mask != nullptr) { masked_cols++; }
+        if (pk->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR || !MaskAllValid(pk)) {
+          eligible = false;
+        }
+      }
+      const auto bt2 = std::chrono::steady_clock::now();
+      bcast_lhs_dense.reserve(lhs_output_columns.col_idxs.size());
+      for (auto lhs_idx : lhs_output_columns.col_idxs) {
+        auto dense = HandleMaterializeExpression(input_relation.columns[lhs_idx], gpuBufferManager);
+        if (dense->data_wrapper.validity_mask != nullptr) { masked_cols++; }
+        if (dense->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR || !MaskAllValid(dense)) {
+          eligible = false;
+        }
+        bcast_lhs_dense.push_back(std::move(dense));
+      }
+      const auto bt3 = std::chrono::steady_clock::now();
+      mask_key_ms = ms(bt1, bt2);
+      mat_lhs_ms  = ms(bt2, bt3);
+      d = ExchangeBroadcastDecision(gpuBufferManager, local_probe, local_build, eligible);
+    }
+    const auto bt4 = std::chrono::steady_clock::now();
+    if (bcast_phase_time) {
+      std::fprintf(stderr,
+                   "[bcast-decision gpu=%d] probe_total=%llu build_total=%llu eligible=%d "
+                   "masked_cols=%d exch1=%.2fms mask_key=%.2fms mat+mask_lhs=%.2fms -> %s\n",
+                   sirius_current_gpu, (unsigned long long)d.probe, (unsigned long long)d.build,
+                   (int)d.eligible, masked_cols, ms(bt0, bt1), mask_key_ms, mat_lhs_ms,
+                   d.take_broadcast ? "broadcast" : "shuffle");
+    }
+    if (d.take_broadcast) {
+      rstate.broadcast_probe  = true;
+      rstate.use_shuffle_join = false;
+    }
+    (void)bt4;
+  }
+
+  // ── broadcast-probe: allgather the probe side, then use the local path ────
+  // The build stayed local (disjoint per-GPU partitions), so probing with the
+  // FULL probe set on every GPU yields each match exactly once; the collector
+  // concatenation of the per-GPU outputs is the exact INNER join.
+  if (rstate.broadcast_probe) {
+    const auto at0 = std::chrono::steady_clock::now();
+    for (idx_t cond_idx = 0; cond_idx < conditions.size(); cond_idx++) {
+      probe_key[cond_idx] = AllgatherProbeColumn(probe_key[cond_idx], gpuBufferManager);
+    }
+    const auto at1 = std::chrono::steady_clock::now();
+    for (idx_t i = 0; i < lhs_output_columns.col_idxs.size(); i++) {
+      auto lhs_idx = lhs_output_columns.col_idxs[i];
+      auto dense   = i < bcast_lhs_dense.size()
+                       ? bcast_lhs_dense[i]
+                       : HandleMaterializeExpression(input_relation.columns[lhs_idx], gpuBufferManager);
+      input_relation.columns[lhs_idx] = AllgatherProbeColumn(dense, gpuBufferManager);
+    }
+    const auto at2 = std::chrono::steady_clock::now();
+    if (bcast_phase_time) {
+      std::fprintf(stderr, "[bcast-phase gpu=%d] ag_key=%.2fms ag_lhs=%.2fms\n",
+                   sirius_current_gpu,
+                   std::chrono::duration<double, std::milli>(at1 - at0).count(),
+                   std::chrono::duration<double, std::milli>(at2 - at1).count());
+    }
+  }
+
   // ── magi NVLink shuffle join (build side not replicated / forced) ─────────
   // Runs the full build+probe shuffle over NVLink and emits the join output
   // columns directly, bypassing the cudf probe + row_id materialization (after
@@ -940,6 +1191,34 @@ SinkResultType GPUPhysicalHashJoin::Sink(GPUIntermediateRelation& input_relation
     const bool build_replicated =
         (children.size() >= 2 && SubtreeAllReplicated(*children[1]));
     static const bool force_shuffle = std::getenv("MAGI_FORCE_SHUFFLE_JOIN") != nullptr;
+    // Broadcast-probe CANDIDATE gate — plan-deterministic checks only, so
+    // every worker takes the same Sink branch. The actual shuffle-vs-broadcast
+    // choice happens at Execute from real row counts (plan estimates are
+    // useless for filtered probes). For a candidate this Sink stages BOTH
+    // paths: the shuffle stash below AND the ordinary local per-partition
+    // build (for INNER that's just materialize-reuse + reference stores).
+    // VARCHAR is pre-gated on the PLAN; per-partition nullability is folded
+    // into the Execute-time exchanged decision.
+    bool bcast_candidate = !build_replicated && !force_shuffle &&
+                           join_type == JoinType::INNER && children.size() >= 2 &&
+                           std::getenv("MAGI_NO_BCAST_JOIN") == nullptr;
+    if (bcast_candidate) {
+      for (auto& condition : conditions) {
+        if (condition.left->return_type.id() == LogicalTypeId::VARCHAR) {
+          bcast_candidate = false;
+          break;
+        }
+      }
+    }
+    if (bcast_candidate) {
+      for (auto idx : lhs_output_columns.col_idxs) {
+        if (idx < children[0]->types.size() &&
+            children[0]->types[idx].id() == LogicalTypeId::VARCHAR) {
+          bcast_candidate = false;
+          break;
+        }
+      }
+    }
     if (!build_replicated || force_shuffle) {
       // Build side not replicated (or forced for testing) → magi NVLink shuffle
       // join. v1: INNER only. Stash the materialized build join key; the
@@ -973,7 +1252,12 @@ SinkResultType GPUPhysicalHashJoin::Sink(GPUIntermediateRelation& input_relation
         rstate.shuffle_build_payload->columns[i] =
           HandleMaterializeExpression(input_relation.columns[rhs_output_columns.col_idxs[i]],
                                       gpuBufferManager);
-      return SinkResultType::FINISHED;
+      if (!bcast_candidate) { return SinkResultType::FINISHED; }
+      rstate.bcast_candidate = true;
+      // fall through: ALSO stage the ordinary local per-partition build (cheap
+      // — re-materialize is zero-copy on dense columns, the rest is reference
+      // stores) so Execute can take the broadcast-probe local path without a
+      // second Sink pass if the runtime decision picks broadcast.
     }
   }
 
