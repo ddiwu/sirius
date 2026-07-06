@@ -68,16 +68,19 @@ bool DeriveKeyShape(const vector<shared_ptr<GPUColumn>>& keys,
   // keys in order, give each its byte range, and pick the key width from the
   // total. src_col_idx is the per-kind pool index (BuildGenericInputs assigns
   // i_cols / i64_cols independently in key order), so we track one counter per
-  // pool. Covers single INT, single BIGINT (Q11), and any INT/BIGINT compound
-  // (Q9 = nationkey + o_year) for free.
-  //   total ≤ 4B → INT32 key word;  ≤ 8B → UINT64;  > 8B → needs wide-key path.
+  // pool. Covers single INT, single BIGINT (Q11), and any INT/BIGINT/DATE
+  // compound (Q9 = nationkey + o_year; Q3 = l_orderkey + o_orderdate +
+  // o_shippriority → 16B) for free. DATE is physically an int32 day count, so
+  // it packs through the INT32 pool unchanged — the writeback re-types the
+  // emitted column from the input column, so no device work is DATE-aware.
+  //   total ≤ 4B → INT32 key word;  ≤ 8B → UINT64;  ≤ 16B → UINT128.
   {
     bool all_fixed = true;
     int byte_off = 0, i32_idx = 0, i64_idx = 0;
     std::vector<KeyFieldEntry> f;
     for (int k = 0; k < n_keys; ++k) {
       auto id = keys[k]->data_wrapper.type.id();
-      if (id == GPUColumnTypeId::INT32) {
+      if (id == GPUColumnTypeId::INT32 || id == GPUColumnTypeId::DATE) {
         f.push_back({KeyFieldKind::INT32, (int8_t)i32_idx++, (int8_t)byte_off, 4});
         byte_off += 4;
       } else if (id == GPUColumnTypeId::INT64) {
@@ -190,7 +193,8 @@ magi_generic::PerGpuInputs BuildGenericInputs(
       in.cols.v_chars  [v_idx] = keys[k]->data_wrapper.data;
       in.cols.v_offsets[v_idx] = keys[k]->data_wrapper.offset;
       ++v_idx;
-    } else if (id == GPUColumnTypeId::INT32) {
+    } else if (id == GPUColumnTypeId::INT32 || id == GPUColumnTypeId::DATE) {
+      // DATE is an int32 day count — same byte layout, same pool.
       in.cols.i_cols[i_idx++] =
           reinterpret_cast<const int32_t*>(keys[k]->data_wrapper.data);
     } else if (id == GPUColumnTypeId::INT64) {
@@ -641,15 +645,20 @@ void WriteGenericSliceToColumnsDevice(int gpu_id, const magi_generic::AggResultR
   for (int ki = 0; ki < num_group_keys; ++ki) {
     const magi_ops::KeyFieldEntry& f = key_fields[ki];
     const int shift = f.byte_offset * 8;
+    // 4-byte fields pack DATE and INT32 identically; re-type the emitted
+    // column from the input column so DATE keys come back as DATE.
+    const auto i32_out_id = (keys[ki] && keys[ki]->data_wrapper.type.id() == GPUColumnTypeId::DATE)
+                              ? GPUColumnTypeId::DATE
+                              : GPUColumnTypeId::INT32;
     switch (f.kind) {
       case magi_ops::KeyFieldKind::VARCHAR_PREFIX:
         EmitVarcharKeyDevice(gpu_id, N, d_in, keys[ki], f.byte_offset, f.byte_len, gbm);
         break;
       case magi_ops::KeyFieldKind::INT32: {
-        if (N == 0) { keys[ki] = make_shared_ptr<GPUColumn>(0, GPUColumnType(GPUColumnTypeId::INT32), nullptr, nullptr); keys[ki]->row_id_count = 0; break; }
+        if (N == 0) { keys[ki] = make_shared_ptr<GPUColumn>(0, GPUColumnType(i32_out_id), nullptr, nullptr); keys[ki]->row_id_count = 0; break; }
         auto* d = gbm->customCudaMalloc<int32_t>(N, gpu_id, false);
         k_gb_key_i32<<<grid, tpb>>>(d_in, N, shift, d);
-        keys[ki] = make_shared_ptr<GPUColumn>(N, GPUColumnType(GPUColumnTypeId::INT32), reinterpret_cast<uint8_t*>(d), createNullMask(N));
+        keys[ki] = make_shared_ptr<GPUColumn>(N, GPUColumnType(i32_out_id), reinterpret_cast<uint8_t*>(d), createNullMask(N));
         keys[ki]->row_id_count = 0;
       } break;
       case magi_ops::KeyFieldKind::INT64: {
@@ -729,6 +738,11 @@ void WriteGenericSliceToColumns(int                                             
   for (int ki = 0; ki < num_group_keys; ++ki) {
     const magi_ops::KeyFieldEntry& f = key_fields[ki];
     const int shift = f.byte_offset * 8;
+    // 4-byte fields pack DATE and INT32 identically; re-type the emitted
+    // column from the input column so DATE keys come back as DATE.
+    const auto i32_out_id = (keys[ki] && keys[ki]->data_wrapper.type.id() == GPUColumnTypeId::DATE)
+                              ? GPUColumnTypeId::DATE
+                              : GPUColumnTypeId::INT32;
     switch (f.kind) {
       case magi_ops::KeyFieldKind::VARCHAR_PREFIX:
         EmitVarcharKeyFromPacked(gpu_id, N, slice, keys[ki],
@@ -737,7 +751,7 @@ void WriteGenericSliceToColumns(int                                             
       case magi_ops::KeyFieldKind::INT32: {
         if (N == 0) {
           keys[ki] = make_shared_ptr<GPUColumn>(0,
-              GPUColumnType(GPUColumnTypeId::INT32), nullptr, nullptr);
+              GPUColumnType(i32_out_id), nullptr, nullptr);
           keys[ki]->row_id_count = 0;
           break;
         }
@@ -747,7 +761,7 @@ void WriteGenericSliceToColumns(int                                             
         auto* d_buf = gbm->customCudaMalloc<int32_t>(N, gpu_id, false);
         cudaMemcpy(d_buf, v.data(), N * sizeof(int32_t), cudaMemcpyHostToDevice);
         keys[ki] = make_shared_ptr<GPUColumn>(N,
-            GPUColumnType(GPUColumnTypeId::INT32),
+            GPUColumnType(i32_out_id),
             reinterpret_cast<uint8_t*>(d_buf), createNullMask(N));
         keys[ki]->row_id_count = 0;
       } break;

@@ -155,11 +155,18 @@ struct HashJoinRuntimeState : OpRuntimeState {
   //! partitions are disjoint, so each probe row matches on exactly one GPU and
   //! the concatenated per-GPU outputs form the exact join.
   bool broadcast_probe               = false;
-  //! Set in Sink for INNER partitioned-build joins whose probe columns are
-  //! broadcast-eligible (fixed-width, plan-checked): Sink stages BOTH the
+  //! Broadcast-BUILD strategy (build side small, probe side big — e.g. Q3's
+  //! lineitem ⋈ filtered orders⋈customer): Execute allgathers the build key +
+  //! build output columns and runs the unchanged local cudf join with the
+  //! FULL build against the untouched local probe partition. Output stays
+  //! probe-partitioned, so the per-GPU concatenation is exact. Unlike the
+  //! shuffle it has no payload-type or unique-key restrictions.
+  bool broadcast_build               = false;
+  //! Set in Sink for INNER partitioned-build joins: Sink stages BOTH the
   //! shuffle inputs and the local-path structures; Execute exchanges ACTUAL
   //! per-GPU row counts (plan estimates proved wildly off for filtered
-  //! probes) and picks shuffle vs broadcast-probe consistently across workers.
+  //! probes) and picks shuffle / broadcast-probe / broadcast-build
+  //! consistently across workers.
   bool bcast_candidate               = false;
   //! Build-side (RHS) output columns, materialized in Sink and carried through
   //! the shuffle as build payload so Execute can emit them (e.g. Q11's s_nationkey).
