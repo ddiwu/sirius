@@ -77,17 +77,67 @@ def parse_runs(path):
             junk += 1
     if cur:
         raw_runs.append(cur)
-    runs = []
+    runs, ordered = [], []
     for rows in raw_runs:
         groups = {}
+        seq = []  # (key_tuple, val_tuple) in output order — for --ordered
         for f in rows:
             key = tuple(x for x in f if not is_float_field(x))
             val = tuple(float(x) for x in f if is_float_field(x))
             groups.setdefault(key, []).append(val)
+            seq.append((key, val))
         for k in groups:
             groups[k].sort()
         runs.append(groups)
-    return runs, junk
+        ordered.append(seq)
+    return runs, junk, ordered
+
+
+def _rows_equal(ra, rb, rtol):
+    """Row equal iff non-float key columns match exactly and float columns
+    match within rtol. Returns (equal, max_rel_seen)."""
+    (ka, va), (kb, vb) = ra, rb
+    if ka != kb or len(va) != len(vb):
+        return False, 0.0
+    mr = 0.0
+    for x, y in zip(va, vb):
+        rel = abs(x - y) / max(abs(y), 1e-30)
+        mr = max(mr, rel)
+        if rel > rtol:
+            return False, mr
+    return True, mr
+
+
+def diff_ordered(a, b, rtol):
+    """Positional row-by-row compare (order-sensitive, for ORDER BY).
+    Adjacent transpositions of rows that are equal within tolerance are counted
+    as near-tie SWAPS, not hard diffs: when the sort key is a float aggregate,
+    two rows whose keys differ only at ~1e-16 can order oppositely between
+    engines (different reduce order), which is a valid ORDER BY result.
+    -> (n_hard_diff, n_soft_swap, max_rel)."""
+    n_hard, n_soft, max_rel = 0, 0, 0.0
+    if len(a) != len(b):
+        n_hard += abs(len(a) - len(b))
+    L = min(len(a), len(b))
+    i = 0
+    while i < L:
+        eq, mr = _rows_equal(a[i], b[i], rtol)
+        max_rel = max(max_rel, mr)
+        if eq:
+            i += 1
+            continue
+        # adjacent transposition (near-tie swap)?
+        if i + 1 < L:
+            e1, m1 = _rows_equal(a[i], b[i + 1], rtol)
+            e2, m2 = _rows_equal(a[i + 1], b[i], rtol)
+            if e1 and e2:
+                max_rel = max(max_rel, m1, m2)
+                n_soft += 1
+                i += 2
+                continue
+        n_hard += 1
+        i += 1
+    return n_hard, n_soft, max_rel
 
 
 def diff(a, b, rtol):
@@ -115,28 +165,55 @@ def checksum(run):
 def main():
     args = sys.argv[1:]
     rtol = 1e-6
-    if args and args[0] == "--rtol":
-        rtol = float(args[1])
-        args = args[2:]
+    ordered = False
+    while args and args[0] in ("--rtol", "--ordered"):
+        if args[0] == "--rtol":
+            rtol = float(args[1])
+            args = args[2:]
+        else:  # --ordered: compare rows positionally (ORDER BY correctness)
+            ordered = True
+            args = args[1:]
     configs = []
     for a in args:
         label, _, path = a.partition("=")
-        runs, junk = parse_runs(path)
-        configs.append((label, runs, junk))
+        runs, junk, ordruns = parse_runs(path)
+        configs.append((label, runs, junk, ordruns))
         sizes = [len(r) for r in runs]
         sums = " ".join(f"{checksum(r):.4f}" for r in runs[:4])
-        print(f"[{label}] runs={len(runs)} rows/run={sizes} junk_lines={junk}")
+        print(f"[{label}] runs={len(runs)} rows/run={sizes} junk_lines={junk}"
+              f"{' [ordered]' if ordered else ''}")
         print(f"[{label}] checksums: {sums}")
     if not configs:
-        print("usage: qverify_compare.py [--rtol X] ref=FILE [cfg=FILE ...]")
+        print("usage: qverify_compare.py [--rtol X] [--ordered] ref=FILE [cfg=FILE ...]")
         return 2
     ok = True
-    ref_label, ref_runs, _ = configs[0]
+    ref_label, ref_runs, _, ref_ord = configs[0]
     if not ref_runs:
         print(f"FAIL: reference config '{ref_label}' produced no runs")
         return 1
     ref = ref_runs[0]
-    for label, runs, _ in configs:
+    if ordered:
+        # Order-sensitive: row-by-row against the reference's first run.
+        for label, _, _, ordruns in configs:
+            if not ordruns:
+                print(f"FAIL [{label}]: no data runs parsed")
+                ok = False
+                continue
+            for i, r in enumerate(ordruns):
+                base = ordruns[0] if label == ref_label else ref_ord[0]
+                if label == ref_label and i == 0:
+                    continue
+                hard, soft, mr = diff_ordered(r, base, rtol)
+                tag = f"run{i} vs run0" if label == ref_label else f"vs [{ref_label}]"
+                status = "OK  " if hard == 0 else "FAIL"
+                swap = f", near_tie_swaps={soft}" if soft else ""
+                print(f"{status} [{label}] {tag}: rows {len(r)} vs {len(base)}, "
+                      f"hard_diffs={hard}{swap} max_rel={mr:.3e}")
+                if hard:
+                    ok = False
+        print("VERDICT:", "PASS" if ok else "FAIL")
+        return 0 if ok else 1
+    for label, runs, _, _ in configs:
         if not runs:
             print(f"FAIL [{label}]: no data runs parsed")
             ok = False

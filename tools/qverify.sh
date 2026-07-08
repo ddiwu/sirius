@@ -49,10 +49,11 @@ if [ -z "${QV_INNER:-}" ]; then
   exec bash -l "$0" "$@"
 fi
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-RUNS=3; DB=/dev/shm/tpch_sf50.duckdb; DO_MAIN=0; DO_CPU=1; RTOL=1e-6
-while getopts "n:d:mCt:" o; do
+RUNS=3; DB=/dev/shm/tpch_sf50.duckdb; DO_MAIN=0; DO_CPU=1; RTOL=1e-6; ORDERED=""
+while getopts "n:d:mCt:o" o; do
   case $o in
     n) RUNS=$OPTARG;; d) DB=$OPTARG;; m) DO_MAIN=1;; C) DO_CPU=0;; t) RTOL=$OPTARG;;
+    o) ORDERED="--ordered";;   # order-sensitive compare (ORDER BY / TOP_N)
     *) echo "bad option"; exit 2;;
   esac
 done
@@ -153,7 +154,7 @@ fi
 
 # ── compare ──────────────────────────────────────────────────────────────────
 echo "── compare (rtol=$RTOL) ──"
-python3 "$REPO/tools/qverify_compare.py" --rtol "$RTOL" "${CONFIGS[@]}"
+python3 "$REPO/tools/qverify_compare.py" --rtol "$RTOL" $ORDERED "${CONFIGS[@]}"
 CMP=$?
 [ "$CMP" != 0 ] && KEEP=1
 if [ "$FB_OURS" -gt 0 ]; then
