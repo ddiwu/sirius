@@ -21,6 +21,8 @@
 #include "log/logging.hpp"
 #include "operator/gpu_physical_order.hpp"
 
+#include <cudf/merge.hpp>
+
 #include <cub/cub.cuh>
 
 #include <stdio.h>
@@ -970,6 +972,55 @@ void CustomSingleColumnRadixTopN(vector<shared_ptr<GPUColumn>>& keys,
   uint32_t final_count = (uint32_t)std::min((uint64_t)num_results, (uint64_t)cutoff_idx);
   MaterializeResults(projection, d_records, final_count, gpuBufferManager, num_projections);
   gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_records), 0);
+}
+
+// Merge N pre-sorted runs (all resident on the CURRENT device) into one
+// globally sorted table via cudf::merge. Used by the multi-GPU ORDER BY: each
+// GPU sorts its partition, the runs are gathered to one GPU over NVLink, and
+// this replaces the serial host k-way merge (which dominated large ORDER BY:
+// ~24ms for 381K rows vs ~1ms here). `key_cols` index into the run columns;
+// order/null-order mapping MUST match cudf_orderby's sort (ASC→nulls AFTER,
+// DESC→nulls BEFORE) or the merge would un-sort around NULLs.
+void cudf_merge_sorted(vector<vector<shared_ptr<GPUColumn>>>& runs,
+                       const vector<idx_t>& key_cols,
+                       OrderByType* order_by_type,
+                       idx_t num_keys,
+                       idx_t num_cols,
+                       vector<shared_ptr<GPUColumn>>& out)
+{
+  GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
+  cudf::set_current_device_resource_ref(gpuBufferManager->get_mr_ref());
+
+  std::vector<std::vector<cudf::column_view>> run_cols(runs.size());
+  std::vector<cudf::table_view> views;
+  views.reserve(runs.size());
+  for (size_t r = 0; r < runs.size(); r++) {
+    run_cols[r].reserve(num_cols);
+    for (idx_t col = 0; col < num_cols; col++) {
+      run_cols[r].push_back(runs[r][col]->convertToCudfColumn());
+    }
+    views.emplace_back(run_cols[r]);
+  }
+
+  std::vector<cudf::size_type> keys_cudf;
+  std::vector<cudf::order> orders;
+  std::vector<cudf::null_order> null_orders;
+  for (idx_t i = 0; i < num_keys; i++) {
+    keys_cudf.push_back(static_cast<cudf::size_type>(key_cols[i]));
+    if (order_by_type[i] == OrderByType::ASCENDING) {
+      orders.push_back(cudf::order::ASCENDING);
+      null_orders.push_back(cudf::null_order::AFTER);
+    } else {
+      orders.push_back(cudf::order::DESCENDING);
+      null_orders.push_back(cudf::null_order::BEFORE);
+    }
+  }
+
+  auto merged = cudf::merge(views, keys_cudf, orders, null_orders);
+  for (idx_t col = 0; col < num_cols; col++) {
+    out[col]->setFromCudfColumn(
+      merged->get_column(col), out[col]->is_unique, nullptr, 0, gpuBufferManager);
+  }
 }
 
 // Router

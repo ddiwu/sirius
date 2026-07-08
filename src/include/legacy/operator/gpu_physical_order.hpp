@@ -29,12 +29,31 @@ void cudf_orderby(vector<shared_ptr<GPUColumn>>& keys,
                   OrderByType* order_by_type,
                   idx_t num_results = 0);
 
+//! Merge N pre-sorted runs (all on the CURRENT device) into one sorted table
+//! via cudf::merge. key_cols index into the run columns; ordering semantics
+//! match cudf_orderby.
+void cudf_merge_sorted(vector<vector<shared_ptr<GPUColumn>>>& runs,
+                       const vector<idx_t>& key_cols,
+                       OrderByType* order_by_type,
+                       idx_t num_keys,
+                       idx_t num_cols,
+                       vector<shared_ptr<GPUColumn>>& out);
+
 void orderByString(uint8_t** col_keys,
                    uint64_t** col_offsets,
                    int* sort_orders,
                    uint64_t* col_num_bytes,
                    uint64_t num_rows,
                    uint64_t num_cols);
+
+//! Per-GPU sorted output. Each worker thread sorts ONLY its own partition into
+//! its own slot; a single shared member would be clobbered last-writer-wins by
+//! the concurrent workers (that race made multi-GPU ORDER BY throw -> DuckDB
+//! fallback). The collector k-way-merges the per-GPU runs into a global order.
+class OrderRuntimeState : public OpRuntimeState {
+ public:
+  shared_ptr<GPUIntermediateRelation> sort_result;
+};
 
 class GPUPhysicalOrder : public GPUPhysicalOperator {
  public:
@@ -50,7 +69,6 @@ class GPUPhysicalOrder : public GPUPhysicalOperator {
   //! Input data
   vector<BoundOrderByNode> orders;
   vector<idx_t> projections;
-  shared_ptr<GPUIntermediateRelation> sort_result;
   bool is_index_sort;
 
  public:
@@ -70,5 +88,11 @@ class GPUPhysicalOrder : public GPUPhysicalOperator {
   bool IsSink() const override { return true; }
   bool ParallelSink() const override { return true; }
   bool SinkOrderDependent() const override { return false; }
+
+ private:
+  //! Large multi-GPU sorts: gather the per-GPU sorted runs onto one GPU and
+  //! cudf::merge them there (replaces the serial host k-way merge). Decides
+  //! from exchanged ACTUAL row totals; all workers rendezvous inside.
+  void MaybeGpuMergeAcrossGpus(OrderRuntimeState& rstate) const;
 };
 }  // namespace duckdb

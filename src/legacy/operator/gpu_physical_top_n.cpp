@@ -40,10 +40,6 @@ GPUPhysicalTopN::GPUPhysicalTopN(vector<LogicalType> types_p,
     offset(offset),
     dynamic_filter(std::move(dynamic_filter_p))
 {
-  sort_result = make_shared_ptr<GPUIntermediateRelation>(types.size());
-  for (int col = 0; col < types.size(); col++) {
-    sort_result->columns[col] = nullptr;
-  }
 }
 
 GPUPhysicalTopN::~GPUPhysicalTopN() {}
@@ -111,6 +107,12 @@ SinkResultType GPUPhysicalTopN::Sink(GPUIntermediateRelation& input_relation) co
 
   HandleTopN(order_by_keys, projection_columns, orders, types.size(), limit + offset);
 
+  // Per-GPU slot: this worker kept only its own partition's top-(limit+offset).
+  auto& rstate = runtime_state<TopNRuntimeState>(sirius_current_gpu);
+  if (!rstate.sort_result) {
+    rstate.sort_result = make_shared_ptr<GPUIntermediateRelation>(types.size());
+  }
+  auto& sort_result = rstate.sort_result;
   for (int col = 0; col < types.size(); col++) {
     if (sort_result->columns[col] == nullptr || sort_result->columns[col]->column_length == 0 ||
         sort_result->columns[col]->data_wrapper.data == nullptr) {
@@ -140,10 +142,18 @@ SourceResultType GPUPhysicalTopN::GetData(GPUIntermediateRelation& output_relati
   auto start = std::chrono::high_resolution_clock::now();
   if (limit == 0) { return SourceResultType::FINISHED; }
   GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
+  auto& sort_result = runtime_state<TopNRuntimeState>(sirius_current_gpu).sort_result;
+
+  // Multi-GPU: this worker holds only its partition's local top-(limit+offset).
+  // Emit the FULL retained run untouched; the collector k-way-merges the per-GPU
+  // runs and applies the GLOBAL offset+limit (applying offset per-partition here
+  // would skip the wrong rows). Single-GPU keeps the local offset+limit slice.
+  const bool multi = GPUBufferManager::GetMaxGpus() > 1;
 
   for (int col = 0; col < sort_result->columns.size(); col++) {
     SIRIUS_LOG_DEBUG("Writing top n result to column {}", col);
-    if (offset >= sort_result->columns[col]->column_length) {
+    const idx_t eff_offset = multi ? 0 : offset;
+    if (eff_offset >= sort_result->columns[col]->column_length) {
       output_relation.columns[col] =
         make_shared_ptr<GPUColumn>(0,
                                    sort_result->columns[col]->data_wrapper.type,
@@ -153,7 +163,9 @@ SourceResultType GPUPhysicalTopN::GetData(GPUIntermediateRelation& output_relati
                                    sort_result->columns[col]->data_wrapper.is_string_data,
                                    nullptr);
     } else {
-      auto limit_const         = std::min(limit, sort_result->columns[col]->column_length - offset);
+      const idx_t offset = eff_offset;
+      const idx_t avail  = sort_result->columns[col]->column_length - offset;
+      auto limit_const   = multi ? avail : std::min(limit, avail);
       uint8_t* output_col_data = sort_result->columns[col]->data_wrapper.data;
       uint64_t* output_col_offset   = sort_result->columns[col]->data_wrapper.offset;
       uint64_t output_col_num_bytes = sort_result->columns[col]->data_wrapper.num_bytes;

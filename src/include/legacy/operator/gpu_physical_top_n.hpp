@@ -25,6 +25,15 @@ struct DynamicFilterData;
 
 //! Represents a physical ordering of the data. Note that this will not change
 //! the data but only add a selection vector.
+//! Per-GPU top-(limit+offset) sorted run. Same rationale as OrderRuntimeState:
+//! each worker keeps its own partition's local top-K so the shared operator
+//! isn't clobbered by the concurrent workers; the collector merges the runs and
+//! applies the global offset+limit.
+class TopNRuntimeState : public OpRuntimeState {
+ public:
+  shared_ptr<GPUIntermediateRelation> sort_result;
+};
+
 class GPUPhysicalTopN : public GPUPhysicalOperator {
  public:
   static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::TOP_N;
@@ -43,7 +52,6 @@ class GPUPhysicalTopN : public GPUPhysicalOperator {
   idx_t offset;
   //! Dynamic table filter (if any)
   shared_ptr<DynamicFilterData> dynamic_filter;
-  shared_ptr<GPUIntermediateRelation> sort_result;
 
  public:
   SourceResultType GetData(GPUIntermediateRelation& output_relation) const override;

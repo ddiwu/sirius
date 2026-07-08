@@ -22,6 +22,12 @@
 #include "duckdb/main/prepared_statement_data.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
+#include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "operator/gpu_physical_order.hpp"
+#include "operator/gpu_physical_top_n.hpp"
+
+#include <cstring>
+#include <queue>
 #include "gpu_buffer_manager.hpp"
 #include "gpu_context.hpp"
 #include "gpu_meta_pipeline.hpp"
@@ -856,12 +862,264 @@ unique_ptr<GPUResultCollection> CollectUngroupedRawPartials(
   return partials;
 }
 
+namespace {
+
+// One key column of the global merge order.
+struct MergeKey {
+  int  col;          // output-column index the key reads from
+  bool ascending;    // ASC vs DESC
+  bool nulls_first;  // where NULLs sort
+};
+
+// A source row reference into a per-GPU run: (run, chunk, row).
+struct SrcRef {
+  uint16_t run;
+  uint32_t chunk;
+  uint32_t row;
+};
+
+// A read cursor over one per-GPU sorted run (chunks already locally sorted by
+// the same keys).
+struct RunCursor {
+  GPUResultCollection* run   = nullptr;
+  size_t               chunk = 0;
+  size_t               row   = 0;
+  bool                 done  = false;
+  vector<Value>        keys;  // cached key values of the current head row
+};
+
+// -1 if row a precedes b in the merge order, +1 if after, 0 if equal.
+int CompareKeys(const vector<Value>& a, const vector<Value>& b, const vector<MergeKey>& ks)
+{
+  for (size_t i = 0; i < ks.size(); ++i) {
+    const bool na = a[i].IsNull(), nb = b[i].IsNull();
+    if (na || nb) {
+      if (na && nb) { continue; }
+      const bool a_first = ks[i].nulls_first ? na : nb;
+      return a_first ? -1 : 1;
+    }
+    if (a[i] < b[i]) { return ks[i].ascending ? -1 : 1; }
+    if (b[i] < a[i]) { return ks[i].ascending ? 1 : -1; }
+  }
+  return 0;
+}
+
+// Advance a cursor to the next non-empty (chunk,row) and refresh its head keys.
+void LoadCursorKeys(RunCursor& c, const vector<MergeKey>& ks)
+{
+  while (c.chunk < c.run->write_idx && c.row >= c.run->data_chunks[c.chunk].size()) {
+    ++c.chunk;
+    c.row = 0;
+  }
+  if (c.chunk >= c.run->write_idx) {
+    c.done = true;
+    return;
+  }
+  c.keys.clear();
+  for (auto& k : ks) { c.keys.push_back(c.run->data_chunks[c.chunk].GetValue(k.col, c.row)); }
+}
+
+// k-way merge of the per-GPU sorted runs into one globally ordered collection.
+// For TOP_N (has_limit), emit only global rows [offset, offset+limit); each run
+// already holds its partition's local top-(limit+offset), which provably
+// contains every global top row. For ORDER BY, emit every row.
+unique_ptr<GPUResultCollection> MergeSortedRuns(vector<GPUResultCollection*>& runs,
+                                                const vector<LogicalType>&   types,
+                                                const vector<MergeKey>&      keys,
+                                                bool                         has_limit,
+                                                idx_t                        limit,
+                                                idx_t                        offset)
+{
+  static const bool merge_phase_time = std::getenv("MAGI_PHASE_TIME") != nullptr;
+  const auto        mp0 = std::chrono::steady_clock::now();
+  auto              out = make_uniq<GPUResultCollection>();
+
+  vector<RunCursor> curs(runs.size());
+  size_t            total_rows = 0;
+  for (size_t k = 0; k < runs.size(); ++k) {
+    curs[k].run = runs[k];
+    total_rows += runs[k]->size();
+    LoadCursorKeys(curs[k], keys);
+  }
+
+  // Min-heap of run indices by head keys (ties broken by run id for stability).
+  auto worse = [&](int x, int y) {
+    const int c = CompareKeys(curs[x].keys, curs[y].keys, keys);
+    return c != 0 ? c > 0 : x > y;
+  };
+  std::priority_queue<int, vector<int>, decltype(worse)> pq(worse);
+  for (size_t k = 0; k < runs.size(); ++k) {
+    if (!curs[k].done) { pq.push(static_cast<int>(k)); }
+  }
+
+  const idx_t out_rows =
+    has_limit ? std::min<idx_t>(limit, total_rows > offset ? total_rows - offset : 0) : total_rows;
+  out->SetCapacity((out_rows + STANDARD_VECTOR_SIZE) / STANDARD_VECTOR_SIZE + 1);
+
+  // Phase 1: k-way merge → the global output order as (run, chunk, row) refs.
+  // The heavy per-cell copy is deferred to a typed column gather (Phase 2).
+  vector<SrcRef> order;
+  order.reserve(out_rows);
+  idx_t skipped = 0;
+  while (!pq.empty()) {
+    const int  k = pq.top();
+    pq.pop();
+    RunCursor& c = curs[k];
+    if (has_limit && skipped < offset) {
+      ++skipped;
+    } else {
+      order.push_back({static_cast<uint16_t>(k),
+                       static_cast<uint32_t>(c.chunk),
+                       static_cast<uint32_t>(c.row)});
+      if (has_limit && order.size() >= limit) { break; }
+    }
+    ++c.row;
+    LoadCursorKeys(c, keys);
+    if (!c.done) { pq.push(k); }
+  }
+
+  const auto mp1 = std::chrono::steady_clock::now();
+  // Phase 2: gather each output chunk column-by-column with typed native copies.
+  Allocator& alloc = Allocator::DefaultAllocator();
+  for (size_t base = 0; base < order.size(); base += STANDARD_VECTOR_SIZE) {
+    const size_t n = std::min<size_t>(STANDARD_VECTOR_SIZE, order.size() - base);
+    DataChunk    chunk;
+    chunk.Initialize(alloc, types);
+    for (size_t col = 0; col < types.size(); ++col) {
+      Vector& dst   = chunk.data[col];
+      auto&   dmask = FlatVector::Validity(dst);
+      auto src_vec  = [&](size_t r) -> Vector& {
+        const SrcRef& s = order[base + r];
+        return runs[s.run]->data_chunks[s.chunk].data[col];
+      };
+      auto src_row = [&](size_t r) { return order[base + r].row; };
+      if (types[col].InternalType() == PhysicalType::VARCHAR) {
+        // Strings must be copied into dst's own heap (a raw string_t copy would
+        // dangle once the per-GPU runs are released after the merge).
+        auto* d = FlatVector::GetData<string_t>(dst);
+        for (size_t r = 0; r < n; ++r) {
+          Vector& s = src_vec(r);
+          if (!FlatVector::Validity(s).RowIsValid(src_row(r))) { dmask.SetInvalid(r); continue; }
+          d[r] = StringVector::AddStringOrBlob(dst, FlatVector::GetData<string_t>(s)[src_row(r)]);
+        }
+      } else {
+        // All fixed-width types (INT*/FLOAT/DOUBLE/DATE/TIMESTAMP/DECIMAL/BOOL):
+        // raw element-size memcpy via the untyped Vector::GetData(). Using the
+        // typed FlatVector::GetData<T> would trip DuckDB's per-type check.
+        const idx_t esz   = GetTypeIdSize(types[col].InternalType());
+        data_ptr_t  dbase = dst.GetData();
+        for (size_t r = 0; r < n; ++r) {
+          Vector& s = src_vec(r);
+          std::memcpy(dbase + static_cast<size_t>(r) * esz,
+                      s.GetData() + static_cast<size_t>(src_row(r)) * esz, esz);
+          if (!FlatVector::Validity(s).RowIsValid(src_row(r))) { dmask.SetInvalid(r); }
+        }
+      }
+    }
+    chunk.SetCardinality(n);
+    out->AddChunk(chunk);
+  }
+  if (merge_phase_time) {
+    const auto mp2 = std::chrono::steady_clock::now();
+    std::fprintf(stderr, "[merge-split] phase1_kway=%.2fms phase2_gather=%.2fms\n",
+                 std::chrono::duration<double, std::milli>(mp1 - mp0).count(),
+                 std::chrono::duration<double, std::milli>(mp2 - mp1).count());
+  }
+  return out;
+}
+
+}  // namespace
+
 unique_ptr<QueryResult> GPUPhysicalMaterializedCollector::GetResult(GlobalSinkState& state)
 {
   auto& gstate = state.Cast<GPUMaterializedCollectorGlobalState>();
   if (!gstate.context)
     throw InvalidInputException("No context set in GPUMaterializedCollectorState");
   auto prop = gstate.context->GetClientProperties();
+
+  // Multi-GPU ORDER BY / TOP_N: each worker sorted only its own (disjoint)
+  // partition, so a plain concatenation of the per-GPU runs is not globally
+  // ordered. k-way-merge the per-GPU sorted runs by the query's order keys
+  // (and apply the global offset+limit for TOP_N). Only reached when the
+  // subtree is partitioned; all-replicated plans already fell back in Sink.
+  if (GPUBufferManager::GetMaxGpus() > 1 &&
+      (plan.type == PhysicalOperatorType::ORDER_BY || plan.type == PhysicalOperatorType::TOP_N)) {
+    vector<GPUResultCollection*> runs;
+    for (int g = 0; g < GPUBufferManager::GetMaxGpus(); ++g) {
+      if (!per_gpu_state[g]) continue;
+      auto& rstate = static_cast<ResultCollectorRuntimeState&>(*per_gpu_state[g]);
+      if (rstate.result_collection && rstate.result_collection->write_idx > 0) {
+        runs.push_back(rstate.result_collection.get());
+      }
+    }
+    // A single non-empty ORDER_BY run is already globally sorted (either only
+    // one GPU produced rows, or the ORDER operator's cross-GPU cudf::merge
+    // collapsed everything onto one GPU) — fall through to plain concatenation.
+    // TOP_N always takes the merge path: its per-GPU GetData emits the FULL
+    // retained run, so the global offset+limit still must be applied here even
+    // for a single run (cheap: TOP_N runs are ≤ limit+offset rows).
+    if (runs.size() > 1 || plan.type == PhysicalOperatorType::TOP_N) {
+      // Resolve the order keys to OUTPUT-column indices + direction.
+      vector<MergeKey> merge_keys;
+      bool             has_limit = false;
+      idx_t            limit = 0, offset = 0;
+      const vector<BoundOrderByNode>* orders = nullptr;
+      const vector<idx_t>*            projections = nullptr;
+      if (plan.type == PhysicalOperatorType::TOP_N) {
+        auto& op    = plan.Cast<GPUPhysicalTopN>();
+        orders      = &op.orders;
+        has_limit   = true;
+        limit       = op.limit;
+        offset      = op.offset;
+      } else {
+        auto& op    = plan.Cast<GPUPhysicalOrder>();
+        orders      = &op.orders;
+        projections = &op.projections;
+      }
+      for (auto& ord : *orders) {
+        if (ord.expression->GetExpressionClass() != ExpressionClass::BOUND_REF) {
+          throw NotImplementedException(
+            "Multi-GPU ORDER BY only supports column references as sort keys");
+        }
+        const idx_t in_idx = ord.expression->Cast<BoundReferenceExpression>().index;
+        int         out_col = -1;
+        if (projections) {
+          // ORDER BY: output column j reads input column projections[j].
+          for (size_t j = 0; j < projections->size(); ++j) {
+            if ((*projections)[j] == in_idx) { out_col = static_cast<int>(j); break; }
+          }
+        } else {
+          // TOP_N: output columns are the input columns 1:1.
+          out_col = static_cast<int>(in_idx);
+        }
+        if (out_col < 0 || out_col >= static_cast<int>(types.size())) {
+          throw NotImplementedException(
+            "Multi-GPU ORDER BY key is not among the output columns (unsupported)");
+        }
+        merge_keys.push_back({out_col,
+                              ord.type != OrderType::DESCENDING,
+                              ord.null_order == OrderByNullType::NULLS_FIRST});
+      }
+
+      const auto mt0 = std::chrono::high_resolution_clock::now();
+      auto merged = MergeSortedRuns(runs, types, merge_keys, has_limit, limit, offset);
+      if (std::getenv("MAGI_PHASE_TIME") != nullptr) {
+        size_t in_rows = 0;
+        for (auto* r : runs) { in_rows += r->size(); }
+        std::fprintf(stderr, "[orderby-merge] runs=%zu in_rows=%zu out_rows=%zu merge=%.2fms\n",
+                     runs.size(), in_rows, merged->size(),
+                     std::chrono::duration<double, std::milli>(
+                       std::chrono::high_resolution_clock::now() - mt0)
+                       .count());
+      }
+      for (int g = 0; g < GPUBufferManager::GetMaxGpus(); ++g) {
+        if (!per_gpu_state[g]) continue;
+        static_cast<ResultCollectorRuntimeState&>(*per_gpu_state[g]).result_collection.reset();
+      }
+      return make_uniq<GPUQueryResult>(
+        statement_type, properties, names, types, prop, std::move(merged));
+    }
+  }
 
   // Concatenate the per-GPU result_collections (in GPU id order) into one
   // combined collection that GPUQueryResult will hand out chunk-by-chunk.
