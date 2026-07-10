@@ -883,6 +883,32 @@ void Run(int                                gpu_id,
          int                                num_aggregates,
          sirius::AggregationType*           agg_mode)
 {
+  // ── Widen narrow SUM/AVG inputs up front ────────────────────────────────
+  // SUM over INT32 (e.g. Q12's `CASE WHEN .. THEN 1 ELSE 0`) has no device
+  // path; widening to INT64 here lets every type-driven stage downstream
+  // (input routing, ops table, emit) take the existing INT64 path. DuckDB's
+  // sum(int) result is HUGEINT and the collector already converts our INT64
+  // output to INT128, so the logical types line up.
+  for (int a = 0; a < num_aggregates; ++a) {
+    if (agg_mode[a] != sirius::AggregationType::SUM &&
+        agg_mode[a] != sirius::AggregationType::AVERAGE) {
+      continue;
+    }
+    auto& col = aggregate_keys[a];
+    if (!col || col->data_wrapper.type.id() != GPUColumnTypeId::INT32) { continue; }
+    const size_t n   = col->column_length;
+    uint8_t*     wide = nullptr;
+    if (col->data_wrapper.data != nullptr && n > 0) {
+      wide = GPUBufferManager::GetInstance().customCudaMalloc<uint8_t>(
+        n * sizeof(int64_t), gpu_id, 0);
+      convertInt32ToInt64(col->data_wrapper.data, wide, n);
+    }
+    auto widened = make_shared_ptr<GPUColumn>(
+      n, GPUColumnType(GPUColumnTypeId::INT64), wide, col->data_wrapper.validity_mask);
+    widened->row_id_count = 0;
+    col = widened;
+  }
+
   // ── Generic path (table-driven; handles all supported GROUP BY shapes) ──
   magi_generic::KeyKind                 key_kind;
   std::vector<magi_ops::KeyFieldEntry>  key_fields;

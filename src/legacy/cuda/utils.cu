@@ -116,6 +116,13 @@ __global__ void subtract_to_each(T* data, T delta, size_t count)
   if (idx < count) { data[idx] -= delta; }
 }
 
+template <typename T>
+__global__ void add_to_each(T* data, T delta, size_t count)
+{
+  size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < count) { data[idx] += delta; }
+}
+
 __global__ void reorder_row_ids(int64_t* in_row_ids, uint64_t* out_indices, size_t count)
 {
   size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -198,6 +205,17 @@ void subtractToEach(T* data, T delta, size_t count)
   cudaDeviceSynchronize();
 }
 
+// Rebase a VARCHAR offsets segment when concatenating string partitions (the
+// symmetric op of subtractToEach). Caller synchronizes.
+template <typename T>
+void addToEach(T* data, T delta, size_t count)
+{
+  size_t threads_per_block = 256;
+  size_t blocks            = (count + threads_per_block - 1) / threads_per_block;
+
+  add_to_each<uint64_t><<<blocks, threads_per_block>>>(data, delta, count);
+}
+
 template <typename T>
 void callCubPrefixSum(
   T* in, T* out, size_t count, bool inclusive, cudaStream_t stream, CubPrefixSumAllocFunc allocator)
@@ -223,6 +241,8 @@ void reorderRowIds(int64_t* in_row_ids, uint64_t* out_indices, size_t count)
 }
 
 template void subtractToEach<uint64_t>(uint64_t* data, uint64_t delta, size_t count);
+
+template void addToEach<uint64_t>(uint64_t* data, uint64_t delta, size_t count);
 
 template void callCubPrefixSum<uint64_t>(uint64_t* in,
                                          uint64_t* out,

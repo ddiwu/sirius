@@ -32,6 +32,9 @@ void createRowIdColumn(uint8_t* data, size_t count);
 template <typename T>
 void subtractToEach(T* data, T delta, size_t count);
 
+template <typename T>
+void addToEach(T* data, T delta, size_t count);
+
 using CubPrefixSumAllocFunc = std::function<void*(size_t)>;
 template <typename T>
 void callCubPrefixSum(T* in,

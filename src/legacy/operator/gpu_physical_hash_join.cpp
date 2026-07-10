@@ -71,14 +71,13 @@ static shared_ptr<GPUColumn> AllgatherProbeColumn(const shared_ptr<GPUColumn>& c
   // exchange only picks this path after verifying every partition's mask is
   // ALL-VALID (MaskAllValid) — so the mask carries no information and the
   // gathered output is emitted dense (mask dropped).
-  if (col->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR) {
-    throw NotImplementedException(
-      "broadcast-probe join: VARCHAR probe column not supported yet");
-  }
+  const bool is_varchar = col->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR;
 
   struct Slot {
-    const uint8_t* ptr;
-    uint64_t       rows;
+    const uint8_t*  ptr;
+    const uint64_t* offs;   // VARCHAR only: offsets array (rows+1, 0-based)
+    uint64_t        rows;
+    uint64_t        bytes;  // VARCHAR only: chars blob size
   };
   static std::array<Slot, 8>            slots;
   static std::unique_ptr<std::barrier<>> bar;
@@ -89,24 +88,55 @@ static shared_ptr<GPUColumn> AllgatherProbeColumn(const shared_ptr<GPUColumn>& c
   // Our own materialization kernels must have landed before peers read the
   // buffer (same coherence rule as the magi runtimes).
   cudaDeviceSynchronize();
-  slots[g] = {col->data_wrapper.data, col->column_length};
+  slots[g] = {col->data_wrapper.data, col->data_wrapper.offset, col->column_length,
+              col->data_wrapper.num_bytes};
   bar->arrive_and_wait();  // every partition published
 
   uint64_t total = 0;
   for (int i = 0; i < num_gpus; ++i) { total += slots[i].rows; }
-  const size_t esz = col->data_wrapper.getColumnTypeSize();
-  uint8_t*     dst = gpuBufferManager->customCudaMalloc<uint8_t>(total * esz, g, 0);
-  uint64_t     off = 0;
-  for (int i = 0; i < num_gpus; ++i) {
-    if (slots[i].rows > 0) {
-      // UVA resolves the source device; goes over NVLink when P2P is enabled.
-      cudaMemcpy(dst + off * esz, slots[i].ptr, slots[i].rows * esz, cudaMemcpyDeviceToDevice);
+
+  shared_ptr<GPUColumn> out;
+  if (is_varchar) {
+    // Concatenate chars blobs; copy each partition's offsets segment and
+    // rebase it by the cumulative char count (partition offsets are 0-based
+    // after materialization).
+    uint64_t total_bytes = 0;
+    for (int i = 0; i < num_gpus; ++i) { total_bytes += slots[i].bytes; }
+    uint8_t* chars = gpuBufferManager->customCudaMalloc<uint8_t>(
+      total_bytes > 0 ? total_bytes : 1, g, 0);
+    uint64_t* offs = gpuBufferManager->customCudaMalloc<uint64_t>(total + 1, g, 0);
+    uint64_t row_off = 0, char_off = 0;
+    for (int i = 0; i < num_gpus; ++i) {
+      if (slots[i].rows > 0) {
+        if (slots[i].bytes > 0) {
+          cudaMemcpy(chars + char_off, slots[i].ptr, slots[i].bytes,
+                     cudaMemcpyDeviceToDevice);
+        }
+        cudaMemcpy(offs + row_off, slots[i].offs, slots[i].rows * sizeof(uint64_t),
+                   cudaMemcpyDeviceToDevice);
+        if (char_off > 0) { addToEach<uint64_t>(offs + row_off, char_off, slots[i].rows); }
+        row_off += slots[i].rows;
+        char_off += slots[i].bytes;
+      }
     }
-    off += slots[i].rows;
+    cudaMemcpy(offs + total, &char_off, sizeof(uint64_t), cudaMemcpyHostToDevice);
+    out = make_shared_ptr<GPUColumn>(
+      total, col->data_wrapper.type, chars, offs, total_bytes, true, nullptr);
+  } else {
+    const size_t esz = col->data_wrapper.getColumnTypeSize();
+    uint8_t*     dst = gpuBufferManager->customCudaMalloc<uint8_t>(total * esz, g, 0);
+    uint64_t     off = 0;
+    for (int i = 0; i < num_gpus; ++i) {
+      if (slots[i].rows > 0) {
+        // UVA resolves the source device; goes over NVLink when P2P is enabled.
+        cudaMemcpy(dst + off * esz, slots[i].ptr, slots[i].rows * esz,
+                   cudaMemcpyDeviceToDevice);
+      }
+      off += slots[i].rows;
+    }
+    out = make_shared_ptr<GPUColumn>(total, col->data_wrapper.type, dst, nullptr);
   }
   bar->arrive_and_wait();  // all copies done before the slots are reused
-
-  auto out = make_shared_ptr<GPUColumn>(total, col->data_wrapper.type, dst, nullptr);
   return out;
 }
 
@@ -160,13 +190,20 @@ static BcastStrategy PickBcastStrategy(uint64_t probe_total,
                                        uint64_t probe_row_bytes,
                                        uint64_t build_row_bytes)
 {
+  // PROJECT RULE: broadcast is ONLY for a genuinely SMALL side. It moves
+  // rows*(N-1)*width bytes AND duplicates that side's join work on every GPU,
+  // so a join whose both sides are tens of millions of rows must shuffle.
+  // The caps bound the broadcast side in absolute terms; the bytes/ratio
+  // rules below additionally keep it small RELATIVE to the other side.
+  // TPC-H SF50 reference: Q14 probe 3.7M, Q3 builds 1.5M/7.3M, Q12 build
+  // 1.6M — all far under the cap.
   static const uint64_t probe_max = [] {
     const char* e = std::getenv("MAGI_BCAST_PROBE_MAX");
-    return e ? std::strtoull(e, nullptr, 10) : uint64_t(64'000'000);
+    return e ? std::strtoull(e, nullptr, 10) : uint64_t(16'000'000);
   }();
   static const uint64_t build_max = [] {
     const char* e = std::getenv("MAGI_BCAST_BUILD_MAX");
-    return e ? std::strtoull(e, nullptr, 10) : uint64_t(32'000'000);
+    return e ? std::strtoull(e, nullptr, 10) : uint64_t(16'000'000);
   }();
   const bool probe_fits = probe_total > 0 && probe_total <= probe_max && build_total > 0;
   const bool build_fits = build_total > 0 && build_total <= build_max && probe_total > 0;
@@ -825,14 +862,14 @@ OperatorResultType GPUPhysicalHashJoin::Execute(GPUIntermediateRelation& input_r
       // partitions, so it must be exchanged, not decided locally).
       bool eligible = true;
       for (auto& pk : probe_key) {
-        if (pk->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR || !MaskAllValid(pk)) {
+        if (!MaskAllValid(pk)) {
           eligible = false;
         }
       }
       bcast_lhs_dense.reserve(lhs_output_columns.col_idxs.size());
       for (auto lhs_idx : lhs_output_columns.col_idxs) {
         auto dense = HandleMaterializeExpression(input_relation.columns[lhs_idx], gpuBufferManager);
-        if (dense->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR || !MaskAllValid(dense)) {
+        if (!MaskAllValid(dense)) {
           eligible = false;
         }
         bcast_lhs_dense.push_back(std::move(dense));
@@ -849,7 +886,7 @@ OperatorResultType GPUPhysicalHashJoin::Execute(GPUIntermediateRelation& input_r
       // densify them here — they must be gathered anyway if we broadcast.
       bool eligible = true;
       for (auto& bk : rstate.materialized_build_key->columns) {
-        if (bk->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR || !MaskAllValid(bk)) {
+        if (!MaskAllValid(bk)) {
           eligible = false;
         }
       }
@@ -857,7 +894,7 @@ OperatorResultType GPUPhysicalHashJoin::Execute(GPUIntermediateRelation& input_r
       for (idx_t i = conditions.size(); i < rstate.hash_table_result->columns.size(); i++) {
         auto dense = HandleMaterializeExpression(rstate.hash_table_result->columns[i],
                                                  gpuBufferManager);
-        if (dense->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR || !MaskAllValid(dense)) {
+        if (!MaskAllValid(dense)) {
           eligible = false;
         }
         bcast_build_dense.push_back(std::move(dense));
