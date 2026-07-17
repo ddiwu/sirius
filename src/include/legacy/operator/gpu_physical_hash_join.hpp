@@ -127,6 +127,15 @@ void scanHashTableRight(unsigned long long* ht,
                         int join_mode,
                         int num_keys);
 
+// Multi-GPU RIGHT_SEMI/RIGHT_ANTI flag-merge helpers (hash_join_right.cu):
+// convert per-GPU slot marks into a build-ROW-ID-indexed flags array (row-id
+// space is identical across GPUs; slot layout is not), OR-merge across GPUs,
+// then emit a disjoint row-id range per GPU.
+void scanHTMatchedToFlags(unsigned long long* ht, uint64_t ht_len, int num_keys, uint8_t* flags);
+void orFlagsInPlace(uint8_t* dst, const uint8_t* src, uint64_t n);
+void selectFlaggedRange(const uint8_t* flags, uint64_t lo, uint64_t hi, bool want_set,
+                        uint64_t*& row_ids, uint64_t*& count);
+
 //! Per-GPU runtime state for the hash join. Under the parallel multi-GPU
 //! executor every worker thread runs Sink/Execute/GetData on the shared
 //! operator instance; everything an execution mutates lives here, indexed by
@@ -171,6 +180,15 @@ struct HashJoinRuntimeState : OpRuntimeState {
   //! Build-side (RHS) output columns, materialized in Sink and carried through
   //! the shuffle as build payload so Execute can emit them (e.g. Q11's s_nationkey).
   shared_ptr<GPUIntermediateRelation> shuffle_build_payload;
+  //! Multi-GPU SEMI/ANTI/RIGHT_SEMI/RIGHT_ANTI: Sink replicated the build on
+  //! every GPU (allgather unless the cache already replicated it) and the
+  //! single-GPU build/probe runs unchanged. SEMI/ANTI emit LOCAL probe rows
+  //! (naturally partitioned); RIGHT_SEMI/RIGHT_ANTI merge match flags across
+  //! GPUs in GetData and emit disjoint build-row ranges.
+  bool semi_bcast                    = false;
+  //! Total (gathered) build rows — the flags array length and the row-id
+  //! range that is split across GPUs at emission.
+  uint64_t semi_build_total          = 0;
 };
 
 class GPUPhysicalHashJoin : public GPUPhysicalOperator {
@@ -233,6 +251,13 @@ class GPUPhysicalHashJoin : public GPUPhysicalOperator {
 
   //! Join Keys statistics (optional)
   vector<unique_ptr<BaseStatistics>> join_stats;
+
+  //! Set on the join-back node fabricated by the eager-aggregation rewrite
+  //! (TryEagerAggRewrite): after the probe, verify that the global output row
+  //! count equals the global aggregate (build-side) row count. The rewrite is
+  //! exact iff the probe-side key is unique among matches; a mismatch throws
+  //! so the query falls back to DuckDB instead of duplicating groups.
+  bool eager_agg_verify = false;
 
  protected:
   // Source interface

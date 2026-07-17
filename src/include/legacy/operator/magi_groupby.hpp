@@ -41,8 +41,13 @@ void Run(int                                gpu_id,
 
 // True iff this per-GPU slice is high-cardinality (would route magi to XLARGE).
 // The operator runs a cudf local groupby first for these, then calls Run() on the
-// reduced partials with re-aggregation agg modes (COUNT*->SUM, etc.).
-bool ShouldCudfPreAgg(const vector<shared_ptr<GPUColumn>>& keys, int n_keys);
+// reduced partials with re-aggregation agg modes (COUNT*->SUM, etc.). Also fires
+// for large inputs headed to the WIDE path (DeriveKeyShape miss or a VARCHAR key
+// exceeding its prefix budget): the 320B-slot machinery costs O(input rows) at
+// random-access bandwidth, so collapse duplicates locally first. May launch a
+// max-strlen probe and rendezvous across workers — call exactly once per grouped
+// aggregate on every worker.
+bool ShouldCudfPreAgg(int gpu_id, vector<shared_ptr<GPUColumn>>& keys, int n_keys);
 
 }  // namespace magi_groupby
 }  // namespace duckdb

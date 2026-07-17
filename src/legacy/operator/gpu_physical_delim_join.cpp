@@ -121,6 +121,10 @@ SinkResultType GPUPhysicalRightDelimJoin::Sink(GPUIntermediateRelation& input_re
   // input.interrupt_state}; distinct->Sink(context, input_relation, distinct_sink_input);
   SIRIUS_LOG_DEBUG("Sinking input relation to distinct group by");
   distinct->Sink(input_relation);
+  // The distinct groupby is driven INTERNALLY (not a scheduled pipeline
+  // sink), so the executor's finalize-point pass can't see it — finalize
+  // here. The delim Sink runs once per worker, so this stays aligned.
+  distinct->FinalizeSink();
 
   return SinkResultType::FINISHED;
 }
@@ -143,6 +147,9 @@ SinkResultType GPUPhysicalLeftDelimJoin::Sink(GPUIntermediateRelation& input_rel
   }
 
   distinct->Sink(input_relation);
+  // Internally-driven distinct (not a scheduled pipeline sink) — finalize
+  // here; the delim Sink runs once per worker, so this stays aligned.
+  distinct->FinalizeSink();
   return SinkResultType::FINISHED;
 }
 

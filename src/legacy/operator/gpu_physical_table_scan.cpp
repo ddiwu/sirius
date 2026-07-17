@@ -1226,6 +1226,27 @@ bool SubtreeAllReplicated(const GPUPhysicalOperator& op)
   return true;
 }
 
+// Semantic variant for JOIN-side placement decisions: is this subtree's
+// OUTPUT identical on every GPU? Extends SubtreeAllReplicated with operators
+// that MAKE their output replicated regardless of input partitioning: an
+// interior UNGROUPED_AGGREGATE cross-GPU-merges its partials (e.g. Q15's
+// max-of-revenue0 subquery), so every GPU holds the same global row(s)
+// afterwards. Treating such a build side as partitioned and allgathering it
+// concatenates N identical copies → every probe match duplicates ×N. Do NOT
+// use this for the result collector's root check — a ROOT ungrouped
+// aggregate's partials are merged by the collector itself, not in-plan.
+bool SubtreeOutputReplicated(const GPUPhysicalOperator& op)
+{
+  if (op.type == PhysicalOperatorType::UNGROUPED_AGGREGATE) { return true; }
+  if (op.type == PhysicalOperatorType::TABLE_SCAN) { return SubtreeAllReplicated(op); }
+  auto children = op.GetChildren();
+  if (children.empty()) { return false; }
+  for (auto& child : children) {
+    if (!SubtreeOutputReplicated(child.get())) { return false; }
+  }
+  return true;
+}
+
 // DuckDB's optimizer folds `date_col < DATE 'x' + INTERVAL ...` into
 // `CAST(date_col AS TIMESTAMP) <op> TIMESTAMP_CONST` and pushes it down as an
 // EXPRESSION_FILTER, which knocked the whole scan off the fused constant-

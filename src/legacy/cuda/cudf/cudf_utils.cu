@@ -88,7 +88,13 @@ cudf::bitmask_type* createNullMask(size_t size, cudf::mask_state state)
   GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
   size_t mask_bytes                  = getMaskBytesSize(size);
   uint8_t* mask = gpuBufferManager->customCudaMalloc<uint8_t>(mask_bytes, 0, 0);
-  if (state == cudf::mask_state::ALL_VALID) { cudaMemset(mask, 0xFF, mask_bytes); }
+  if (state == cudf::mask_state::ALL_VALID) {
+    cudaMemset(mask, 0xFF, mask_bytes);
+  } else if (state == cudf::mask_state::ALL_NULL) {
+    // Previously left UNINITIALIZED (garbage bits — random rows counted as
+    // valid); an all-zero mask is what ALL_NULL means.
+    cudaMemset(mask, 0x00, mask_bytes);
+  }
   return reinterpret_cast<cudf::bitmask_type*>(mask);
 }
 

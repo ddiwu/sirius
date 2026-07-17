@@ -152,6 +152,15 @@ SinkResultType GPUPhysicalUngroupedAggregate::Sink(GPUIntermediateRelation& inpu
       "Multi-GPU ungrouped aggregate over fully-replicated input (small tables only) is not "
       "supported; falling back to DuckDB");
   }
+  // Multi-batch guard: a RIGHT/OUTER join upstream sinks twice; this Sink
+  // still assumes one batch (the second would overwrite the first's partial).
+  // Fail loudly → DuckDB fallback until the stash/FinalizeSink treatment
+  // (see GPUPhysicalGroupedAggregate) is applied here.
+  if (++runtime_state<UngroupedAggregateRuntimeState>(sirius_current_gpu).sink_calls > 1) {
+    throw NotImplementedException(
+      "Multi-batch ungrouped aggregate (RIGHT/OUTER join upstream) is not supported yet; "
+      "falling back to DuckDB");
+  }
   vector<shared_ptr<GPUColumn>> aggregate_column(aggregates.size());
   for (int aggr_idx = 0; aggr_idx < aggregates.size(); aggr_idx++) {
     aggregate_column[aggr_idx] = nullptr;

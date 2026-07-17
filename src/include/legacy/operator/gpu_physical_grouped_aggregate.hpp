@@ -67,6 +67,14 @@ class ClientContext;
 // workers.
 struct GroupedAggregateRuntimeState : OpRuntimeState {
   shared_ptr<GPUIntermediateRelation> slice;
+  //! Materialized input batches accumulated across Sink calls. A RIGHT/OUTER
+  //! join upstream legally sinks TWICE (matched pairs from the probe pipeline
+  //! + NULL-padded unmatched rows from its unmatched-scan child pipeline);
+  //! the aggregation itself runs once in FinalizeSink over the union.
+  //! Layout per batch: [group cols..., agg cols...]; rows[] holds each
+  //! batch's logical row count (columns may be 0-length NULL placeholders).
+  vector<shared_ptr<GPUIntermediateRelation>> pending;
+  vector<uint64_t>                            pending_rows;
 };
 
 class GPUPhysicalGroupedAggregate : public GPUPhysicalOperator {
@@ -121,8 +129,11 @@ class GPUPhysicalGroupedAggregate : public GPUPhysicalOperator {
   OrderPreservationType SourceOrder() const override { return OrderPreservationType::NO_ORDER; }
 
  public:
-  // Sink interface
+  // Sink interface. Sink materializes and STASHES each input batch;
+  // FinalizeSink (once per worker, after the last sinking pipeline) runs the
+  // actual aggregation over the union — see GroupedAggregateRuntimeState.
   SinkResultType Sink(GPUIntermediateRelation& input_relation) const override;
+  void FinalizeSink() const override;
 
   // Sink interface
   bool IsSink() const override { return true; }
@@ -133,5 +144,11 @@ class GPUPhysicalGroupedAggregate : public GPUPhysicalOperator {
 
  private:
   static bool CheckGroupKeyTypesForSiriusImpl(const vector<shared_ptr<GPUColumn>>& columns);
+  //! The actual aggregation (cudf pre-agg decision + magi shuffle or the
+  //! distinct-only path) over already-materialized columns; fills the
+  //! per-worker slice. Extracted from the old single-batch Sink.
+  void RunAggregation(vector<shared_ptr<GPUColumn>>& group_by_column,
+                      vector<shared_ptr<GPUColumn>>& aggregate_column,
+                      uint64_t column_size) const;
 };
 }  // namespace duckdb

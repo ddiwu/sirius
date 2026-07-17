@@ -216,6 +216,17 @@ void addToEach(T* data, T delta, size_t count)
   add_to_each<uint64_t><<<blocks, threads_per_block>>>(data, delta, count);
 }
 
+// Stream variant: ordered after async copies issued on the same stream
+// (broadcast allgather pipelines). Caller synchronizes the stream.
+template <typename T>
+void addToEachAsync(T* data, T delta, size_t count, cudaStream_t stream)
+{
+  size_t threads_per_block = 256;
+  size_t blocks            = (count + threads_per_block - 1) / threads_per_block;
+
+  add_to_each<uint64_t><<<blocks, threads_per_block, 0, stream>>>(data, delta, count);
+}
+
 template <typename T>
 void callCubPrefixSum(
   T* in, T* out, size_t count, bool inclusive, cudaStream_t stream, CubPrefixSumAllocFunc allocator)
@@ -243,6 +254,9 @@ void reorderRowIds(int64_t* in_row_ids, uint64_t* out_indices, size_t count)
 template void subtractToEach<uint64_t>(uint64_t* data, uint64_t delta, size_t count);
 
 template void addToEach<uint64_t>(uint64_t* data, uint64_t delta, size_t count);
+
+template void addToEachAsync<uint64_t>(uint64_t* data, uint64_t delta, size_t count,
+                                       cudaStream_t stream);
 
 template void callCubPrefixSum<uint64_t>(uint64_t* in,
                                          uint64_t* out,

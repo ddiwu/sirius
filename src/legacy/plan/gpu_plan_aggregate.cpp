@@ -23,8 +23,13 @@
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
+#include "duckdb/planner/operator/logical_comparison_join.hpp"
+#include "duckdb/planner/operator/logical_projection.hpp"
+#include "duckdb/planner/expression_iterator.hpp"
 #include "gpu_physical_plan_generator.hpp"
+#include "log/logging.hpp"
 #include "operator/gpu_physical_grouped_aggregate.hpp"
+#include "operator/gpu_physical_hash_join.hpp"
 #include "operator/gpu_physical_projection.hpp"
 #include "operator/gpu_physical_table_scan.hpp"
 #include "operator/gpu_physical_ungrouped_aggregate.hpp"
@@ -300,9 +305,273 @@ static bool CanUsePerfectHashAggregate(ClientContext& context,
 //   return groupby;
 // }
 
+namespace {
+
+// Collect every BoundReferenceExpression under `expr` (including itself).
+void CollectBoundRefs(Expression& expr, vector<BoundReferenceExpression*>& out)
+{
+  if (expr.GetExpressionClass() == ExpressionClass::BOUND_REF) {
+    out.push_back(&expr.Cast<BoundReferenceExpression>());
+    return;
+  }
+  ExpressionIterator::EnumerateChildren(expr,
+                                        [&](Expression& child) { CollectBoundRefs(child, out); });
+}
+
+// Resolve a join-OUTPUT position to (side, child-output index), honouring the
+// join's projection maps (output layout = [left(map), right(map)]).
+bool JoinOutputToChild(const LogicalComparisonJoin& j, idx_t out_pos, int& side, idx_t& child_idx)
+{
+  const idx_t n_left_out =
+    j.left_projection_map.empty() ? j.children[0]->types.size() : j.left_projection_map.size();
+  if (out_pos < n_left_out) {
+    side      = 0;
+    child_idx = j.left_projection_map.empty() ? out_pos : j.left_projection_map[out_pos];
+    return true;
+  }
+  const idx_t rpos = out_pos - n_left_out;
+  const idx_t n_right_out =
+    j.right_projection_map.empty() ? j.children[1]->types.size() : j.right_projection_map.size();
+  if (rpos >= n_right_out) { return false; }
+  side      = 1;
+  child_idx = j.right_projection_map.empty() ? rpos : j.right_projection_map[rpos];
+  return true;
+}
+
+}  // namespace
+
+unique_ptr<GPUPhysicalOperator> GPUPhysicalPlanGenerator::TryEagerAggRewrite(LogicalAggregate& op)
+{
+  if (std::getenv("MAGI_NO_EAGER_AGG") != nullptr) { return nullptr; }
+  // Shape: AGG(groups g1..gn, aggs) ← PROJ ← T=JOIN(L, J=JOIN(P, S)); every
+  // group column from P, one group g* = P's equi-join key in J, every
+  // aggregate input from L. Rewrites to
+  //   PROJ' ← JOIN_back(P, AGG(group = S's key) ← PROJ ← T=JOIN(L, S)).
+  // Exact iff g* is unique within P (attribute columns are then functionally
+  // dependent on it) — verified at runtime by the join-back row-count check
+  // (mismatch throws → DuckDB CPU fallback), so a false positive here can
+  // never produce a wrong answer.
+  if (op.groups.size() < 2 || op.grouping_sets.size() > 1 || !op.grouping_functions.empty()) {
+    return nullptr;
+  }
+  if (op.expressions.empty()) { return nullptr; }
+  if (op.children.size() != 1 ||
+      op.children[0]->type != LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+    return nullptr;
+  }
+  auto& t = op.children[0]->Cast<LogicalComparisonJoin>();
+  if (t.join_type != JoinType::INNER || t.predicate) { return nullptr; }
+  // v1 scope: the group-supplying join J sits on T's RHS (build side).
+  if (t.children[1]->type != LogicalOperatorType::LOGICAL_COMPARISON_JOIN) { return nullptr; }
+  auto& j = t.children[1]->Cast<LogicalComparisonJoin>();
+  if (j.type != LogicalOperatorType::LOGICAL_COMPARISON_JOIN || j.join_type != JoinType::INNER ||
+      j.conditions.size() != 1 || j.predicate) {
+    return nullptr;
+  }
+  auto& jcond = j.conditions[0];
+  if (jcond.comparison != ExpressionType::COMPARE_EQUAL ||
+      jcond.left->GetExpressionClass() != ExpressionClass::BOUND_REF ||
+      jcond.right->GetExpressionClass() != ExpressionClass::BOUND_REF) {
+    return nullptr;
+  }
+  const idx_t n_t_left_out =
+    t.left_projection_map.empty() ? t.children[0]->types.size() : t.left_projection_map.size();
+
+  // Try P = each side of J; S = the other. S must carry T's join key(s).
+  for (int p_side = 0; p_side < 2; ++p_side) {
+    const int s_side = 1 - p_side;
+    auto& p_key_ref =
+      (p_side == 0 ? jcond.left : jcond.right)->Cast<BoundReferenceExpression>();
+    auto& s_key_ref =
+      (p_side == 0 ? jcond.right : jcond.left)->Cast<BoundReferenceExpression>();
+    const auto key_id = s_key_ref.return_type.id();
+    if (key_id != LogicalTypeId::INTEGER && key_id != LogicalTypeId::BIGINT) { continue; }
+
+    // Every T condition's RHS must resolve into S (survives J's removal).
+    bool t_conds_ok = true;
+    for (auto& tc : t.conditions) {
+      vector<BoundReferenceExpression*> refs;
+      CollectBoundRefs(*tc.right, refs);
+      for (auto* r : refs) {
+        int side; idx_t cidx;
+        if (!JoinOutputToChild(j, r->index, side, cidx) || side != s_side) {
+          t_conds_ok = false;
+          break;
+        }
+      }
+      if (!t_conds_ok) { break; }
+    }
+    if (!t_conds_ok) { continue; }
+
+    // Trace all groups (plain column refs into T's output) to P columns; one
+    // must be P's join key.
+    vector<idx_t> group_p_idx(op.groups.size());
+    bool groups_ok  = true;
+    bool found_gkey = false;
+    for (idx_t gi = 0; gi < op.groups.size(); ++gi) {
+      if (op.groups[gi]->GetExpressionClass() != ExpressionClass::BOUND_REF) {
+        groups_ok = false;
+        break;
+      }
+      const idx_t t_pos = op.groups[gi]->Cast<BoundReferenceExpression>().index;
+      if (t_pos < n_t_left_out) { groups_ok = false; break; }   // group from L side
+      // T's RHS output position → J output position (T's right map).
+      idx_t j_out = t_pos - n_t_left_out;
+      if (!t.right_projection_map.empty()) {
+        if (j_out >= t.right_projection_map.size()) { groups_ok = false; break; }
+        j_out = t.right_projection_map[j_out];
+      }
+      int side; idx_t cidx;
+      if (!JoinOutputToChild(j, j_out, side, cidx) || side != p_side) {
+        groups_ok = false;
+        break;
+      }
+      group_p_idx[gi] = cidx;
+      if (cidx == p_key_ref.index &&
+          op.groups[gi]->return_type == p_key_ref.return_type) {
+        found_gkey = true;
+      }
+    }
+    if (!groups_ok || !found_gkey) { continue; }
+
+    // Aggregate inputs (arbitrary expressions, e.g. l_ext*(1-l_disc)) must
+    // reference only T's L side; no filters.
+    bool aggs_ok = true;
+    for (auto& aexpr : op.expressions) {
+      auto& agg = aexpr->Cast<BoundAggregateExpression>();
+      if (agg.filter) { aggs_ok = false; break; }
+      for (auto& child : agg.children) {
+        vector<BoundReferenceExpression*> refs;
+        CollectBoundRefs(*child, refs);
+        for (auto* r : refs) {
+          if (r->index >= n_t_left_out) { aggs_ok = false; break; }
+        }
+        if (!aggs_ok) { break; }
+      }
+      if (!aggs_ok) { break; }
+    }
+    if (!aggs_ok) { continue; }
+
+    // ── Pattern matched: mutate the tree ──────────────────────────────────
+    SIRIUS_LOG_DEBUG("eager-agg rewrite fires: {} groups -> 1 narrow key", op.groups.size());
+    const idx_t pk = p_key_ref.index;
+    const idx_t sk = s_key_ref.index;
+    const auto  p_key_type = p_key_ref.return_type;
+    const auto  s_key_type = s_key_ref.return_type;
+
+    // T's RHS condition refs indexed J's output; remap them to S's output
+    // (must happen while J's children are still attached).
+    for (auto& tc : t.conditions) {
+      vector<BoundReferenceExpression*> refs;
+      CollectBoundRefs(*tc.right, refs);
+      for (auto* r : refs) {
+        int side; idx_t cidx;
+        JoinOutputToChild(j, r->index, side, cidx);   // verified side == s_side above
+        r->index = cidx;
+      }
+    }
+    auto j_owned = std::move(t.children[1]);
+    auto& j2     = j_owned->Cast<LogicalComparisonJoin>();
+    auto p_tree  = std::move(j2.children[p_side]);
+    auto s_tree  = std::move(j2.children[s_side]);
+    const idx_t n_p = p_tree->types.size();
+    t.children[1] = std::move(s_tree);
+    // T now outputs all of S (drop the stale RHS map — late materialization
+    // keeps unreferenced columns free). L-side positions are unchanged, so
+    // the aggregate input expressions stay valid as-is.
+    t.right_projection_map.clear();
+
+    // Narrow aggregate directly over the rewired T, grouped by S's key.
+    auto new_agg = make_uniq<LogicalAggregate>(op.group_index, op.aggregate_index,
+                                               std::move(op.expressions));
+    new_agg->groupings_index = op.groupings_index;
+    new_agg->groups.push_back(make_uniq<BoundReferenceExpression>(s_key_type, n_t_left_out + sk));
+    GroupingSet gs;
+    gs.insert(0);
+    new_agg->grouping_sets.push_back(std::move(gs));
+    new_agg->distinct_validity = op.distinct_validity;
+    const idx_t n_aggs         = new_agg->expressions.size();
+    vector<LogicalType> agg_out_types;
+    for (auto& e : new_agg->expressions) { agg_out_types.push_back(e->return_type); }
+    new_agg->children.push_back(std::move(op.children[0]));
+
+    // Join P back above the aggregate: probe = P (attributes stay local),
+    // build = the narrow aggregate (broadcast-eligible at runtime).
+    auto join_back = make_uniq<LogicalComparisonJoin>(JoinType::INNER);
+    JoinCondition jb;
+    jb.left       = make_uniq<BoundReferenceExpression>(p_key_type, pk);
+    jb.right      = make_uniq<BoundReferenceExpression>(s_key_type, 0);
+    jb.comparison = ExpressionType::COMPARE_EQUAL;
+    join_back->conditions.push_back(std::move(jb));
+    join_back->children.push_back(std::move(p_tree));
+    join_back->children.push_back(std::move(new_agg));
+
+    // Restore the original aggregate's output layout [groups..., aggs...].
+    vector<unique_ptr<Expression>> final_exprs;
+    for (idx_t gi = 0; gi < group_p_idx.size(); ++gi) {
+      final_exprs.push_back(
+        make_uniq<BoundReferenceExpression>(op.groups[gi]->return_type, group_p_idx[gi]));
+    }
+    for (idx_t a = 0; a < n_aggs; ++a) {
+      final_exprs.push_back(make_uniq<BoundReferenceExpression>(agg_out_types[a], n_p + 1 + a));
+    }
+    auto final_proj = make_uniq<LogicalProjection>(op.group_index, std::move(final_exprs));
+    final_proj->children.push_back(std::move(join_back));
+    final_proj->ResolveOperatorTypes();
+
+    auto gpu = CreatePlan(*final_proj);
+    // Flag the join-back for the runtime row-count verification (see
+    // GPUPhysicalHashJoin::eager_agg_verify). CreatePlan may omit the final
+    // projection, so search the top of the returned tree.
+    GPUPhysicalOperator* node = gpu.get();
+    while (node != nullptr && node->type != PhysicalOperatorType::HASH_JOIN &&
+           !node->children.empty()) {
+      node = node->children[0].get();
+    }
+    if (node != nullptr && node->type == PhysicalOperatorType::HASH_JOIN) {
+      node->Cast<GPUPhysicalHashJoin>().eager_agg_verify = true;
+    }
+    return gpu;
+  }
+  return nullptr;
+}
+
 unique_ptr<GPUPhysicalOperator> GPUPhysicalPlanGenerator::CreatePlan(LogicalAggregate& op)
 {
   D_ASSERT(op.children.size() == 1);
+
+  const bool dump_logical = std::getenv("MAGI_DUMP_LOGICAL") != nullptr;
+  if (dump_logical) {
+    fprintf(stderr, "[eager-agg-dump] ===== LogicalAggregate subtree =====\n%s\n",
+            op.ToString().c_str());
+    for (auto& g : op.groups) {
+      fprintf(stderr, "[eager-agg-dump] group: %s (type %s)\n", g->ToString().c_str(),
+              g->return_type.ToString().c_str());
+    }
+    for (auto& a : op.expressions) {
+      fprintf(stderr, "[eager-agg-dump] aggregate: %s\n", a->ToString().c_str());
+    }
+    const LogicalOperator* c = op.children[0].get();
+    while (c != nullptr) {
+      fprintf(stderr, "[eager-agg-dump] child: type=%s n_types=%zu\n",
+              LogicalOperatorToString(c->type).c_str(), c->types.size());
+      if (c->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+        auto& j = c->Cast<LogicalComparisonJoin>();
+        for (auto& cond : j.conditions) {
+          fprintf(stderr, "[eager-agg-dump]   cond: %s %s %s | L n_types=%zu R n_types=%zu\n",
+                  cond.left->ToString().c_str(),
+                  ExpressionTypeToString(cond.comparison).c_str(),
+                  cond.right->ToString().c_str(),
+                  j.children[0]->types.size(), j.children[1]->types.size());
+        }
+        break;
+      }
+      c = c->children.empty() ? nullptr : c->children[0].get();
+    }
+  }
+
+  auto rewritten = TryEagerAggRewrite(op);
+  if (rewritten) { return rewritten; }
 
   auto plan = CreatePlan(*op.children[0]);
 

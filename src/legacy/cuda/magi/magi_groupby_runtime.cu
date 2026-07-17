@@ -29,6 +29,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include <cuda_runtime.h>
@@ -43,7 +44,7 @@ namespace duckdb { namespace magi_generic {
 
 // ── Kernel-launch constants ──────────────────────────────────────────────
 constexpr int    BLOCK_SIZE      = 1024;
-constexpr int    MAX_AGG_OPS     = 16;  // ample for any TPC-H GROUP BY
+constexpr int    MAX_AGG_OPS     = 48;  // TPC-H aggs + wide-key inline key-blob KEEP ops
 constexpr int    MAX_KEY_FIELDS  = 8;   // 2-VARCHAR (Q1) or compound INT+VARCHAR
 
 // Tier sizes (N_SLOTS_SMALL/MEDIUM/LARGE/XLARGE) live in the public header so
@@ -70,6 +71,25 @@ constexpr int N_LOCAL_SLOTS    = N_SLOTS_SMALL;
 constexpr size_t AGG_BUF_BYTES =
     sizeof(magi_ops::AggSlot64<std::uint64_t, 128>) * MAX_TIER_SLOTS;
 
+// Wide-key (320B-slot) table sizes. Two tiers, both fitting the 2GB arena:
+//  - WIDE_M (2M slots, 640MB): picked when this GPU's input rows fit at ≤~60%
+//    load. Table init + compact scan cost is O(table bytes), so right-sizing
+//    matters: at Q10 scale (1.08M rows) the 6M tier spends 13ms/query just
+//    initializing 2×1.92GB of slots.
+//  - WIDE (6M slots, 1.92GB): everything bigger; ~4.6M groups per GPU at the
+//    0.77 load bound; overflow counter falls back to DuckDB beyond that.
+// Tier choice is PER-GPU LOCAL (by own n_filtered): GPUs may legally disagree —
+// the wire format depends only on SB (320B), and each GPU's stage/final tables
+// are private. Extreme skew (peer sends me far more groups than my own rows)
+// can overflow the small tier → overflow counter throws → CPU fallback, never
+// a wrong result.
+constexpr int N_SLOTS_WIDE   = 6 * 1024 * 1024;
+constexpr int N_SLOTS_WIDE_M = 2 * 1024 * 1024;
+static_assert((size_t)N_SLOTS_WIDE *
+                  sizeof(magi_ops::AggSlot64<unsigned __int128, 320>) <=
+              AGG_BUF_BYTES,
+              "wide-tier table must fit the AggSlot64 arena");
+
 // Convert TableSize → slot count.
 constexpr int slots_for(TableSize t) {
   switch (t) {
@@ -84,9 +104,11 @@ constexpr int slots_for(TableSize t) {
 }}  // namespace duckdb::magi_generic
 
 // ── Per-KeyT init kernel ──────────────────────────────────────────────────
-// `cudaMemset(agg, 0, …)` works for uint64 keys (empty_key_v<uint64_t> = 0)
-// but not for int32 keys (empty_key_v<int32_t> = -1). One small kernel
-// writes the correct empty-key sentinel into every slot at session start.
+// Writes the empty-key sentinel into every slot at session start. Only the
+// all-zero-sentinel kinds (__int128 hash keys) can use plain cudaMemset
+// instead (see the constexpr branch at the call site); int32/uint64 use
+// non-zero sentinels (INT32_MIN / all-ones — real key values of 0 or -1 must
+// not collide with "slot free", see empty_key_v) and need this kernel.
 // `n_slots` is the *active* tier's slot count — we only touch that prefix.
 namespace duckdb { namespace magi_generic {
 template <typename KeyT, int SB>
@@ -211,6 +233,9 @@ static std::byte*               g_stage_dev  [NUM_GPUS] = { nullptr };  // H (pr
 static magi_ops::AggOpEntry*    g_ops_dev    [NUM_GPUS] = { nullptr };
 static magi_ops::KeyFieldEntry* g_kfields_dev[NUM_GPUS] = { nullptr };
 static unsigned int*            g_overflow_dev[NUM_GPUS] = { nullptr };  // 1×u32: rows the hash had to drop
+// Overflow d_rows allocation (device_emit results too big for the arena);
+// owned by the runtime, freed lazily at the next run's entry.
+static AggResultRow*            g_rows_malloc[NUM_GPUS] = { nullptr };
 static std::mutex               g_init_mu;
 
 // MAGI_FORCE_GLOBAL=1 forces the two-kernel global-memory path even for the
@@ -308,19 +333,37 @@ static std::size_t run_per_gpu_typed_tier(int                        gpu_id,
   // Clear receiver global agg (writes empty_key_v<KeyT> per slot — a plain
   // memset to 0 would mis-mark int32 slots as "occupied" since
   // empty_key_v<int32_t> = -1). Only touch the prefix this tier uses.
-  auto* agg_typed_for_init =
-      reinterpret_cast<magi_ops::AggSlot64<KeyT, SB>*>(g_agg_dev[gpu_id]);
-  auto* stage_typed_for_init =
-      reinterpret_cast<magi_ops::AggSlot64<KeyT, SB>*>(g_stage_dev[gpu_id]);
-  constexpr int INIT_BLOCK = 256;
-  const     int init_grid  = (N_SLOTS + INIT_BLOCK - 1) / INIT_BLOCK;
-  init_global_agg_slots<KeyT, SB>
-      <<<init_grid, INIT_BLOCK, 0, magi_runtime::magi_stream(gpu_id)>>>(
-          agg_typed_for_init, N_SLOTS);
-  // Stage hash H (producer pre-agg) — same empty-key init.
-  init_global_agg_slots<KeyT, SB>
-      <<<init_grid, INIT_BLOCK, 0, magi_runtime::magi_stream(gpu_id)>>>(
-          stage_typed_for_init, N_SLOTS);
+  if constexpr (magi_ops::empty_key_v<KeyT> == KeyT{}) {
+    // empty key is all-zero bits (the __int128 hash kinds), so a zero-filled
+    // slot is bit-identical to what init_global_agg_slots writes (AggSlot64{}
+    // + empty key). cudaMemset saturates DRAM (~1.5TB/s) where the strided
+    // init kernel manages ~290GB/s — on the 320B wide tier (2 × 6M × 320B =
+    // 3.8GB) that is the difference between 13ms and ~1ms of per-query setup.
+    // int32/uint64 kinds use non-zero sentinels (see empty_key_v) and take
+    // the kernel below; their tables are 64/128B-slot tiers, far cheaper.
+    const size_t bytes = sizeof(magi_ops::AggSlot64<KeyT, SB>) * (size_t)N_SLOTS;
+    cudaMemsetAsync(g_agg_dev[gpu_id],   0, bytes, magi_runtime::magi_stream(gpu_id));
+    cudaMemsetAsync(g_stage_dev[gpu_id], 0, bytes, magi_runtime::magi_stream(gpu_id));
+  } else {
+    auto* agg_typed_for_init =
+        reinterpret_cast<magi_ops::AggSlot64<KeyT, SB>*>(g_agg_dev[gpu_id]);
+    auto* stage_typed_for_init =
+        reinterpret_cast<magi_ops::AggSlot64<KeyT, SB>*>(g_stage_dev[gpu_id]);
+    constexpr int INIT_BLOCK = 256;
+    const     int init_grid  = (N_SLOTS + INIT_BLOCK - 1) / INIT_BLOCK;
+    init_global_agg_slots<KeyT, SB>
+        <<<init_grid, INIT_BLOCK, 0, magi_runtime::magi_stream(gpu_id)>>>(
+            agg_typed_for_init, N_SLOTS);
+    // Stage hash H (producer pre-agg) — same empty-key init.
+    init_global_agg_slots<KeyT, SB>
+        <<<init_grid, INIT_BLOCK, 0, magi_runtime::magi_stream(gpu_id)>>>(
+            stage_typed_for_init, N_SLOTS);
+  }
+  auto pt_tI = pt_t0;
+  if (phase_time) {
+    cudaStreamSynchronize(magi_runtime::magi_stream(gpu_id));
+    pt_tI = pt_clock::now();
+  }
 
   // Push per-query tables: ops + key_fields.
   cudaMemcpyAsync(g_ops_dev[gpu_id],
@@ -340,6 +383,12 @@ static std::size_t run_per_gpu_typed_tier(int                        gpu_id,
   // for slots wider than one cell (128B). For 64B slots CELL_SIZE == sizeof,
   // so this is unchanged behaviour.
   magi_runtime::magi_set_tuple_size(gpu_id, magi::CELL_SIZE);
+  if (phase_time) {
+    cudaStreamSynchronize(magi_runtime::magi_stream(gpu_id));
+    cudaError_t e = cudaGetLastError();
+    std::fprintf(stderr, "[magi-dbg gpu=%d] init+upload: %s\n", gpu_id,
+                 cudaGetErrorString(e));
+  }
   auto pt_t1 = pt_clock::now();
 
   // Session bump (thread 0) + sync.
@@ -381,6 +430,7 @@ static std::size_t run_per_gpu_typed_tier(int                        gpu_id,
   //    two-kernel global-memory hashagg.
   // MAGI_FORCE_GLOBAL=1 forces the two-kernel path even for SMALL (A/B perf).
   bool used_single = false;
+  auto pt_tA       = pt_t4;
   if constexpr (sizeof(KeyT) <= 8 && N_SLOTS == N_SLOTS_SMALL) {
     if (!g_force_global) {
       used_single = true;
@@ -421,6 +471,13 @@ static std::size_t run_per_gpu_typed_tier(int                        gpu_id,
                                             stage_typed,
                                             /*just_load=*/false,
                                             g_overflow_dev[gpu_id]);
+    if (phase_time) {
+      cudaStreamSynchronize(magi_runtime::magi_stream(gpu_id));
+      pt_tA         = pt_clock::now();
+      cudaError_t e = cudaGetLastError();
+      std::fprintf(stderr, "[magi-dbg gpu=%d] stageA(global_preagg): %s\n", gpu_id,
+                   cudaGetErrorString(e));
+    }
     //   B: scan H -> shuffle to owners -> merge into final
     magi::shuffle_global_kernel<KeyT,
                                 KBUFFERING_INTRA_PARTITION_SIZE,
@@ -434,7 +491,19 @@ static std::size_t run_per_gpu_typed_tier(int                        gpu_id,
                                             /*just_load=*/false,
                                             g_overflow_dev[gpu_id]);
   }
+  {
+    cudaError_t e = cudaGetLastError();
+    if (phase_time)
+      std::fprintf(stderr, "[magi-dbg gpu=%d] post-launch: %s\n", gpu_id,
+                   cudaGetErrorString(e));
+  }
   cudaStreamSynchronize(magi_runtime::magi_stream(gpu_id));
+  {
+    cudaError_t e = cudaGetLastError();
+    if (phase_time)
+      std::fprintf(stderr, "[magi-dbg gpu=%d] post-sync: %s\n", gpu_id,
+                   cudaGetErrorString(e));
+  }
   auto pt_t5 = pt_clock::now();
   magi_runtime::magi_sync_after_session(gpu_id, xc.session_id);
   auto pt_t6 = pt_clock::now();
@@ -464,16 +533,26 @@ static std::size_t run_per_gpu_typed_tier(int                        gpu_id,
   cudaMemcpyAsync(&live, g_overflow_dev[gpu_id], sizeof(unsigned int),
                   cudaMemcpyDeviceToHost, st);
   cudaStreamSynchronize(st);
+  auto pt_tC = pt_clock::now();
   if (device_emit) {
-    // On-device: convert the compacted slots to a flat device AggResultRow buffer
-    // and hand it to the caller (no D2H of slots + host slice construction). Raw
-    // cudaMalloc — this .cu is deliberately free of the buffer-manager/duckdb
-    // headers; ~live*sizeof(AggResultRow) is well within the free headroom beyond
-    // the reserved caching/processing pools.
+    // On-device: convert the compacted slots to a flat device AggResultRow
+    // buffer and hand it to the caller (no D2H of slots + host slice
+    // construction). The buffer is the FINAL-table arena g_agg_dev — dead once
+    // compact copied the live slots into `dense` (g_stage_dev) — so no
+    // cudaMalloc/cudaFree on the query path (the malloc alone cost ~2.5ms at
+    // Q10's 292MB). The pointer stays valid until the next groupby run
+    // re-initializes the arena; the caller consumes it within this query and
+    // MUST NOT free it. Falls back to a tracked cudaMalloc only if live rows
+    // exceed the arena (>~6.7M live), freed on the next run's entry.
     AggResultRow* d_rows = nullptr;
     if (live > 0) {
-      cudaMalloc(reinterpret_cast<void**>(&d_rows),
-                 static_cast<size_t>(live) * sizeof(AggResultRow));
+      if (static_cast<size_t>(live) * sizeof(AggResultRow) <= AGG_BUF_BYTES) {
+        d_rows = reinterpret_cast<AggResultRow*>(g_agg_dev[gpu_id]);
+      } else {
+        cudaMalloc(reinterpret_cast<void**>(&d_rows),
+                   static_cast<size_t>(live) * sizeof(AggResultRow));
+        g_rows_malloc[gpu_id] = d_rows;
+      }
       constexpr int RB = 256;
       const unsigned rg = static_cast<unsigned>((live + RB - 1) / RB);
       aggslot_to_resultrow<KeyT, SB><<<rg, RB, 0, st>>>(dense, live, d_rows);
@@ -510,11 +589,17 @@ static std::size_t run_per_gpu_typed_tier(int                        gpu_id,
   if (phase_time) {
     auto pt_t7 = pt_clock::now();
     std::fprintf(stderr,
-      "[magi-phase gpu=%d] setup=%.2f barrier=%.2f rowids=%.2f devsync=%.2f "
-      "kernels=%.2f session=%.2f extract=%.2f total=%.2f ms\n",
-      gpu_id, pt_ms(pt_t0, pt_t1), pt_ms(pt_t1, pt_t2), pt_ms(pt_t2, pt_t3),
-      pt_ms(pt_t3, pt_t4), pt_ms(pt_t4, pt_t5), pt_ms(pt_t5, pt_t6),
-      pt_ms(pt_t6, pt_t7), pt_ms(pt_t0, pt_t7));
+      "[magi-phase gpu=%d] setup=%.2f(init=%.2f up=%.2f) barrier=%.2f rowids=%.2f "
+      "devsync=%.2f kernels=%.2f(A=%.2f B=%.2f) session=%.2f "
+      "extract=%.2f(compact=%.2f rows=%.2f) total=%.2f ms live=%u\n",
+      gpu_id, pt_ms(pt_t0, pt_t1), pt_ms(pt_t0, pt_tI), pt_ms(pt_tI, pt_t1),
+      pt_ms(pt_t1, pt_t2), pt_ms(pt_t2, pt_t3),
+      pt_ms(pt_t3, pt_t4), pt_ms(pt_t4, pt_t5),
+      used_single ? 0.0 : pt_ms(pt_t4, pt_tA),
+      used_single ? pt_ms(pt_t4, pt_t5) : pt_ms(pt_tA, pt_t5),
+      pt_ms(pt_t5, pt_t6),
+      pt_ms(pt_t6, pt_t7), pt_ms(pt_t6, pt_tC), pt_ms(pt_tC, pt_t7),
+      pt_ms(pt_t0, pt_t7), live);
   }
 
   xc.end.arrive_and_wait();
@@ -551,13 +636,33 @@ static std::size_t run_tier(int gpu_id, int n_slots,
                             std::vector<AggResultRow>& my_slice,
                             bool device_emit, AggResultRow** d_rows_out)
 {
-  constexpr int N64 = magi_ops::AggSlot64<KeyT, 64>::N_DOUBLES;
-  const int sb = (n_slots <= N64) ? 64 : 128;
+  constexpr int N64  = magi_ops::AggSlot64<KeyT, 64>::N_DOUBLES;
+  constexpr int N128 = magi_ops::AggSlot64<KeyT, 128>::N_DOUBLES;
+  const int sb = (n_slots <= N64) ? 64 : (n_slots <= N128 ? 128 : 320);
   if (std::getenv("MAGI_SB_DEBUG"))
     std::fprintf(stderr, "[magi-sb] gpu=%d n_slots=%d N64=%d -> SB=%dB\n",
                  gpu_id, n_slots, N64, sb);
-  if (n_slots <= N64) return run_per_gpu_typed_tier<KeyT, N_SLOTS, 64 >(gpu_id, my_slice, device_emit, d_rows_out);
-  return              run_per_gpu_typed_tier<KeyT, N_SLOTS, 128>(gpu_id, my_slice, device_emit, d_rows_out);
+  if (n_slots <= N64)  return run_per_gpu_typed_tier<KeyT, N_SLOTS, 64 >(gpu_id, my_slice, device_emit, d_rows_out);
+  if (n_slots <= N128) return run_per_gpu_typed_tier<KeyT, N_SLOTS, 128>(gpu_id, my_slice, device_emit, d_rows_out);
+  // 320B slots (5 cells): wide-key GROUP BY — 128-bit hash key + inline
+  // original-key bytes as KEEP_I64 slots. Only instantiated for the 128-bit
+  // key kind to keep template bloat down. Uses the fixed WIDE tiers instead of
+  // the caller's: XLARGE x 320B would overrun the 2GB slot arena.
+  if constexpr (std::is_same_v<KeyT, unsigned __int128>) {
+    // Right-size by this GPU's own row count (see N_SLOTS_WIDE_M comment for
+    // why per-GPU local choice is legal): stage table needs ≥ n_filtered slots
+    // (every local row may be a distinct group), final table needs ≥ owned
+    // groups (≈ n_filtered under balanced hash routing). ≤60% worst-case load.
+    const std::uint64_t rows = exchange().inputs[gpu_id].n_filtered;
+    if (rows <= (std::uint64_t)N_SLOTS_WIDE_M * 3 / 5) {
+      return run_per_gpu_typed_tier<KeyT, N_SLOTS_WIDE_M, 320>(gpu_id, my_slice, device_emit, d_rows_out);
+    }
+    return run_per_gpu_typed_tier<KeyT, N_SLOTS_WIDE, 320>(gpu_id, my_slice, device_emit, d_rows_out);
+  } else {
+    std::fprintf(stderr, "[magi-generic] %d agg slots need 320B slots, only "
+                 "supported for 128-bit keys\n", n_slots);
+    return 0;
+  }
 }
 
 // ── dispatch over (KeyKind, TableSize) × runtime SlotSize ────────────────
@@ -633,6 +738,13 @@ std::size_t distributed_hash_groupby_run_per_gpu(
 
   magi_runtime::MagiInitOnce();
   EnsureDeviceBuffers();
+
+  // Free a leftover oversized d_rows buffer from a previous run (the arena
+  // path leaves this null; see device_emit block).
+  if (g_rows_malloc[gpu_id] != nullptr) {
+    cudaFree(g_rows_malloc[gpu_id]);
+    g_rows_malloc[gpu_id] = nullptr;
+  }
 
   auto& xc = exchange();
   xc.inputs[gpu_id]            = inputs;

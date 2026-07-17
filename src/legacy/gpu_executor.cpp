@@ -124,13 +124,26 @@ void GPUExecutor::Execute()
   int initial_idx_w   = initial_idx;
   auto* gpu_bm        = gpuBufferManager;
 
-  auto worker_body = [&scheduled_ref, &executor_ref, &context_ref, initial_idx_w, gpu_bm](
-                      int gpu_iter, std::exception_ptr* err_slot) {
+  // FinalizeSink points: for each sink operator, the LAST scheduled pipeline
+  // that sinks into it. Multi-batch sinks (a RIGHT/OUTER join feeds its sink
+  // from both the probe pipeline and the unmatched-scan child pipeline) defer
+  // their real work to FinalizeSink, which must run exactly once per worker
+  // after all their batches arrived. The schedule is static and identical for
+  // every worker, so finalize points align across workers (magi collectives
+  // inside FinalizeSink pair correctly).
+  std::unordered_map<const GPUPhysicalOperator*, size_t> last_sink_at;
+  for (size_t p = 0; p < scheduled_ref.size(); p++) {
+    if (scheduled_ref[p]->sink) { last_sink_at[scheduled_ref[p]->sink.get()] = p; }
+  }
+
+  auto worker_body = [&scheduled_ref, &executor_ref, &context_ref, initial_idx_w, gpu_bm,
+                      &last_sink_at](int gpu_iter, std::exception_ptr* err_slot) {
     try {
         gpu_bm->set_gpu_for_thread(gpu_iter);
         SIRIUS_LOG_DEBUG("Per-GPU worker thread: GPU {}", gpu_iter);
 
-        for (const auto& pipeline : scheduled_ref) {
+        for (size_t pipeline_pos = 0; pipeline_pos < scheduled_ref.size(); pipeline_pos++) {
+        const auto& pipeline = scheduled_ref[pipeline_pos];
     // TODO: This is temporary solution
     // if (pipeline->source->type == PhysicalOperatorType::HASH_JOIN || pipeline->source->type ==
     // PhysicalOperatorType::RESULT_COLLECTOR) { 	continue;
@@ -256,6 +269,10 @@ void GPUExecutor::Execute()
       // OperatorSinkInput sink_input {*pipeline->sink->sink_state, *local_sink_state,
       // interrupt_state}; pipeline->sink->Sink(exec_context, *sink_relation, sink_input);
       pipeline->sink->Sink(*sink_relation);
+      auto it = last_sink_at.find(pipeline->sink.get());
+      if (it != last_sink_at.end() && it->second == pipeline_pos) {
+        pipeline->sink->FinalizeSink();
+      }
     }
   }  // end for-pipeline
     } catch (...) {

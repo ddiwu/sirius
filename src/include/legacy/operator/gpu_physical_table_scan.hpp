@@ -193,4 +193,10 @@ class GPUPhysicalTableScan : public GPUPhysicalOperator {
 //! for the Sink-time callers).
 bool SubtreeAllReplicated(const GPUPhysicalOperator& op);
 
+//! JOIN-placement variant: true when the subtree's OUTPUT is identical on
+//! every GPU — SubtreeAllReplicated plus operators that replicate their
+//! output regardless of input (interior UNGROUPED_AGGREGATE cross-GPU merge).
+//! Not for the result collector's root check (root aggregates emit partials).
+bool SubtreeOutputReplicated(const GPUPhysicalOperator& op);
+
 }  // namespace duckdb

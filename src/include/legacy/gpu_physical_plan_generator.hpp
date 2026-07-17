@@ -73,6 +73,13 @@ class GPUPhysicalPlanGenerator {
   unique_ptr<GPUPhysicalOperator> CreatePlan(LogicalOperator& op);
 
   unique_ptr<GPUPhysicalOperator> CreatePlan(LogicalAggregate& op);
+  //! Eager-aggregation rewrite (Q10-class shapes): when every GROUP BY column
+  //! comes from one side P of an equi-join below the aggregate and one group
+  //! column is P's join key, group by the other side's (narrow) key instead
+  //! and join P back ABOVE the aggregate — P's wide columns never enter the
+  //! cross-GPU groupby shuffle. Returns nullptr when the pattern doesn't
+  //! apply (caller continues with the stock plan).
+  unique_ptr<GPUPhysicalOperator> TryEagerAggRewrite(LogicalAggregate& op);
   // unique_ptr<GPUPhysicalOperator> CreatePlan(LogicalAnyJoin &op);
   unique_ptr<GPUPhysicalOperator> CreatePlan(LogicalColumnDataGet& op);
   unique_ptr<GPUPhysicalOperator> CreatePlan(LogicalComparisonJoin& op);

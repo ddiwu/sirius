@@ -90,7 +90,7 @@ struct AggResultRow {
   // Sized for the WIDEST slot (128B → 14 doubles) so this host-side row holds the
   // result of whichever (64B/128B) GPU slot the dynamic dispatch picked; the
   // runtime copies only the active slot's N_DOUBLES prefix.
-  static constexpr int N_VALUES = magi_ops::AggSlot64<std::uint64_t, 128>::N_DOUBLES;
+  static constexpr int N_VALUES = magi_ops::AggSlot64<unsigned __int128, 320>::N_DOUBLES;
 
   unsigned __int128 key_packed;
   double            values[N_VALUES];

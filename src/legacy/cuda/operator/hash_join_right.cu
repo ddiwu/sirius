@@ -289,4 +289,76 @@ template void probeHashTableRightSemiAnti<int64_t>(uint8_t** keys,
                                                    int* condition_mode,
                                                    int num_keys);
 
+// ── Multi-GPU RIGHT_SEMI/RIGHT_ANTI match-flag merge helpers ─────────────────
+// Every GPU builds the SAME (allgathered) build side, probes its LOCAL probe
+// partition (marking slots), then converts marks to a flags array indexed by
+// BUILD ROW ID — slot positions differ across GPUs (insertion races), row ids
+// don't. The flags arrays are then OR-merged across GPUs and each GPU emits a
+// disjoint row-id range.
+
+__global__ void scan_ht_matched_to_flags(const unsigned long long* ht, uint64_t ht_len,
+                                         int num_keys, uint8_t* flags)
+{
+  uint64_t slot = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (slot >= ht_len) return;
+  const unsigned long long row_id = ht[slot * (num_keys + 2) + num_keys];
+  const unsigned long long mark   = ht[slot * (num_keys + 2) + num_keys + 1];
+  if (row_id != 0xFFFFFFFFFFFFFFFF && mark != 0xFFFFFFFFFFFFFFFF) { flags[row_id] = 1; }
+}
+
+void scanHTMatchedToFlags(unsigned long long* ht, uint64_t ht_len, int num_keys, uint8_t* flags)
+{
+  if (ht_len == 0) { return; }
+  constexpr int B = 256;
+  scan_ht_matched_to_flags<<<(ht_len + B - 1) / B, B>>>(ht, ht_len, num_keys, flags);
+  CHECK_ERROR();
+  cudaDeviceSynchronize();
+}
+
+__global__ void or_flags(uint8_t* dst, const uint8_t* src, uint64_t n)
+{
+  uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) { dst[i] |= src[i]; }
+}
+
+void orFlagsInPlace(uint8_t* dst, const uint8_t* src, uint64_t n)
+{
+  if (n == 0) { return; }
+  constexpr int B = 256;
+  or_flags<<<(n + B - 1) / B, B>>>(dst, src, n);
+  CHECK_ERROR();
+  cudaDeviceSynchronize();
+}
+
+__global__ void select_flagged_range(const uint8_t* flags, uint64_t lo, uint64_t hi,
+                                     uint8_t want, uint64_t* row_ids,
+                                     unsigned long long* count)
+{
+  uint64_t i = lo + (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= hi) { return; }
+  if (flags[i] == want) { row_ids[atomicAdd(count, 1ull)] = i; }
+}
+
+// Emits (unordered) build row ids in [lo, hi) whose flag equals `want`.
+// `count` follows the scanHashTableRight convention: host-alloc'd single value.
+void selectFlaggedRange(const uint8_t* flags, uint64_t lo, uint64_t hi, bool want_set,
+                        uint64_t*& row_ids, uint64_t*& count)
+{
+  GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
+  uint64_t* h_count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
+  h_count[0]        = 0;
+  count             = h_count;
+  row_ids           = nullptr;
+  if (hi <= lo) { return; }
+  uint64_t* d_count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
+  cudaMemset(d_count, 0, sizeof(uint64_t));
+  row_ids = gpuBufferManager->customCudaMalloc<uint64_t>(hi - lo, 0, 0);
+  constexpr int B = 256;
+  select_flagged_range<<<(hi - lo + B - 1) / B, B>>>(
+    flags, lo, hi, want_set ? 1 : 0, row_ids, (unsigned long long*)d_count);
+  CHECK_ERROR();
+  cudaMemcpy(h_count, d_count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
+  gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_count), 0);
+}
+
 }  // namespace duckdb

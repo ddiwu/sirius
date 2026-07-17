@@ -16,10 +16,14 @@
 
 #include "operator/magi_groupby.hpp"
 
+#include <array>
+#include <barrier>
 #include <cstdint>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <memory>
+#include <mutex>
 #include <vector>
 
 #include <cuda_runtime.h>
@@ -871,9 +875,505 @@ void WriteGenericSliceToColumns(int                                             
 // a tier sized from the (now small) distinct count. Reuses PickTableSize so the
 // cudf-vs-magi-direct decision and the tier picker cannot drift; every GPU sees
 // ~the same row count and so decides identically (the begin barrier stays balanced).
-bool ShouldCudfPreAgg(const vector<shared_ptr<GPUColumn>>& keys, int n_keys)
+
+// ══════════════════════════════════════════════════════════════════════════
+// Wide-key GROUP BY: hash-routed magi shuffle with the ORIGINAL key bytes
+// carried inline in the tuple (user design: "key 走 hash, payload 完整随行").
+//
+// Handles every key shape DeriveKeyShape cannot pack into a 128-bit word
+// (e.g. TPC-H Q10: 7 keys incl. VARCHAR(117) c_comment). Per row we build a
+// canonical byte layout of all key columns, hash it into 128 bits (two
+// FNV-1a lanes + avalanche) — that hash IS the magi KeyT (routing + receiver
+// atomic key; collision odds at 2^-128 are ignorable) — and ship the layout
+// bytes as KEEP_I64 value slots in a 320B AggSlot64, merged first-writer-wins
+// (identical bytes per group). The receiver merges partials ON ARRIVAL like
+// any magi groupby; emit unpacks the inline bytes back into typed columns.
+// ══════════════════════════════════════════════════════════════════════════
+static constexpr int WIDE_MAX_KEYS  = 8;
+static constexpr int WIDE_MAX_BYTES = 248;  // 31 KEEP words; +hash key +1 agg fits 320B
+
+struct WideColDesc {
+  const uint8_t*  data;
+  const uint64_t* offs;    // VARCHAR only
+  int32_t         width;   // fixed byte width; -1 = VARCHAR
+  int32_t         off;     // byte offset inside the packed layout
+  int32_t         maxlen;  // VARCHAR char budget (excludes the 2B length)
+};
+struct WideDesc {
+  WideColDesc cols[WIDE_MAX_KEYS];
+  int32_t     n_cols;
+  int32_t     total_bytes;
+  int32_t     n_keep;
+  uint64_t    n_rows;
+};
+
+__global__ void k_wide_maxlen(const uint64_t* offs, uint64_t n, uint32_t* out)
 {
-  return PickTableSize(keys, n_keys) == magi_generic::TableSize::XLARGE;
+  uint64_t r = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (r >= n) return;
+  atomicMax(out, (uint32_t)(offs[r + 1] - offs[r]));
+}
+
+// Contention-free "any string longer than the budget?" probe: only violating
+// threads store (plain store, idempotent). An atomicMax over 120M rows onto a
+// single counter costs ~4ms/column (Q1); this is a pure bandwidth-bound read.
+__global__ void k_prefix_exceeds(const uint64_t* offs, uint64_t n, uint32_t budget,
+                                 uint32_t* flag)
+{
+  uint64_t r = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (r >= n) return;
+  if ((uint32_t)(offs[r + 1] - offs[r]) > budget) { *flag = 1u; }
+}
+
+// One pass per input row: assemble the canonical key-byte layout, hash it
+// (128-bit), and scatter the layout into the column-major KEEP blob the
+// producer kernel will read through the i64_agg_cols pool.
+__global__ void k_wide_pack(WideDesc d, int64_t* hash_lo, int64_t* hash_hi, int64_t* blob)
+{
+  const uint64_t r = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (r >= d.n_rows) return;
+  uint8_t buf[WIDE_MAX_BYTES];
+  for (int i = 0; i < d.total_bytes; ++i) buf[i] = 0;
+  for (int c = 0; c < d.n_cols; ++c) {
+    const WideColDesc& col = d.cols[c];
+    if (col.width >= 0) {
+      for (int b = 0; b < col.width; ++b) buf[col.off + b] = col.data[r * col.width + b];
+    } else {
+      const uint64_t s   = col.offs[r];
+      uint32_t       len = (uint32_t)(col.offs[r + 1] - s);
+      if ((int32_t)len > col.maxlen) len = col.maxlen;
+      buf[col.off]     = (uint8_t)(len & 0xFF);
+      buf[col.off + 1] = (uint8_t)(len >> 8);
+      for (uint32_t b = 0; b < len; ++b) buf[col.off + 2 + b] = col.data[s + b];
+    }
+  }
+  uint64_t h1 = 1469598103934665603ULL;
+  uint64_t h2 = 0x9E3779B97F4A7C15ULL;
+  for (int i = 0; i < d.total_bytes; ++i) {
+    h1 = (h1 ^ buf[i]) * 1099511628211ULL;
+    h2 = (h2 ^ buf[i]) * 0xC2B2AE3D27D4EB4FULL;
+  }
+  h1 ^= h1 >> 33; h1 *= 0xFF51AFD7ED558CCDULL; h1 ^= h1 >> 33;
+  h2 ^= h2 >> 29; h2 *= 0x94D049BB133111EBULL; h2 ^= h2 >> 29;
+  hash_lo[r] = (int64_t)h1;
+  hash_hi[r] = (int64_t)h2;
+  for (int j = 0; j < d.n_keep; ++j) {
+    int64_t w;
+    memcpy(&w, buf + j * 8, 8);
+    blob[(uint64_t)j * d.n_rows + r] = w;
+  }
+}
+
+__global__ void k_wide_emit_fixed(const magi_generic::AggResultRow* in, size_t N,
+                                  int byte_off, int width, uint8_t* out)
+{
+  size_t r = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (r >= N) return;
+  const uint8_t* src = reinterpret_cast<const uint8_t*>(in[r].values) + byte_off;
+  for (int b = 0; b < width; ++b) out[r * width + b] = src[b];
+}
+__global__ void k_wide_emit_len(const magi_generic::AggResultRow* in, size_t N,
+                                int byte_off, uint64_t* lens)
+{
+  size_t r = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (r >= N) return;
+  const uint8_t* src = reinterpret_cast<const uint8_t*>(in[r].values) + byte_off;
+  lens[r] = (uint64_t)src[0] | ((uint64_t)src[1] << 8);
+}
+__global__ void k_wide_emit_chars(const magi_generic::AggResultRow* in, size_t N,
+                                  int byte_off, const uint64_t* offs, uint8_t* chars)
+{
+  size_t r = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (r >= N) return;
+  const uint8_t* src = reinterpret_cast<const uint8_t*>(in[r].values) + byte_off;
+  const uint64_t len = (uint64_t)src[0] | ((uint64_t)src[1] << 8);
+  uint8_t* dst = chars + offs[r];
+  for (uint64_t b = 0; b < len; ++b) dst[b] = src[2 + b];
+}
+
+// Plan-consistent eligibility (identical on every worker: type-driven only).
+bool WideKeyShapeSupported(const vector<shared_ptr<GPUColumn>>& keys, int n_keys)
+{
+  if (n_keys <= 0 || n_keys > WIDE_MAX_KEYS) return false;
+  for (int k = 0; k < n_keys; ++k) {
+    if (!keys[k]) return false;
+    const auto id = keys[k]->data_wrapper.type.id();
+    switch (id) {
+      case GPUColumnTypeId::INT32:
+      case GPUColumnTypeId::DATE:
+      case GPUColumnTypeId::INT64:
+      case GPUColumnTypeId::VARCHAR:
+        break;
+      case GPUColumnTypeId::DECIMAL:
+        if (keys[k]->data_wrapper.getColumnTypeSize() > 8) return false;
+        break;
+      default:
+        return false;
+    }
+  }
+  return true;
+}
+
+void RunWideKey(int                            gpu_id,
+                vector<shared_ptr<GPUColumn>>& keys,
+                vector<shared_ptr<GPUColumn>>& aggs,
+                int                            num_group_keys,
+                int                            num_aggregates,
+                sirius::AggregationType*       agg_mode)
+{
+  GPUBufferManager* gbm      = &GPUBufferManager::GetInstance();
+  const int         num_gpus = static_cast<int>(gbm->tables_per_gpu.size());
+  const uint64_t    n_rows   = keys[0]->column_length;
+  static const bool phase_time = std::getenv("MAGI_PHASE_TIME") != nullptr;
+  const auto        t0         = std::chrono::steady_clock::now();
+
+  // Per-VARCHAR local max length, then rendezvous so every worker agrees on
+  // the SAME byte layout (a worker whose slice lacks the longest string must
+  // still reserve room for it).
+  std::array<uint32_t, WIDE_MAX_KEYS> local_max{};
+  for (int k = 0; k < num_group_keys; ++k) {
+    if (keys[k]->data_wrapper.type.id() != GPUColumnTypeId::VARCHAR || n_rows == 0) continue;
+    uint32_t* d_max = gbm->customCudaMalloc<uint32_t>(1, gpu_id, 0);
+    cudaMemset(d_max, 0, sizeof(uint32_t));
+    int tpb; unsigned grid; gb_cfg(n_rows, tpb, grid);
+    k_wide_maxlen<<<grid, tpb>>>(keys[k]->data_wrapper.offset, n_rows, d_max);
+    cudaMemcpy(&local_max[k], d_max, sizeof(uint32_t), cudaMemcpyDeviceToHost);
+    cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+      throw InvalidInputException("magi_groupby (wide): maxlen kernel failed: %s",
+                                  cudaGetErrorString(e));
+    }
+  }
+  if (num_gpus > 1) {
+    static std::array<std::array<uint32_t, WIDE_MAX_KEYS>, 8> slots;
+    static std::unique_ptr<std::barrier<>> bar;
+    static std::once_flag                  once;
+    std::call_once(once, [&] { bar = std::make_unique<std::barrier<>>(num_gpus); });
+    slots[gpu_id] = local_max;
+    bar->arrive_and_wait();
+    for (int g = 0; g < num_gpus; ++g)
+      for (int k = 0; k < WIDE_MAX_KEYS; ++k)
+        if (slots[g][k] > local_max[k]) local_max[k] = slots[g][k];
+    bar->arrive_and_wait();
+  }
+
+  // Byte layout (identical across workers: fixed widths + agreed maxlens).
+  WideDesc d{};
+  d.n_cols = num_group_keys;
+  int off  = 0;
+  for (int k = 0; k < num_group_keys; ++k) {
+    auto& col = keys[k]->data_wrapper;
+    if (col.type.id() == GPUColumnTypeId::VARCHAR) {
+      d.cols[k] = {col.data, col.offset, -1, off, (int32_t)local_max[k]};
+      off += 2 + (int)local_max[k];
+    } else {
+      const int w = (int)col.getColumnTypeSize();
+      d.cols[k]   = {col.data, nullptr, w, off, 0};
+      off += w;
+    }
+  }
+  if (off > WIDE_MAX_BYTES) {
+    throw NotImplementedException(
+        "magi_groupby (wide): key layout %d B exceeds the %d B inline budget",
+        off, WIDE_MAX_BYTES);
+  }
+  d.total_bytes = off;
+  d.n_keep      = (off + 7) / 8;
+  d.n_rows      = n_rows;
+  const auto t_prep = std::chrono::steady_clock::now();
+
+  // hash + KEEP blob
+  int64_t* hash_lo = gbm->customCudaMalloc<int64_t>(n_rows > 0 ? n_rows : 1, gpu_id, 0);
+  int64_t* hash_hi = gbm->customCudaMalloc<int64_t>(n_rows > 0 ? n_rows : 1, gpu_id, 0);
+  int64_t* blob    = gbm->customCudaMalloc<int64_t>(
+      n_rows > 0 ? (uint64_t)d.n_keep * n_rows : 1, gpu_id, 0);
+  if (n_rows > 0) {
+    int tpb; unsigned grid; gb_cfg(n_rows, tpb, grid);
+    k_wide_pack<<<grid, tpb>>>(d, hash_lo, hash_hi, blob);
+  }
+  cudaDeviceSynchronize();
+  {
+    cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+      throw InvalidInputException("magi_groupby (wide): pack kernel failed: %s",
+                                  cudaGetErrorString(e));
+    }
+    if (phase_time) {
+      std::fprintf(stderr, "[wide-dbg gpu=%d] pack ok rows=%llu layout=%dB keep=%d\n",
+                   gpu_id, (unsigned long long)n_rows, d.total_bytes, d.n_keep);
+    }
+  }
+  const auto t_pack = std::chrono::steady_clock::now();
+
+  // Route through the stock UINT128 machinery with (hash_lo, hash_hi) as the
+  // packed key and the real aggregates untouched; append the KEEP columns.
+  vector<shared_ptr<GPUColumn>> hkeys(2);
+  hkeys[0] = make_shared_ptr<GPUColumn>(n_rows, GPUColumnType(GPUColumnTypeId::INT64),
+                                        reinterpret_cast<uint8_t*>(hash_lo), nullptr);
+  hkeys[1] = make_shared_ptr<GPUColumn>(n_rows, GPUColumnType(GPUColumnTypeId::INT64),
+                                        reinterpret_cast<uint8_t*>(hash_hi), nullptr);
+  magi_generic::KeyKind                key_kind;
+  std::vector<magi_ops::KeyFieldEntry> key_fields;
+  DeriveKeyShape(hkeys, 2, key_kind, key_fields);
+  const auto table_size = PickTableSize(hkeys, 2);
+
+  auto in             = BuildGenericInputs(hkeys, aggs, 2, num_aggregates, agg_mode);
+  int  avg_count_slot = -1;
+  auto ops            = BuildAggOpsTable(aggs, num_aggregates, agg_mode, avg_count_slot);
+  int dst_base = 0;
+  for (const auto& op : ops)
+    if ((int)op.dst_slot_idx + 1 > dst_base) dst_base = (int)op.dst_slot_idx + 1;
+  const int keep_col_base = in.cols.n_int64_aggs;
+  if (keep_col_base + d.n_keep > magi_ops::MAX_INT64_AGG_COLS ||
+      dst_base + d.n_keep > magi_generic::AggResultRow::N_VALUES) {
+    throw NotImplementedException(
+        "magi_groupby (wide): %d agg slots + %d keep words exceed slot capacity",
+        dst_base, d.n_keep);
+  }
+  // Bisect switch: MAGI_WIDE_NO_KEEP drops the inline-key KEEP slots (keys
+  // emit as garbage) to isolate the KEEP device branches from the rest of the
+  // wide pipeline when debugging.
+  static const bool no_keep = std::getenv("MAGI_WIDE_NO_KEEP") != nullptr;
+  if (!no_keep) {
+    for (int j = 0; j < d.n_keep; ++j) {
+      in.cols.i64_agg_cols[keep_col_base + j] = blob + (uint64_t)j * (n_rows > 0 ? n_rows : 1);
+      ops.push_back({magi_ops::AggKind::KEEP_I64, (int8_t)(keep_col_base + j),
+                     (int8_t)(dst_base + j), 0});
+    }
+    in.cols.n_int64_aggs = keep_col_base + d.n_keep;
+  }
+
+  std::vector<magi_generic::AggResultRow> slice;
+  magi_generic::AggResultRow*             d_rows = nullptr;
+  const std::size_t N = magi_generic::distributed_hash_groupby_run_per_gpu(
+      gpu_id, in, key_fields, ops, key_kind, table_size, slice,
+      /*device_emit=*/true, &d_rows);
+  const auto t_run = std::chrono::steady_clock::now();
+  if (phase_time) {
+    cudaError_t e = cudaGetLastError();
+    std::fprintf(stderr, "[wide-dbg gpu=%d] shuffle done groups=%zu err=%s\n",
+                 gpu_id, N, cudaGetErrorString(e));
+  }
+
+  // ── Emit: inline key bytes → typed columns; aggregates via stock helpers ──
+  // Two phases so the per-VARCHAR pipelines overlap instead of serializing:
+  // phase 1 queues ALL fixed-col emits, lens kernels and prefix scans without
+  // a single blocking call (par_nosync — stock thrust::device syncs per scan);
+  // phase 2's first total-D2H then waits once for everything, the remaining
+  // D2Hs are ~µs, and the chars kernels queue behind them. With 5 VARCHAR keys
+  // (Q10) this collapses 5×(scan sync + D2H sync) into one pipeline flush.
+  const int byte_base = dst_base * 8;
+  int tpb; unsigned grid; gb_cfg(N > 0 ? N : 1, tpb, grid);
+  struct VcPending { int k; uint64_t* lens; uint64_t* offs; };
+  std::vector<VcPending> vc_pending;
+  for (int k = 0; k < num_group_keys; ++k) {
+    const GPUColumnType out_type = keys[k]->data_wrapper.type;  // keeps DATE/DECIMAL info
+    const int           col_off  = byte_base + d.cols[k].off;
+    if (d.cols[k].width >= 0) {
+      if (N == 0) {
+        keys[k] = make_shared_ptr<GPUColumn>(0, out_type, nullptr, nullptr);
+      } else {
+        uint8_t* out = gbm->customCudaMalloc<uint8_t>(N * d.cols[k].width, gpu_id, 0);
+        k_wide_emit_fixed<<<grid, tpb>>>(d_rows, N, col_off, d.cols[k].width, out);
+        keys[k] = make_shared_ptr<GPUColumn>(N, out_type, out, createNullMask(N));
+      }
+      keys[k]->row_id_count = 0;
+    } else {
+      if (N == 0) {
+        keys[k] = make_shared_ptr<GPUColumn>(0, out_type, nullptr, nullptr, 0, true, nullptr);
+        keys[k]->row_id_count = 0;
+      } else {
+        uint64_t* lens = gbm->customCudaMalloc<uint64_t>(N, gpu_id, 0);
+        uint64_t* offs = gbm->customCudaMalloc<uint64_t>(N + 1, gpu_id, 0);
+        k_wide_emit_len<<<grid, tpb>>>(d_rows, N, col_off, lens);
+        cudaMemsetAsync(offs, 0, sizeof(uint64_t));
+        thrust::inclusive_scan(thrust::cuda::par_nosync, lens, lens + N, offs + 1);
+        vc_pending.push_back({k, lens, offs});
+      }
+    }
+  }
+  for (const auto& vc : vc_pending) {
+    const GPUColumnType out_type = keys[vc.k]->data_wrapper.type;
+    const int           col_off  = byte_base + d.cols[vc.k].off;
+    uint64_t total_chars = 0;
+    cudaMemcpy(&total_chars, vc.offs + N, sizeof(uint64_t), cudaMemcpyDeviceToHost);
+    uint8_t* chars = gbm->customCudaMalloc<uint8_t>(total_chars > 0 ? total_chars : 1,
+                                                    gpu_id, 0);
+    k_wide_emit_chars<<<grid, tpb>>>(d_rows, N, col_off, vc.offs, chars);
+    keys[vc.k] = make_shared_ptr<GPUColumn>(N, out_type, chars, vc.offs, total_chars, true,
+                                            createNullMask(N));
+    keys[vc.k]->row_id_count = 0;
+  }
+  if (phase_time) cudaDeviceSynchronize();
+  const auto t_ekeys = std::chrono::steady_clock::now();
+  // Aggregates: same emit sequence as WriteGenericSliceToColumnsDevice.
+  int dst_idx = 0;
+  for (int a = 0; a < num_aggregates; ++a) {
+    switch (agg_mode[a]) {
+      case sirius::AggregationType::SUM:
+      case sirius::AggregationType::MIN:
+      case sirius::AggregationType::MAX: {
+        const auto in_id =
+            aggs[a] ? aggs[a]->data_wrapper.type.id() : GPUColumnTypeId::FLOAT64;
+        const auto* in_dti = (in_id == GPUColumnTypeId::DECIMAL && aggs[a])
+                                 ? aggs[a]->data_wrapper.type.GetDecimalTypeInfo()
+                                 : nullptr;
+        const int dti_w = in_dti ? in_dti->width_ : 0;
+        const int dti_s = in_dti ? in_dti->scale_ : 0;
+        if (in_id == GPUColumnTypeId::INT64 || in_id == GPUColumnTypeId::DECIMAL) {
+          EmitInt64AggColDevice(gpu_id, N, d_rows, dst_idx++, aggs[a], gbm);
+          if (in_id == GPUColumnTypeId::DECIMAL && in_dti && aggs[a]) {
+            aggs[a]->data_wrapper.type = GPUColumnType(GPUColumnTypeId::DECIMAL);
+            aggs[a]->data_wrapper.type.SetDecimalTypeInfo(dti_w, dti_s);
+          }
+        } else {
+          EmitDoubleAggColDevice(gpu_id, N, d_rows, dst_idx++, aggs[a], gbm);
+        }
+        break;
+      }
+      case sirius::AggregationType::AVERAGE: {
+        const auto in_id =
+            aggs[a] ? aggs[a]->data_wrapper.type.id() : GPUColumnTypeId::FLOAT64;
+        const bool sum_is_int64 =
+            (in_id == GPUColumnTypeId::INT64 || in_id == GPUColumnTypeId::DECIMAL);
+        int scale = 0;
+        if (in_id == GPUColumnTypeId::DECIMAL && aggs[a]) {
+          const auto* dti = aggs[a]->data_wrapper.type.GetDecimalTypeInfo();
+          if (dti) scale = dti->scale_;
+        }
+        EmitAvgColDevice(gpu_id, N, d_rows, dst_idx, avg_count_slot, sum_is_int64, scale,
+                         aggs[a], gbm);
+        dst_idx++;
+        break;
+      }
+      case sirius::AggregationType::COUNT_STAR:
+      case sirius::AggregationType::COUNT:
+        EmitInt64AggColDevice(gpu_id, N, d_rows, dst_idx++, aggs[a], gbm);
+        break;
+      default:
+        throw NotImplementedException(
+            "magi_groupby (wide): unsupported AggregationType %d at emit",
+            static_cast<int>(agg_mode[a]));
+    }
+  }
+  cudaDeviceSynchronize();
+  const auto t_eaggs = std::chrono::steady_clock::now();
+  // d_rows lives in the runtime's g_agg_dev arena (or a runtime-tracked
+  // overflow malloc) — the runtime owns it; do not free here.
+  if (phase_time) {
+    const auto t_end = std::chrono::steady_clock::now();
+    auto ms = [](std::chrono::steady_clock::time_point a,
+                 std::chrono::steady_clock::time_point b) {
+      return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+    std::fprintf(stderr,
+                 "[wide-groupby gpu=%d] rows_in=%llu groups_out=%zu layout=%dB keep=%d "
+                 "prep=%.2f pack=%.2f run=%.2f emitk=%.2f emita=%.2f free=%.2f "
+                 "total=%.2fms\n",
+                 gpu_id, (unsigned long long)n_rows, N, d.total_bytes, d.n_keep,
+                 ms(t0, t_prep), ms(t_prep, t_pack), ms(t_pack, t_run),
+                 ms(t_run, t_ekeys), ms(t_ekeys, t_eaggs), ms(t_eaggs, t_end),
+                 ms(t0, t_end));
+  }
+}
+
+static bool VarcharPrefixInsufficient(int                                         gpu_id,
+                                      vector<shared_ptr<GPUColumn>>&              keys,
+                                      const std::vector<magi_ops::KeyFieldEntry>& fields);
+
+// Cross-GPU max of a per-worker row count. The pre-agg decision (and any
+// rows-thresholded gate ahead of a rendezvous) must be IDENTICAL on every
+// worker: per-GPU partitions differ by a few hundred rows, so a local-rows
+// threshold could split workers across a barrier (deadlock) or diverge the
+// COUNT→SUM re-aggregation modes (wrong merge). Unconditional rendezvous —
+// every worker calls exactly once per decision point.
+static uint64_t CrossGpuMaxRows(int gpu_id, uint64_t local_rows)
+{
+  GPUBufferManager* gbm      = &GPUBufferManager::GetInstance();
+  const int         num_gpus = static_cast<int>(gbm->tables_per_gpu.size());
+  if (num_gpus <= 1) { return local_rows; }
+  static std::array<uint64_t, 8>         slots;
+  static std::unique_ptr<std::barrier<>> bar;
+  static std::once_flag                  once;
+  std::call_once(once, [&] { bar = std::make_unique<std::barrier<>>(num_gpus); });
+  slots[gpu_id] = local_rows;
+  bar->arrive_and_wait();
+  uint64_t m = 0;
+  for (int g = 0; g < num_gpus; ++g) {
+    if (slots[g] > m) { m = slots[g]; }
+  }
+  bar->arrive_and_wait();
+  return m;
+}
+
+bool ShouldCudfPreAgg(int gpu_id, vector<shared_ptr<GPUColumn>>& keys, int n_keys)
+{
+  if (PickTableSize(keys, n_keys) == magi_generic::TableSize::XLARGE) { return true; }
+  // Inputs headed for the WIDE path benefit from a local pre-agg regardless
+  // of the tier estimate: the 320B-slot machinery costs O(input rows) at
+  // random-access bandwidth, so collapse duplicates locally first. Q4's
+  // `group by o_orderpriority` (1.3M rows -> 4 groups, "4-NOT SPECIFIED"
+  // exceeds the 8B prefix) paid 6.5ms in the wide path for a 4-group
+  // aggregation without this.
+  const uint64_t n_rows = keys.empty() || !keys[0] ? 0 : keys[0]->column_length;
+  if (CrossGpuMaxRows(gpu_id, n_rows) <= 65536) { return false; }
+  magi_generic::KeyKind                key_kind;
+  std::vector<magi_ops::KeyFieldEntry> key_fields;
+  const bool shape_ok = DeriveKeyShape(keys, n_keys, key_kind, key_fields);
+  if (!shape_ok) { return WideKeyShapeSupported(keys, n_keys); }
+  // VarcharPrefixInsufficient rendezvouses across workers behind
+  // type-deterministic gates only, and its verdict is a cross-GPU OR —
+  // identical on every worker (Run() later repeats it — also symmetric).
+  return VarcharPrefixInsufficient(gpu_id, keys, key_fields);
+}
+
+// A VARCHAR_PREFIX recipe is only exact when every string in the query's
+// actual data fits its prefix budget: the emit rebuilds the string FROM the
+// packed prefix (a longer string comes back truncated — Q5's "INDONESIA" →
+// "INDONESI"), and two distinct strings sharing a prefix would silently merge
+// into one group. Checked against the runtime max string length; the verdict
+// is rendezvoused across workers (cross-GPU OR) so every worker takes the
+// same DeriveKeyShape-vs-wide branch — a split would deadlock the barriers.
+static bool VarcharPrefixInsufficient(int                                        gpu_id,
+                                      vector<shared_ptr<GPUColumn>>&             keys,
+                                      const std::vector<magi_ops::KeyFieldEntry>& fields)
+{
+  bool has_prefix = false;
+  for (const auto& f : fields) {
+    if (f.kind == magi_ops::KeyFieldKind::VARCHAR_PREFIX) { has_prefix = true; break; }
+  }
+  if (!has_prefix) { return false; }   // identical on every worker (same recipe)
+
+  GPUBufferManager* gbm      = &GPUBufferManager::GetInstance();
+  const int         num_gpus = static_cast<int>(gbm->tables_per_gpu.size());
+  bool local_bad = false;
+  uint32_t* d_flag = gbm->customCudaMalloc<uint32_t>(1, gpu_id, 0);
+  cudaMemset(d_flag, 0, sizeof(uint32_t));
+  for (const auto& f : fields) {
+    if (f.kind != magi_ops::KeyFieldKind::VARCHAR_PREFIX) { continue; }
+    const auto& col = keys[f.src_col_idx];
+    const uint64_t n = col ? col->column_length : 0;
+    if (n == 0 || col->data_wrapper.offset == nullptr) { continue; }
+    int tpb; unsigned grid; gb_cfg(n, tpb, grid);
+    k_prefix_exceeds<<<grid, tpb>>>(col->data_wrapper.offset, n,
+                                    static_cast<uint32_t>(f.byte_len), d_flag);
+  }
+  uint32_t exceeded = 0;
+  cudaMemcpy(&exceeded, d_flag, sizeof(uint32_t), cudaMemcpyDeviceToHost);
+  local_bad = exceeded != 0;
+  if (num_gpus > 1) {
+    static std::array<uint8_t, 8>          slots;
+    static std::unique_ptr<std::barrier<>> bar;
+    static std::once_flag                  once;
+    std::call_once(once, [&] { bar = std::make_unique<std::barrier<>>(num_gpus); });
+    slots[gpu_id] = local_bad ? 1 : 0;
+    bar->arrive_and_wait();
+    bool any = false;
+    for (int g = 0; g < num_gpus; ++g) { any = any || slots[g] != 0; }
+    bar->arrive_and_wait();
+    return any;
+  }
+  return local_bad;
 }
 
 void Run(int                                gpu_id,
@@ -912,7 +1412,23 @@ void Run(int                                gpu_id,
   // ── Generic path (table-driven; handles all supported GROUP BY shapes) ──
   magi_generic::KeyKind                 key_kind;
   std::vector<magi_ops::KeyFieldEntry>  key_fields;
-  if (!DeriveKeyShape(group_by_keys, num_group_keys, key_kind, key_fields)) {
+  bool shape_ok = DeriveKeyShape(group_by_keys, num_group_keys, key_kind, key_fields);
+  if (shape_ok && VarcharPrefixInsufficient(gpu_id, group_by_keys, key_fields)) {
+    // Strings exceed the prefix budget → the packed-prefix path would emit
+    // truncated keys (and could merge distinct groups). Reroute to the wide
+    // path, which carries the full key bytes.
+    shape_ok = false;
+  }
+  if (!shape_ok) {
+    // Wide-key fallback: hash-routed shuffle with the original key bytes
+    // inlined in the tuple (see RunWideKey). Eligibility is type-driven, so
+    // every worker takes the same branch.
+    if (std::getenv("MAGI_NO_WIDE_GROUPBY") == nullptr &&
+        WideKeyShapeSupported(group_by_keys, num_group_keys)) {
+      RunWideKey(gpu_id, group_by_keys, aggregate_keys, num_group_keys,
+                 num_aggregates, agg_mode);
+      return;
+    }
     throw NotImplementedException(
         "magi_groupby (generic): unsupported key shape "
         "(n_keys=%d, first_type=%d). Extend DeriveKeyShape with a new "
@@ -943,9 +1459,9 @@ void Run(int                                gpu_id,
                                    key_fields, avg_count_slot,
                                    &GPUBufferManager::GetInstance());
   // The emit kernels + thrust scans run on the default stream; flush before the
-  // columns are consumed downstream and before the device buffer is freed.
+  // columns are consumed downstream. d_rows lives in the runtime's g_agg_dev
+  // arena (or a runtime-tracked overflow malloc) — the runtime owns it.
   cudaDeviceSynchronize();
-  if (d_rows) cudaFree(d_rows);
 }
 
 }  // namespace magi_groupby

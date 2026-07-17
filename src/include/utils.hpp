@@ -35,6 +35,9 @@ void subtractToEach(T* data, T delta, size_t count);
 template <typename T>
 void addToEach(T* data, T delta, size_t count);
 
+template <typename T>
+void addToEachAsync(T* data, T delta, size_t count, cudaStream_t stream);
+
 using CubPrefixSumAllocFunc = std::function<void*(size_t)>;
 template <typename T>
 void callCubPrefixSum(T* in,

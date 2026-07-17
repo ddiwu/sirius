@@ -68,10 +68,17 @@ void combineMasks(
   cudf::bitmask_type* a, cudf::bitmask_type* b, cudf::bitmask_type*& c, uint64_t N_a, uint64_t N_b)
 {
   CHECK_ERROR();
+  c = nullptr;
   if (N_a == 0 || N_b == 0) {
     SIRIUS_LOG_DEBUG("Input size is 0");
     return;
   }
+  // A null mask pointer means ALL VALID. Both null → the concat needs no
+  // mask; one null → synthesize an all-valid section so the copy below has a
+  // real source (memcpy from nullptr was an illegal access).
+  if (a == nullptr && b == nullptr) { return; }
+  if (a == nullptr) { a = createNullMask(N_a, cudf::mask_state::ALL_VALID); }
+  if (b == nullptr) { b = createNullMask(N_b, cudf::mask_state::ALL_VALID); }
   SIRIUS_LOG_DEBUG("Launching Combine Columns Kernel");
   GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
   auto size_a                        = getMaskBytesSize(N_a) / sizeof(cudf::bitmask_type);

@@ -35,8 +35,8 @@ shared_ptr<GPUColumn> ResolveTypeCombineColumns(shared_ptr<GPUColumn> column1,
                                                 shared_ptr<GPUColumn> column2,
                                                 GPUBufferManager* gpuBufferManager)
 {
-  T* combine;
-  cudf::bitmask_type* combine_mask;
+  T* combine                       = nullptr;
+  cudf::bitmask_type* combine_mask = nullptr;
   T* a = reinterpret_cast<T*>(column1->data_wrapper.data);
   T* b = reinterpret_cast<T*>(column2->data_wrapper.data);
   combineColumns<T>(a, b, combine, column1->column_length, column2->column_length);
@@ -58,9 +58,9 @@ shared_ptr<GPUColumn> ResolveTypeCombineStrings(shared_ptr<GPUColumn> column1,
                                                 shared_ptr<GPUColumn> column2,
                                                 GPUBufferManager* gpuBufferManager)
 {
-  uint8_t* combine;
-  uint64_t* offset_combine;
-  cudf::bitmask_type* combine_mask;
+  uint8_t* combine                 = nullptr;
+  uint64_t* offset_combine         = nullptr;
+  cudf::bitmask_type* combine_mask = nullptr;
   uint8_t* a           = column1->data_wrapper.data;
   uint8_t* b           = column2->data_wrapper.data;
   uint64_t* offset_a   = column1->data_wrapper.offset;
@@ -101,8 +101,14 @@ shared_ptr<GPUColumn> CombineColumns(shared_ptr<GPUColumn> column1,
 {
   switch (column1->data_wrapper.type.id()) {
     case GPUColumnTypeId::INT32:
+    case GPUColumnTypeId::DATE:
       return ResolveTypeCombineColumns<int32_t>(column1, column2, gpuBufferManager);
     case GPUColumnTypeId::INT64:
+      return ResolveTypeCombineColumns<uint64_t>(column1, column2, gpuBufferManager);
+    case GPUColumnTypeId::DECIMAL:
+      if (column1->data_wrapper.getColumnTypeSize() != sizeof(uint64_t)) {
+        throw NotImplementedException("CombineColumns: only 64-bit DECIMAL supported");
+      }
       return ResolveTypeCombineColumns<uint64_t>(column1, column2, gpuBufferManager);
     case GPUColumnTypeId::FLOAT64:
       return ResolveTypeCombineColumns<double>(column1, column2, gpuBufferManager);
@@ -202,14 +208,26 @@ void HandleGroupByAggregateCuDF(vector<shared_ptr<GPUColumn>>& group_by_keys,
   // and COUNT_DISTINCT are excluded — they would need SUM+COUNT carriers; those
   // stay on the magi-direct path. The cudf decision is identical on every GPU
   // (same query + even slicing) so the begin barrier inside Run() stays balanced.
-  if (magi_groupby::ShouldCudfPreAgg(group_by_keys, num_group_keys)) {
+  if (magi_groupby::ShouldCudfPreAgg(sirius_current_gpu, group_by_keys, num_group_keys)) {
     bool reagg_ok = true;
     for (size_t i = 0; i < aggregates.size(); ++i)
       if (agg_mode[i] == AggregationType::AVERAGE ||
           agg_mode[i] == AggregationType::COUNT_DISTINCT) { reagg_ok = false; break; }
     if (reagg_ok) {
+      const bool pre_pt = std::getenv("MAGI_PHASE_TIME") != nullptr;
+      const auto pre_t0 = std::chrono::steady_clock::now();
+      const uint64_t pre_rows = group_by_keys[0]->column_length;
       cudf_groupby(group_by_keys, aggregate_keys, num_group_keys,
                    static_cast<int>(aggregates.size()), agg_mode, estimated_output_groups);
+      if (pre_pt) {
+        cudaDeviceSynchronize();
+        fprintf(stderr, "[gb-sink gpu=%d] cudf_preagg=%.2fms rows %llu -> %llu\n",
+                sirius_current_gpu,
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - pre_t0).count(),
+                (unsigned long long)pre_rows,
+                (unsigned long long)group_by_keys[0]->column_length);
+      }
       // Re-aggregation of the partials: a COUNT/COUNT_STAR partial is an INT64
       // count column (cudf widened it), which must be SUMMED across the shuffle,
       // not re-counted. SUM/MIN/MAX are already associative and stay as-is.
@@ -513,6 +531,145 @@ SinkResultType GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_
     aggr_idx++;
   }
 
+  // Multi-batch contract: a RIGHT/OUTER join upstream sinks TWICE (matched
+  // pairs + NULL-padded unmatched rows). Stash this batch; FinalizeSink runs
+  // the aggregation once over the union. Single-batch queries take the exact
+  // same code path with a one-element stash.
+  {
+    if (std::getenv("MAGI_PHASE_TIME") != nullptr) {
+      cudaDeviceSynchronize();
+      double mat_ms = std::chrono::duration<double, std::milli>(
+                          std::chrono::high_resolution_clock::now() - start)
+                          .count();
+      fprintf(stderr, "[gb-sink gpu=%d] pre-magi materialize=%.2fms rows=%llu\n",
+              sirius_current_gpu, mat_ms, (unsigned long long)column_size);
+    }
+    auto& rstate = runtime_state<GroupedAggregateRuntimeState>(sirius_current_gpu);
+    auto  batch  = make_shared_ptr<GPUIntermediateRelation>(group_by_column.size() +
+                                                            aggregate_column.size());
+    for (idx_t i = 0; i < group_by_column.size(); i++) { batch->columns[i] = group_by_column[i]; }
+    for (idx_t i = 0; i < aggregate_column.size(); i++) {
+      batch->columns[group_by_column.size() + i] = aggregate_column[i];
+    }
+    rstate.pending.push_back(std::move(batch));
+    rstate.pending_rows.push_back(column_size);
+  }
+
+  auto end      = std::chrono::high_resolution_clock::now();
+  auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+  SIRIUS_LOG_DEBUG("Group Aggregate Sink time: {:.2f} ms", duration.count() / 1000.0);
+
+  return SinkResultType::FINISHED;
+}
+
+void GPUPhysicalGroupedAggregate::FinalizeSink() const
+{
+  auto start = std::chrono::high_resolution_clock::now();
+  GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
+  auto& rstate = runtime_state<GroupedAggregateRuntimeState>(sirius_current_gpu);
+  if (rstate.pending.empty()) { return; }
+  const idx_t n_groups = grouped_aggregate_data.groups.size();
+  const idx_t n_aggs   = grouped_aggregate_data.aggregates.size();
+
+  // Drop empty batches before deciding single-vs-union: a RIGHT_SEMI/ANTI
+  // join's probe-pipeline Execute emits a 0-row batch (its real rows arrive
+  // via the unmatched-scan child pipeline), and concatenating a 0-row batch's
+  // 0-length placeholder columns with real ones produces null-data columns.
+  // If every batch is empty, keep one so the empty-input path behaves as
+  // before.
+  if (rstate.pending.size() > 1) {
+    vector<shared_ptr<GPUIntermediateRelation>> kept;
+    vector<uint64_t>                            kept_rows;
+    for (idx_t bi = 0; bi < rstate.pending.size(); bi++) {
+      if (rstate.pending_rows[bi] > 0) {
+        kept.push_back(rstate.pending[bi]);
+        kept_rows.push_back(rstate.pending_rows[bi]);
+      }
+    }
+    if (kept.empty()) {
+      kept.push_back(rstate.pending[0]);
+      kept_rows.push_back(rstate.pending_rows[0]);
+    }
+    rstate.pending      = std::move(kept);
+    rstate.pending_rows = std::move(kept_rows);
+  }
+
+  vector<shared_ptr<GPUColumn>> group_by_column(n_groups);
+  vector<shared_ptr<GPUColumn>> aggregate_column(n_aggs);
+  uint64_t column_size = rstate.pending_rows[0];
+
+  if (rstate.pending.size() == 1) {
+    // Single batch (every non-outer-join plan): identical to the old flow,
+    // including the 0-length-placeholder conventions cudf_groupby understands.
+    auto& b = *rstate.pending[0];
+    for (idx_t i = 0; i < n_groups; i++) { group_by_column[i] = b.columns[i]; }
+    for (idx_t i = 0; i < n_aggs; i++) { aggregate_column[i] = b.columns[n_groups + i]; }
+  } else {
+    // Union of batches. Aggregate columns may be 0-length NULL placeholders
+    // (a RIGHT join's NULL-padded side): expand them to real all-NULL columns
+    // of the batch's logical row count so the concatenation stays row-aligned;
+    // cudf's null-aware aggregations (COUNT EXCLUDE, SUM skip-null) then give
+    // the exact outer-join semantics. count(*) placeholders (data == nullptr
+    // with FULL length in every batch) stay placeholders with summed length.
+    auto expand_if_placeholder = [&](shared_ptr<GPUColumn> col,
+                                     uint64_t rows) -> shared_ptr<GPUColumn> {
+      if (col->data_wrapper.data != nullptr || col->column_length == rows) { return col; }
+      const auto  type = col->data_wrapper.type;
+      const size_t esz = col->data_wrapper.getColumnTypeSize();
+      uint8_t* data    = gpuBufferManager->customCudaMalloc<uint8_t>(
+        rows > 0 ? rows * esz : 1, sirius_current_gpu, 0);
+      auto mask = createNullMask(rows > 0 ? rows : 1, cudf::mask_state::ALL_NULL);
+      auto out  = make_shared_ptr<GPUColumn>(rows, type, data, mask);
+      out->row_id_count = 0;
+      return out;
+    };
+    column_size = 0;
+    for (idx_t bi = 0; bi < rstate.pending.size(); bi++) { column_size += rstate.pending_rows[bi]; }
+    for (idx_t c = 0; c < n_groups + n_aggs; c++) {
+      // count(*) placeholders: all batches data-null at full length → keep as
+      // a placeholder with the summed length.
+      bool all_placeholder = true;
+      for (idx_t bi = 0; bi < rstate.pending.size(); bi++) {
+        auto& col = rstate.pending[bi]->columns[c];
+        if (col->data_wrapper.data != nullptr) { all_placeholder = false; break; }
+      }
+      shared_ptr<GPUColumn> acc;
+      if (all_placeholder) {
+        acc = make_shared_ptr<GPUColumn>(
+          column_size, rstate.pending[0]->columns[c]->data_wrapper.type, nullptr, nullptr);
+      } else {
+        acc = expand_if_placeholder(rstate.pending[0]->columns[c], rstate.pending_rows[0]);
+        for (idx_t bi = 1; bi < rstate.pending.size(); bi++) {
+          auto next = expand_if_placeholder(rstate.pending[bi]->columns[c],
+                                            rstate.pending_rows[bi]);
+          acc = CombineColumns(acc, next, gpuBufferManager);
+        }
+      }
+      if (c < n_groups) {
+        group_by_column[c] = acc;
+      } else {
+        aggregate_column[c - n_groups] = acc;
+      }
+    }
+  }
+  rstate.pending.clear();
+  rstate.pending_rows.clear();
+
+  RunAggregation(group_by_column, aggregate_column, column_size);
+
+  auto end      = std::chrono::high_resolution_clock::now();
+  auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+  SIRIUS_LOG_DEBUG("Group Aggregate Finalize time: {:.2f} ms", duration.count() / 1000.0);
+}
+
+void GPUPhysicalGroupedAggregate::RunAggregation(vector<shared_ptr<GPUColumn>>& group_by_column,
+                                                 vector<shared_ptr<GPUColumn>>& aggregate_column,
+                                                 uint64_t column_size) const
+{
+  GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
+  auto& aggregates                   = grouped_aggregate_data.aggregates;
+  uint64_t num_group_keys            = grouped_aggregate_data.groups.size();
+
   if (aggregates.size() == 0) {
     // Distinct-only path (no aggregates). Pure-local cudf — gate on
     // column_size > 0; no cross-GPU coordination needed.
@@ -562,10 +719,9 @@ SinkResultType GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_
   // Per-worker assignment (no cross-worker merge): magi has already
   // partitioned the input so this worker's group_by_column[] /
   // aggregate_column[] are its disjoint share of the final result.
-  // GetData below emits these directly. Each Sink call replaces the
-  // per-worker slice; in the current legacy flow Sink is invoked once per
-  // worker per query (one chunk = the worker's whole partition), so the
-  // overwrite is harmless.
+  // GetData emits these directly. RunAggregation runs exactly once per
+  // worker per query (from FinalizeSink, after ALL batches were stashed),
+  // so the assignment is single-shot.
   for (idx_t i = 0; i < grouping_sets[0].size(); i++) {
     slice->columns[i]                = group_by_column[i];
     slice->columns[i]->row_ids       = nullptr;
@@ -577,12 +733,6 @@ SinkResultType GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_
     slice->columns[col]->row_ids     = nullptr;
     slice->columns[col]->row_id_count= 0;
   }
-
-  auto end      = std::chrono::high_resolution_clock::now();
-  auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-  SIRIUS_LOG_DEBUG("Group Aggregate Sink time: {:.2f} ms", duration.count() / 1000.0);
-
-  return SinkResultType::FINISHED;
 }
 
 SourceResultType GPUPhysicalGroupedAggregate::GetData(

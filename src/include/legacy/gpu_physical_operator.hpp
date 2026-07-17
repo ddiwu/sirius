@@ -174,7 +174,14 @@ class GPUPhysicalOperator {
  public:
   // Sink interface
   virtual SinkResultType Sink(GPUIntermediateRelation& input_relation) const;
-  // TODO: Implement SinkExecute if batch-based sink execution is required in the future.
+  //! Called once per worker after the LAST pipeline that sinks into this
+  //! operator completes (the executor precomputes that pipeline from the
+  //! static schedule, so every worker finalizes at the same point). Sinks
+  //! that can legally receive MULTIPLE batches per query — a RIGHT/OUTER
+  //! join feeds its sink from both the probe pipeline and the unmatched-scan
+  //! child pipeline — accumulate in Sink and do their real work here.
+  //! Default: no-op (single-batch sinks keep working in Sink).
+  virtual void FinalizeSink() const {}
 
   virtual SinkFinalizeType CombineFinalize(vector<shared_ptr<GPUIntermediateRelation>>& input,
                                            GPUIntermediateRelation& output) const;
