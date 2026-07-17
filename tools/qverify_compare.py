@@ -108,35 +108,40 @@ def _rows_equal(ra, rb, rtol):
     return True, mr
 
 
-def diff_ordered(a, b, rtol):
+def diff_ordered(a, b, rtol, tie_window=16):
     """Positional row-by-row compare (order-sensitive, for ORDER BY).
-    Adjacent transpositions of rows that are equal within tolerance are counted
-    as near-tie SWAPS, not hard diffs: when the sort key is a float aggregate,
-    two rows whose keys differ only at ~1e-16 can order oppositely between
-    engines (different reduce order), which is a valid ORDER BY result.
-    -> (n_hard_diff, n_soft_swap, max_rel)."""
+    Rows may permute WITHIN a near-tie group: when the sort key is a float
+    aggregate, rows whose keys differ only at ~1e-16 can order arbitrarily
+    between engines (different reduce order) — any such permutation is a valid
+    ORDER BY result, and with many ties it is NOT limited to adjacent swaps
+    (Q11-order showed 3-cycles). A mismatch at position i is soft iff a[i]
+    matches some unconsumed b[j] within tie_window positions; anything else is
+    a hard diff. -> (n_hard_diff, n_soft_swap, max_rel)."""
     n_hard, n_soft, max_rel = 0, 0, 0.0
     if len(a) != len(b):
         n_hard += abs(len(a) - len(b))
     L = min(len(a), len(b))
-    i = 0
-    while i < L:
-        eq, mr = _rows_equal(a[i], b[i], rtol)
-        max_rel = max(max_rel, mr)
-        if eq:
-            i += 1
-            continue
-        # adjacent transposition (near-tie swap)?
-        if i + 1 < L:
-            e1, m1 = _rows_equal(a[i], b[i + 1], rtol)
-            e2, m2 = _rows_equal(a[i + 1], b[i], rtol)
-            if e1 and e2:
-                max_rel = max(max_rel, m1, m2)
-                n_soft += 1
-                i += 2
+    consumed = set()  # b-indices already matched (each b row usable once)
+    for i in range(L):
+        if i not in consumed:
+            eq, mr = _rows_equal(a[i], b[i], rtol)
+            max_rel = max(max_rel, mr)
+            if eq:
+                consumed.add(i)
                 continue
-        n_hard += 1
-        i += 1
+        found = False
+        for j in range(max(0, i - tie_window), min(L, i + tie_window + 1)):
+            if j in consumed:
+                continue
+            ej, mj = _rows_equal(a[i], b[j], rtol)
+            if ej:
+                max_rel = max(max_rel, mj)
+                consumed.add(j)
+                n_soft += 1
+                found = True
+                break
+        if not found:
+            n_hard += 1
     return n_hard, n_soft, max_rel
 
 
