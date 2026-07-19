@@ -19,6 +19,8 @@ Usage: qverify_compare.py [--rtol 1e-6] LABEL=FILE [LABEL=FILE ...]
 The first LABEL=FILE is the reference (usually cpu=...). Exit 0 iff every
 other config matches the reference and is internally consistent per run.
 """
+import csv
+import io as _io
 import re
 import sys
 
@@ -46,6 +48,18 @@ def is_number(s):
         return False
 
 
+def split_csv(line):
+    """CSV-aware split: honors quoted fields (TPC-H comment/address columns
+    contain commas; a naive split misclassified those rows as junk and the
+    compare silently ran on the comma-free subset only)."""
+    if '"' not in line:
+        return line.split(",")
+    try:
+        return next(csv.reader(_io.StringIO(line)))
+    except (csv.Error, StopIteration):
+        return line.split(",")
+
+
 def parse_runs(path):
     """-> (runs, n_junk). Each run: {key_tuple: sorted list of value tuples}."""
     raw_runs, cur, junk = [], [], 0
@@ -59,7 +73,7 @@ def parse_runs(path):
     for line in lines:
         if BOUNDARY in line or line.startswith(("[", "=")):
             continue
-        f = line.split(",")
+        f = split_csv(line)
         if any(is_number(x) for x in f):
             counts[len(f)] = counts.get(len(f), 0) + 1
     shape = max(counts, key=counts.get) if counts else -1
@@ -69,7 +83,7 @@ def parse_runs(path):
                 raw_runs.append(cur)
             cur = []
             continue
-        f = line.split(",")
+        f = split_csv(line)
         if (len(f) == shape and not line.startswith(("[", "=")) and
                 any(is_number(x) for x in f)):
             cur.append(f)
