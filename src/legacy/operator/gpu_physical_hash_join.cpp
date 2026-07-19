@@ -43,6 +43,7 @@ namespace duckdb {
 // device-to-device) into a full-length local buffer. Both workers call this
 // the same number of times in the same order (identical plans), so the
 // static rendezvous slots + barrier stay in lockstep.
+
 static shared_ptr<GPUColumn> AllgatherProbeColumn(const shared_ptr<GPUColumn>& col,
                                                   GPUBufferManager* gpuBufferManager)
 {
@@ -898,6 +899,13 @@ OperatorResultType GPUPhysicalHashJoin::Execute(GPUIntermediateRelation& input_r
     rstate.bcast_candidate  = false;
     rstate.use_shuffle_join = false;
   }
+  // Same cold-cache re-check for the SEMI/LEFT/RIGHT family: a replicated
+  // probe invisible at Sink time would make every GPU emit the same rows.
+  if (rstate.semi_bcast && !children.empty() && SubtreeOutputReplicated(*children[0])) {
+    throw NotImplementedException(
+      "Multi-GPU SEMI/ANTI/LEFT/RIGHT join with a replicated probe side is not supported yet "
+      "(falls back)");
+  }
   if (rstate.bcast_candidate) {
     const auto bt0 = std::chrono::steady_clock::now();
     const uint64_t local_probe = probe_key.empty() ? 0 : probe_key[0]->column_length;
@@ -1449,11 +1457,14 @@ SinkResultType GPUPhysicalHashJoin::Sink(GPUIntermediateRelation& input_relation
     // partition (disjoint by construction), and the NULL-padded unmatched
     // build rows are the flags COMPLEMENT (identical to RIGHT_ANTI's GetData),
     // merged across GPUs and emitted in disjoint row-id ranges.
+    // LEFT is the easy sibling: its unmatched side is the PROBE — a LOCAL
+    // property — so with the build replicated, each GPU's ordinary cudf left
+    // join over its probe partition is already exact (no flags, no GetData).
     const bool semi_family = join_type == JoinType::SEMI || join_type == JoinType::ANTI ||
                              join_type == JoinType::RIGHT_SEMI ||
                              join_type == JoinType::RIGHT_ANTI ||
-                             join_type == JoinType::RIGHT;
-    if (join_type != JoinType::INNER && join_type != JoinType::LEFT && !semi_family) {
+                             join_type == JoinType::RIGHT || join_type == JoinType::LEFT;
+    if (join_type != JoinType::INNER && !semi_family) {
       throw NotImplementedException(
         "Multi-GPU broadcast hash join only supports INNER/LEFT/RIGHT/SEMI/ANTI yet (this join "
         "type falls back)");
@@ -1475,14 +1486,24 @@ SinkResultType GPUPhysicalHashJoin::Sink(GPUIntermediateRelation& input_relation
     const bool probe_replicated =
         (!children.empty() && SubtreeOutputReplicated(*children[0]));
     static const bool force_shuffle = std::getenv("MAGI_FORCE_SHUFFLE_JOIN") != nullptr;
+
     if (semi_family) {
       // SEMI-family scheme: every GPU holds the FULL build side (allgather it
       // below unless the cache already replicated it) and runs the unchanged
       // single-GPU custom build + probe over its LOCAL probe partition.
-      //  - SEMI/ANTI emit local probe rows → outputs are naturally disjoint.
-      //  - RIGHT_SEMI/RIGHT_ANTI emit BUILD rows: each GPU marks the subset
-      //    its probe partition hits; GetData converts marks to row-id flags,
-      //    OR-merges them across GPUs, and emits a disjoint row-id range.
+      //  - SEMI/ANTI/LEFT emit local probe rows → outputs are naturally
+      //    disjoint (LEFT's NULL-padding is a local property of the probe).
+      //  - RIGHT_SEMI/RIGHT_ANTI/RIGHT emit BUILD rows: each GPU marks the
+      //    subset its probe partition hits; GetData converts marks to row-id
+      //    flags, OR-merges them across GPUs, and emits a disjoint range.
+      // A REPLICATED probe breaks the disjointness argument (every GPU would
+      // emit the same rows) — fail loud → DuckDB fallback. Execute re-checks
+      // (probe tables may be uncached at Sink time on the first query).
+      if (probe_replicated) {
+        throw NotImplementedException(
+          "Multi-GPU SEMI/ANTI/LEFT/RIGHT join with a replicated probe side is not supported "
+          "yet (falls back)");
+      }
       auto& srstate      = runtime_state<HashJoinRuntimeState>(gpu);
       srstate.semi_bcast = true;
       semi_bcast_gather  = !build_replicated;
@@ -1609,7 +1630,7 @@ SinkResultType GPUPhysicalHashJoin::Sink(GPUIntermediateRelation& input_relation
   const bool semi_gather_rhs =
     semi_bcast_gather &&
     (join_type == JoinType::RIGHT_SEMI || join_type == JoinType::RIGHT_ANTI ||
-     join_type == JoinType::RIGHT);
+     join_type == JoinType::RIGHT || join_type == JoinType::LEFT);
   int right_idx = 0;
   for (idx_t cond_idx = 0; cond_idx < conditions.size(); cond_idx++) {
     auto& condition     = conditions[cond_idx];

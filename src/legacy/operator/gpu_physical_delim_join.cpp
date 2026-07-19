@@ -19,6 +19,7 @@
 #include "gpu_meta_pipeline.hpp"
 #include "gpu_pipeline.hpp"
 #include "log/logging.hpp"
+#include "gpu_buffer_manager.hpp"
 #include "operator/gpu_physical_column_data_scan.hpp"
 #include "operator/gpu_physical_dummy_scan.hpp"
 #include "operator/gpu_physical_grouped_aggregate.hpp"
@@ -134,17 +135,16 @@ SinkResultType GPUPhysicalLeftDelimJoin::Sink(GPUIntermediateRelation& input_rel
   // auto &lstate = input.local_state.Cast<GPULeftDelimJoinLocalState>();
   // lstate.lhs_data.Append(lstate.append_state, chunk);
   auto& cached_chunk_scan = join->children[0]->Cast<GPUPhysicalColumnDataScan>();
-  // cached_chunk_scan.intermediate_relation = &input_relation;
-  // OperatorSinkInput distinct_sink_input {*distinct->sink_state, *lstate.distinct_state,
-  // input.interrupt_state}; distinct->Sink(context, input_relation, distinct_sink_input);
-  cached_chunk_scan.intermediate_relation =
-    make_shared_ptr<GPUIntermediateRelation>(input_relation.columns.size());
+  // Each worker caches ITS partition into its own slot (see BuildPipelines);
+  // writing the shared intermediate_relation raced across workers.
+  auto slot = make_shared_ptr<GPUIntermediateRelation>(input_relation.columns.size());
   for (int i = 0; i < input_relation.columns.size(); i++) {
     SIRIUS_LOG_DEBUG("Passing input relation idx {} to column data scan idx {}", i, i);
-    cached_chunk_scan.intermediate_relation->columns[i]      = input_relation.columns[i];
-    cached_chunk_scan.intermediate_relation->column_names[i] = input_relation.column_names[i];
-    cached_chunk_scan.intermediate_relation->names           = input_relation.names;
+    slot->columns[i]      = input_relation.columns[i];
+    slot->column_names[i] = input_relation.column_names[i];
+    slot->names           = input_relation.names;
   }
+  (*cached_chunk_scan.per_gpu_relations)[sirius_current_gpu] = std::move(slot);
 
   distinct->Sink(input_relation);
   // Internally-driven distinct (not a scheduled pipeline sink) — finalize
@@ -160,6 +160,15 @@ void GPUPhysicalLeftDelimJoin::BuildPipelines(GPUPipeline& current, GPUMetaPipel
 {
   op_state.reset();
   sink_state.reset();
+
+  // Per-GPU slots for the cached delim input (single-threaded plan phase).
+  // Sink used to write the SHARED intermediate_relation -- last worker won and
+  // every join probe then read ONE GPU's partition on BOTH GPUs (the same
+  // race the materialized-CTE fix addressed; first hit by Q2's correlated
+  // min subquery).
+  auto& cached_chunk_scan = join->children[0]->Cast<GPUPhysicalColumnDataScan>();
+  cached_chunk_scan.per_gpu_relations =
+    make_shared_ptr<vector<shared_ptr<GPUIntermediateRelation>>>(8);
 
   auto& child_meta_pipeline = meta_pipeline.CreateChildMetaPipeline(current, *this);
   child_meta_pipeline.Build(*children[0]);
