@@ -15,6 +15,7 @@
  */
 
 #include "operator/gpu_physical_table_scan.hpp"
+#include "operator/gpu_physical_column_data_scan.hpp"
 
 #include <cstdlib>
 
@@ -1239,6 +1240,19 @@ bool SubtreeOutputReplicated(const GPUPhysicalOperator& op)
 {
   if (op.type == PhysicalOperatorType::UNGROUPED_AGGREGATE) { return true; }
   if (op.type == PhysicalOperatorType::TABLE_SCAN) { return SubtreeAllReplicated(op); }
+  if (op.type == PhysicalOperatorType::CTE_SCAN) {
+    // A CTE materializes its definition's output per GPU: the scan's content
+    // is replicated iff the definition subtree's output is. Consumers'
+    // Sinks run after the CTE pipelines, so the recursion sees warm caches
+    // even on the first query. Without this, a replicated-content CTE (Q2's
+    // europe supplier chain) read as "partitioned" and the join above chose
+    // broadcast-probe — full ⋈ full on every GPU, output duplicated ×N.
+    auto& scan = op.Cast<GPUPhysicalColumnDataScan>();
+    if (scan.cte_op != nullptr && !scan.cte_op->children.empty()) {
+      return SubtreeOutputReplicated(*scan.cte_op->children[0]);
+    }
+    return false;
+  }
   auto children = op.GetChildren();
   if (children.empty()) { return false; }
   for (auto& child : children) {

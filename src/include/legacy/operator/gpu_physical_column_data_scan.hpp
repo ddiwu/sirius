@@ -52,6 +52,14 @@ class GPUPhysicalColumnDataScan : public GPUPhysicalOperator {
   //! When set it takes precedence over intermediate_relation.
   shared_ptr<vector<shared_ptr<GPUIntermediateRelation>>> per_gpu_relations;
 
+  // CTE_SCAN only: the GPUPhysicalCTE this scan reads (set in BuildPipelines).
+  // Lets SubtreeOutputReplicated see through the CTE into its definition —
+  // a CTE materialized from a replicated-output subtree (e.g. Q2's europe
+  // supplier chain over replicated-cached tables) holds a FULL copy per GPU;
+  // treating the scan as partitioned made downstream joins pick strategies
+  // that emitted every result row once per GPU.
+  const GPUPhysicalOperator* cte_op = nullptr;
+
  public:
   SourceResultType GetData(GPUIntermediateRelation& output_relation) const override;
 

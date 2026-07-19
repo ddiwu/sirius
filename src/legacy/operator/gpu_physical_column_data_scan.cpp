@@ -110,9 +110,11 @@ void GPUPhysicalColumnDataScan::BuildPipelines(GPUPipeline& current, GPUMetaPipe
       // namely a dependency on the CTE pipeline to finish
       auto cte_dependency = entry->second.get().shared_from_this();
       auto cte_sink       = state.GetPipelineSink(*cte_dependency);
-      (void)cte_sink;
       D_ASSERT(cte_sink);
       D_ASSERT(cte_sink->type == PhysicalOperatorType::CTE);
+      // Remember the CTE so replication analysis can recurse into its
+      // definition subtree (see SubtreeOutputReplicated).
+      cte_op = cte_sink.get();
       current.AddDependency(cte_dependency);
       state.SetPipelineSource(current, *this);
       return;
