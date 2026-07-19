@@ -457,10 +457,45 @@ static std::size_t run_per_gpu_typed_tier(int                        gpu_id,
   }
   if (!used_single) {
     // Two-kernel global-memory hashagg (see distributed_hash_groupby.cuh). Both
+    // Small-session grid: the shuffle/EOF protocol cost scales with the
+    // BLOCK COUNT (per-block send rings + system-fenced header handshakes on
+    // flush/EOF), not with payload — on a ~25k-row input the fixed 64-block
+    // session costs ~2ms while the actual aggregation is <0.1ms (Q2's min
+    // groupby). Shrink BOTH kernels' grids for small inputs. The ring
+    // geometry is block-symmetric (sender block b fills the peer's ring b),
+    // so sender and receiver grids must match ACROSS GPUs: decide from the
+    // cross-GPU MAX of n_filtered — xc.inputs[] is published before
+    // xc.begin, so every peer computes the same answer. A mismatched grid
+    // would strand cells in rings the receiver never polls (hang).
+    unsigned session_grid = USER_KERNEL_GRID_SIZE;
+    {
+      // DEFAULT OFF: shrinking the grid deadlocked the session (the recv
+      // side evidently waits on ring state beyond the block-symmetric
+      // mapping assumed here — needs a real look at the KBuffering reset /
+      // host-worker geometry before this can be enabled). Opt in with
+      // MAGI_SMALL_SESSION_GRID=<blocks> for experiments.
+      static const long sg_grid = [] {
+        const char* e = std::getenv("MAGI_SMALL_SESSION_GRID");
+        return e ? std::strtol(e, nullptr, 10) : 0L;
+      }();
+      static const long sg_rows = [] {
+        const char* e = std::getenv("MAGI_SMALL_SESSION_ROWS");
+        return e ? std::strtol(e, nullptr, 10) : 200000L;
+      }();
+      if (sg_grid > 0 && sg_rows > 0) {
+        std::uint64_t max_rows = 0;
+        for (int i = 0; i < NUM_GPUS; ++i) {
+          max_rows = std::max<std::uint64_t>(max_rows, xc.inputs[i].n_filtered);
+        }
+        if (max_rows <= static_cast<std::uint64_t>(sg_rows)) {
+          session_grid = static_cast<unsigned>(sg_grid);
+        }
+      }
+    }
     // run on this GPU's magi stream, so kernel B observes a fully-built H.
     //   A: rows -> per-GPU global hash H (no per-block shmem cap → no drop)
     magi::global_preagg_kernel<KeyT, N_SLOTS, SB>
-        <<<USER_KERNEL_GRID_SIZE, BLOCK_SIZE, 0,
+        <<<session_grid, BLOCK_SIZE, 0,
            magi_runtime::magi_stream(gpu_id)>>>(row_ids,
                                             in.n_filtered,
                                             in.cols,
@@ -483,7 +518,7 @@ static std::size_t run_per_gpu_typed_tier(int                        gpu_id,
                                 KBUFFERING_INTRA_PARTITION_SIZE,
                                 KBUFFERING_INTER_PARTITION_SIZE,
                                 N_SLOTS, SB>
-        <<<USER_KERNEL_GRID_SIZE, BLOCK_SIZE, 0,
+        <<<session_grid, BLOCK_SIZE, 0,
            magi_runtime::magi_stream(gpu_id)>>>(stage_typed,
                                             g_ops_dev[gpu_id],
                                             xc.n_ops[gpu_id],
@@ -503,6 +538,52 @@ static std::size_t run_per_gpu_typed_tier(int                        gpu_id,
     if (phase_time)
       std::fprintf(stderr, "[magi-dbg gpu=%d] post-sync: %s\n", gpu_id,
                    cudaGetErrorString(e));
+  }
+  if (std::getenv("MAGI_EOF_PROFILE")) {
+    // Per-block EOF-protocol leg durations recorded by receiver_merge_until_eof
+    // (clock64 deltas within each block; see g_eof_prof layout).
+    unsigned long long prof[64 * 8];
+    if (cudaMemcpyFromSymbol(prof, magi_ops::g_eof_prof, sizeof(prof)) ==
+        cudaSuccess) {
+      static thread_local double us_per_cyc = 0.0;
+      if (us_per_cyc == 0.0) {
+        int dev = 0, khz = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&khz, cudaDevAttrClockRate, dev);
+        us_per_cyc = khz > 0 ? 1000.0 / static_cast<double>(khz) : 0.0;
+      }
+      double mx[4] = {0, 0, 0, 0}, sum[4] = {0, 0, 0, 0};
+      unsigned long long iters = 0, it_flush = 0, it_eof = 0;
+      int n = 0;
+      for (int b = 0; b < 64; ++b) {
+        const unsigned long long* r = &prof[b * 8];
+        if (r[0] == 0 || r[4] == 0) continue;
+        ++n;
+        const double d[4] = {
+          r[1] ? (r[1] - r[0]) * us_per_cyc : 0.0,
+          r[2] ? (r[2] - r[0]) * us_per_cyc : 0.0,
+          r[3] ? (r[3] - r[0]) * us_per_cyc : 0.0,
+          (r[4] - r[0]) * us_per_cyc};
+        for (int i = 0; i < 4; ++i) {
+          if (d[i] > mx[i]) mx[i] = d[i];
+          sum[i] += d[i];
+        }
+        iters += r[5];
+        it_flush += r[6];
+        it_eof += r[7];
+      }
+      if (n > 0) {
+        std::fprintf(stderr,
+                     "[eof-prof gpu=%d] blocks=%d avg/max us: flushed=%.0f/%.0f "
+                     "eof_sent=%.0f/%.0f recv_eof=%.0f/%.0f exit=%.0f/%.0f "
+                     "iters(avg)=%.0f flush_at=%.0f eof_at=%.0f\n",
+                     gpu_id, n, sum[0] / n, mx[0], sum[1] / n, mx[1], sum[2] / n,
+                     mx[2], sum[3] / n, mx[3], (double)iters / n,
+                     (double)it_flush / n, (double)it_eof / n);
+      }
+    } else {
+      (void)cudaGetLastError();
+    }
   }
   auto pt_t5 = pt_clock::now();
   magi_runtime::magi_sync_after_session(gpu_id, xc.session_id);
