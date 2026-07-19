@@ -254,8 +254,18 @@ magi_generic::PerGpuInputs BuildGenericInputs(
       }
       case sirius::AggregationType::MIN:
       case sirius::AggregationType::MAX: {
+        // Same type-based routing as SUM: INT64/DECIMAL≤18 must be read as
+        // int64 (MIN_INT64/MAX_INT64) — the double path would reinterpret
+        // the int64 bit pattern as a denormal double. Lockstep with
+        // BuildAggOpsTable's MIN/MAX branch.
+        const auto  id   = aggs[a] ? aggs[a]->data_wrapper.type.id()
+                                   : GPUColumnTypeId::FLOAT64;
         const void* data = aggs[a] ? aggs[a]->data_wrapper.data : nullptr;
-        in.cols.d_cols[d_idx++] = reinterpret_cast<const double*>(data);
+        if (id == GPUColumnTypeId::INT64 || id == GPUColumnTypeId::DECIMAL) {
+          in.cols.i64_agg_cols[i64a_idx++] = reinterpret_cast<const int64_t*>(data);
+        } else {
+          in.cols.d_cols[d_idx++] = reinterpret_cast<const double*>(data);
+        }
         break;
       }
       case sirius::AggregationType::COUNT_STAR:
@@ -344,15 +354,40 @@ std::vector<magi_ops::AggOpEntry> BuildAggOpsTable(
         e.dst_slot_idx = static_cast<int8_t>(dst_idx++);
         break;
       case sirius::AggregationType::MIN:
-        e.kind         = magi_ops::AggKind::MIN_DOUBLE;
-        e.src_col_idx  = static_cast<int8_t>(d_idx++);
+      case sirius::AggregationType::MAX: {
+        // Kind by input type, mirroring the SUM branch (and BuildGenericInputs'
+        // MIN/MAX routing): FLOAT64 → MIN/MAX_DOUBLE; INT64/DECIMAL≤18 →
+        // MIN/MAX_INT64 (raw int64 order == decimal order at fixed scale; the
+        // emit re-tags the output with the input's {width, scale}).
+        const bool is_min = agg_mode[a] == sirius::AggregationType::MIN;
+        const auto id     = aggs[a] ? aggs[a]->data_wrapper.type.id()
+                                    : GPUColumnTypeId::FLOAT64;
+        if (id == GPUColumnTypeId::FLOAT64) {
+          e.kind        = is_min ? magi_ops::AggKind::MIN_DOUBLE
+                                 : magi_ops::AggKind::MAX_DOUBLE;
+          e.src_col_idx = static_cast<int8_t>(d_idx++);
+        } else if (id == GPUColumnTypeId::INT64 || id == GPUColumnTypeId::DECIMAL) {
+          if (id == GPUColumnTypeId::DECIMAL) {
+            const auto* dti = aggs[a]->data_wrapper.type.GetDecimalTypeInfo();
+            if (dti && dti->GetDecimalTypeSize() > sizeof(int64_t)) {
+              throw NotImplementedException(
+                  "magi_groupby (generic): MIN/MAX on DECIMAL width %d > 18 "
+                  "(int128 storage) not supported yet",
+                  static_cast<int>(dti->width_));
+            }
+          }
+          e.kind        = is_min ? magi_ops::AggKind::MIN_INT64
+                                 : magi_ops::AggKind::MAX_INT64;
+          e.src_col_idx = static_cast<int8_t>(i64a_idx++);
+        } else {
+          throw NotImplementedException(
+              "magi_groupby (generic): MIN/MAX on column type %d not supported "
+              "(only FLOAT64, INT64, DECIMAL≤18)",
+              static_cast<int>(id));
+        }
         e.dst_slot_idx = static_cast<int8_t>(dst_idx++);
         break;
-      case sirius::AggregationType::MAX:
-        e.kind         = magi_ops::AggKind::MAX_DOUBLE;
-        e.src_col_idx  = static_cast<int8_t>(d_idx++);
-        e.dst_slot_idx = static_cast<int8_t>(dst_idx++);
-        break;
+      }
       default:
         throw NotImplementedException(
             "magi_groupby (generic): unsupported AggregationType %d at idx %d",
@@ -445,7 +480,8 @@ void EmitDoubleAggCol(int                                              gpu_id,
                       const std::vector<magi_generic::AggResultRow>&   slice,
                       int                                              dst_slot_idx,
                       shared_ptr<GPUColumn>&                           out_col,
-                      GPUBufferManager*                                gbm)
+                      GPUBufferManager*                                gbm,
+                      int                                              dec = 0)
 {
   if (N == 0) {
     out_col = make_shared_ptr<GPUColumn>(0,
@@ -456,7 +492,13 @@ void EmitDoubleAggCol(int                                              gpu_id,
     return;
   }
   std::vector<double> v(N);
-  for (size_t i = 0; i < N; ++i) v[i] = slice[i].values[dst_slot_idx];
+  for (size_t i = 0; i < N; ++i) {
+    if (dec == 0) { v[i] = slice[i].values[dst_slot_idx]; continue; }
+    // MIN/MAX slots hold the order-preserving encoding — decode.
+    uint64_t u;
+    std::memcpy(&u, &slice[i].values[dst_slot_idx], sizeof(u));
+    v[i] = magi_ops::dec_f64_asc(dec == 1 ? ~u : u);
+  }
   auto* d_buf = gbm->customCudaMalloc<double>(N, gpu_id, false);
   cudaMemcpy(d_buf, v.data(), N * sizeof(double), cudaMemcpyHostToDevice);
   out_col = make_shared_ptr<GPUColumn>(N,
@@ -471,7 +513,8 @@ void EmitInt64AggCol(int                                              gpu_id,
                      const std::vector<magi_generic::AggResultRow>&   slice,
                      int                                              dst_slot_idx,
                      shared_ptr<GPUColumn>&                           out_col,
-                     GPUBufferManager*                                gbm)
+                     GPUBufferManager*                                gbm,
+                     int                                              dec = 0)
 {
   if (N == 0) {
     out_col = make_shared_ptr<GPUColumn>(0,
@@ -484,9 +527,11 @@ void EmitInt64AggCol(int                                              gpu_id,
   std::vector<uint64_t> v(N);
   for (size_t i = 0; i < N; ++i) {
     // COUNT_STAR / COUNT_VALID are stored at `values[dst]` as the raw 8-byte
-    // counter (uint64); just reinterpret the double bit pattern.
+    // counter (uint64); just reinterpret the double bit pattern. MIN/MAX
+    // (dec != 0) hold the order-preserving encoding — decode it.
     double d = slice[i].values[dst_slot_idx];
     std::memcpy(&v[i], &d, sizeof(uint64_t));
+    if (dec != 0) v[i] = (uint64_t)magi_ops::dec_i64_asc(dec == 1 ? ~v[i] : v[i]);
   }
   auto* d_buf = gbm->customCudaMalloc<uint64_t>(N, gpu_id, false);
   cudaMemcpy(d_buf, v.data(), N * sizeof(uint64_t), cudaMemcpyHostToDevice);
@@ -555,13 +600,21 @@ __global__ void k_gb_key_i64(const magi_generic::AggResultRow* in, size_t N, int
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i < N) out[i] = (int64_t)(in[i].key_packed >> shift);
 }
-__global__ void k_gb_double(const magi_generic::AggResultRow* in, size_t N, int slot, double* out) {
+// `dec`: 0 = raw slot word; 1/2 = the slot holds the order-preserving MIN/MAX
+// encoding (agg_slot.cuh) — decode it (MIN stores the bit-inverted encoding).
+__global__ void k_gb_double(const magi_generic::AggResultRow* in, size_t N, int slot, int dec, double* out) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < N) out[i] = in[i].values[slot];
+  if (i >= N) return;
+  if (dec == 0) { out[i] = in[i].values[slot]; return; }
+  uint64_t u; __builtin_memcpy(&u, &in[i].values[slot], 8);
+  out[i] = magi_ops::dec_f64_asc(dec == 1 ? ~u : u);
 }
-__global__ void k_gb_int64(const magi_generic::AggResultRow* in, size_t N, int slot, uint64_t* out) {
+__global__ void k_gb_int64(const magi_generic::AggResultRow* in, size_t N, int slot, int dec, uint64_t* out) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < N) { uint64_t x; __builtin_memcpy(&x, &in[i].values[slot], 8); out[i] = x; }
+  if (i >= N) return;
+  uint64_t x; __builtin_memcpy(&x, &in[i].values[slot], 8);
+  if (dec != 0) x = (uint64_t)magi_ops::dec_i64_asc(dec == 1 ? ~x : x);
+  out[i] = x;
 }
 __global__ void k_gb_avg(const magi_generic::AggResultRow* in, size_t N, int sum_slot, int count_slot,
                          bool sum_is_int64, double scale_div, double* out) {
@@ -609,19 +662,19 @@ void EmitVarcharKeyDevice(int gpu_id, size_t N, const magi_generic::AggResultRow
   out_col = make_shared_ptr<GPUColumn>(N, GPUColumnType(GPUColumnTypeId::VARCHAR), d_chars, d_off, total, true, createNullMask(N));
   out_col->row_id_count = 0;
 }
-void EmitDoubleAggColDevice(int gpu_id, size_t N, const magi_generic::AggResultRow* d_in, int slot, shared_ptr<GPUColumn>& out_col, GPUBufferManager* gbm) {
+void EmitDoubleAggColDevice(int gpu_id, size_t N, const magi_generic::AggResultRow* d_in, int slot, shared_ptr<GPUColumn>& out_col, GPUBufferManager* gbm, int dec = 0) {
   if (N == 0) { out_col = make_shared_ptr<GPUColumn>(0, GPUColumnType(GPUColumnTypeId::FLOAT64), nullptr, nullptr); out_col->row_id_count = 0; return; }
   int tpb; unsigned grid; gb_cfg(N, tpb, grid);
   auto* d = gbm->customCudaMalloc<double>(N, gpu_id, false);
-  k_gb_double<<<grid, tpb>>>(d_in, N, slot, d);
+  k_gb_double<<<grid, tpb>>>(d_in, N, slot, dec, d);
   out_col = make_shared_ptr<GPUColumn>(N, GPUColumnType(GPUColumnTypeId::FLOAT64), reinterpret_cast<uint8_t*>(d), createNullMask(N));
   out_col->row_id_count = 0;
 }
-void EmitInt64AggColDevice(int gpu_id, size_t N, const magi_generic::AggResultRow* d_in, int slot, shared_ptr<GPUColumn>& out_col, GPUBufferManager* gbm) {
+void EmitInt64AggColDevice(int gpu_id, size_t N, const magi_generic::AggResultRow* d_in, int slot, shared_ptr<GPUColumn>& out_col, GPUBufferManager* gbm, int dec = 0) {
   if (N == 0) { out_col = make_shared_ptr<GPUColumn>(0, GPUColumnType(GPUColumnTypeId::INT64), nullptr, nullptr); out_col->row_id_count = 0; return; }
   int tpb; unsigned grid; gb_cfg(N, tpb, grid);
   auto* d = gbm->customCudaMalloc<uint64_t>(N, gpu_id, false);
-  k_gb_int64<<<grid, tpb>>>(d_in, N, slot, d);
+  k_gb_int64<<<grid, tpb>>>(d_in, N, slot, dec, d);
   out_col = make_shared_ptr<GPUColumn>(N, GPUColumnType(GPUColumnTypeId::INT64), reinterpret_cast<uint8_t*>(d), createNullMask(N));
   out_col->row_id_count = 0;
 }
@@ -684,14 +737,18 @@ void WriteGenericSliceToColumnsDevice(int gpu_id, const magi_generic::AggResultR
         const auto* in_dti = (in_id == GPUColumnTypeId::DECIMAL && aggs[a]) ? aggs[a]->data_wrapper.type.GetDecimalTypeInfo() : nullptr;
         const int dti_w = in_dti ? in_dti->width_ : 0;
         const int dti_s = in_dti ? in_dti->scale_ : 0;
+        const int mm_dec =
+            agg_mode[a] == sirius::AggregationType::MIN   ? 1
+            : agg_mode[a] == sirius::AggregationType::MAX ? 2
+                                                          : 0;
         if (in_id == GPUColumnTypeId::INT64 || in_id == GPUColumnTypeId::DECIMAL) {
-          EmitInt64AggColDevice(gpu_id, N, d_in, dst_idx++, aggs[a], gbm);
+          EmitInt64AggColDevice(gpu_id, N, d_in, dst_idx++, aggs[a], gbm, mm_dec);
           if (in_id == GPUColumnTypeId::DECIMAL && in_dti && aggs[a]) {
             aggs[a]->data_wrapper.type = GPUColumnType(GPUColumnTypeId::DECIMAL);
             aggs[a]->data_wrapper.type.SetDecimalTypeInfo(dti_w, dti_s);
           }
         } else {
-          EmitDoubleAggColDevice(gpu_id, N, d_in, dst_idx++, aggs[a], gbm);
+          EmitDoubleAggColDevice(gpu_id, N, d_in, dst_idx++, aggs[a], gbm, mm_dec);
         }
         break;
       }
@@ -820,8 +877,12 @@ void WriteGenericSliceToColumns(int                                             
                 : nullptr;
         const int dti_w = in_dti ? in_dti->width_ : 0;
         const int dti_s = in_dti ? in_dti->scale_ : 0;
+        const int mm_dec =
+            agg_mode[a] == sirius::AggregationType::MIN   ? 1
+            : agg_mode[a] == sirius::AggregationType::MAX ? 2
+                                                          : 0;
         if (in_id == GPUColumnTypeId::INT64 || in_id == GPUColumnTypeId::DECIMAL) {
-          EmitInt64AggCol(gpu_id, N, slice, dst_idx++, aggs[a], gbm);
+          EmitInt64AggCol(gpu_id, N, slice, dst_idx++, aggs[a], gbm, mm_dec);
           // Re-tag the (freshly emitted) output column with the input's DECIMAL
           // {width, scale} so result_collector treats it as DECIMAL, not INT64.
           if (in_id == GPUColumnTypeId::DECIMAL && in_dti && aggs[a]) {
@@ -829,7 +890,7 @@ void WriteGenericSliceToColumns(int                                             
             aggs[a]->data_wrapper.type.SetDecimalTypeInfo(dti_w, dti_s);
           }
         } else {
-          EmitDoubleAggCol(gpu_id, N, slice, dst_idx++, aggs[a], gbm);
+          EmitDoubleAggCol(gpu_id, N, slice, dst_idx++, aggs[a], gbm, mm_dec);
         }
         break;
       }
@@ -1220,14 +1281,18 @@ void RunWideKey(int                            gpu_id,
                                  : nullptr;
         const int dti_w = in_dti ? in_dti->width_ : 0;
         const int dti_s = in_dti ? in_dti->scale_ : 0;
+        const int mm_dec =
+            agg_mode[a] == sirius::AggregationType::MIN   ? 1
+            : agg_mode[a] == sirius::AggregationType::MAX ? 2
+                                                          : 0;
         if (in_id == GPUColumnTypeId::INT64 || in_id == GPUColumnTypeId::DECIMAL) {
-          EmitInt64AggColDevice(gpu_id, N, d_rows, dst_idx++, aggs[a], gbm);
+          EmitInt64AggColDevice(gpu_id, N, d_rows, dst_idx++, aggs[a], gbm, mm_dec);
           if (in_id == GPUColumnTypeId::DECIMAL && in_dti && aggs[a]) {
             aggs[a]->data_wrapper.type = GPUColumnType(GPUColumnTypeId::DECIMAL);
             aggs[a]->data_wrapper.type.SetDecimalTypeInfo(dti_w, dti_s);
           }
         } else {
-          EmitDoubleAggColDevice(gpu_id, N, d_rows, dst_idx++, aggs[a], gbm);
+          EmitDoubleAggColDevice(gpu_id, N, d_rows, dst_idx++, aggs[a], gbm, mm_dec);
         }
         break;
       }
