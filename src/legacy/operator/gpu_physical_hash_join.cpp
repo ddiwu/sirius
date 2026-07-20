@@ -1460,14 +1460,19 @@ SinkResultType GPUPhysicalHashJoin::Sink(GPUIntermediateRelation& input_relation
     // LEFT is the easy sibling: its unmatched side is the PROBE — a LOCAL
     // property — so with the build replicated, each GPU's ordinary cudf left
     // join over its probe partition is already exact (no flags, no GetData).
+    // MARK rides the SEMI scheme unchanged: it emits LOCAL probe rows plus a
+    // boolean computed against the (replicated) full build hash table — a
+    // pure probe-side property, so per-GPU outputs stay disjoint. (Correlated
+    // MARK still throws above.)
     const bool semi_family = join_type == JoinType::SEMI || join_type == JoinType::ANTI ||
                              join_type == JoinType::RIGHT_SEMI ||
                              join_type == JoinType::RIGHT_ANTI ||
-                             join_type == JoinType::RIGHT || join_type == JoinType::LEFT;
+                             join_type == JoinType::RIGHT || join_type == JoinType::LEFT ||
+                             join_type == JoinType::MARK;
     if (join_type != JoinType::INNER && !semi_family) {
       throw NotImplementedException(
-        "Multi-GPU broadcast hash join only supports INNER/LEFT/RIGHT/SEMI/ANTI yet (this join "
-        "type falls back)");
+        "Multi-GPU broadcast hash join only supports INNER/LEFT/RIGHT/SEMI/ANTI/MARK yet (this "
+        "join type falls back)");
     }
     // SubtreeOutputReplicated (not the scan-only SubtreeAllReplicated): an
     // interior ungrouped aggregate's output (e.g. Q15's max-of-revenue0
