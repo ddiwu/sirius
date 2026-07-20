@@ -15,6 +15,7 @@
  */
 
 #include "operator/gpu_physical_nested_loop_join.hpp"
+#include "operator/gpu_physical_table_scan.hpp"
 
 #include "cudf/cudf_utils.hpp"
 #include "duckdb/common/enums/physical_operator_type.hpp"
@@ -199,7 +200,9 @@ GPUPhysicalNestedLoopJoin::GPUPhysicalNestedLoopJoin(
   //         condition_types.push_back(type);
   //     }
   // }
-  right_temp_data = make_shared_ptr<GPUIntermediateRelation>(children[1]->GetTypes().size());
+  for (auto& slot : right_temp_data_slots) {
+    slot = make_shared_ptr<GPUIntermediateRelation>(children[1]->GetTypes().size());
+  }
 }
 
 GPUPhysicalNestedLoopJoin::GPUPhysicalNestedLoopJoin(LogicalOperator& op,
@@ -235,7 +238,9 @@ GPUPhysicalNestedLoopJoin::GPUPhysicalNestedLoopJoin(LogicalOperator& op,
   //         condition_types.push_back(type);
   //     }
   // }
-  right_temp_data = make_shared_ptr<GPUIntermediateRelation>(children[1]->GetTypes().size());
+  for (auto& slot : right_temp_data_slots) {
+    slot = make_shared_ptr<GPUIntermediateRelation>(children[1]->GetTypes().size());
+  }
 }
 
 bool GPUPhysicalNestedLoopJoin::IsSupported(const vector<JoinCondition>& conditions,
@@ -271,6 +276,26 @@ SinkResultType GPUPhysicalNestedLoopJoin::Sink(GPUIntermediateRelation& input_re
   auto start = std::chrono::high_resolution_clock::now();
 
   GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
+
+  // Multi-GPU gate: each GPU runs the unchanged local NL join over its probe
+  // partition, which is exact iff the build side is REPLICATED (e.g. Q22's
+  // interior avg scalar) and the probe side is partitioned. Any other layout
+  // would need a broadcast/shuffle NL join — fail loud → DuckDB fallback.
+  if (GPUBufferManager::GetMaxGpus() > 1) {
+    const bool build_replicated =
+      children.size() >= 2 && SubtreeOutputReplicated(*children[1]);
+    const bool probe_replicated =
+      !children.empty() && SubtreeOutputReplicated(*children[0]);
+    if (!build_replicated || probe_replicated) {
+      throw NotImplementedException(
+        "Multi-GPU nested-loop join supports replicated build + partitioned probe only "
+        "(this shape falls back)");
+    }
+  }
+
+  auto& right_temp_data = right_temp_data_slots[sirius_current_gpu];
+  right_temp_data =
+    make_shared_ptr<GPUIntermediateRelation>(input_relation.columns.size());
 
   for (idx_t cond_idx = 0; cond_idx < conditions.size(); cond_idx++) {
     auto& condition     = conditions[cond_idx];
@@ -350,6 +375,7 @@ void GPUPhysicalNestedLoopJoin::ResolveSimpleJoin(GPUIntermediateRelation& input
 OperatorResultType GPUPhysicalNestedLoopJoin::ResolveComplexJoin(
   GPUIntermediateRelation& input_relation, GPUIntermediateRelation& output_relation) const
 {
+  auto& right_temp_data = right_temp_data_slots[sirius_current_gpu];
   auto start = std::chrono::high_resolution_clock::now();
 
   GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
@@ -492,6 +518,7 @@ OperatorResultType GPUPhysicalNestedLoopJoin::ResolveComplexJoin(
 
 SourceResultType GPUPhysicalNestedLoopJoin::GetData(GPUIntermediateRelation& output_relation) const
 {
+  auto& right_temp_data = right_temp_data_slots[sirius_current_gpu];
   auto start = std::chrono::high_resolution_clock::now();
 
   // check if we need to scan any unmatched tuples from the RHS for the full/right outer join

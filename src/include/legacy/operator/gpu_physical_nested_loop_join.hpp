@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <array>
 #include "duckdb/common/value_operations/value_operations.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/execution/join_hashtable.hpp"
@@ -80,7 +81,11 @@ class GPUPhysicalNestedLoopJoin : public GPUPhysicalOperator {
   //! Duplicate eliminated types; only used for delim_joins (i.e. correlated subqueries)
   vector<LogicalType> delim_types;
 
-  shared_ptr<GPUIntermediateRelation> right_temp_data;
+  // Per-GPU build-side cache. Sink runs once per GPU worker; a single shared
+  // relation raced across workers (last-writer-wins), so one GPU's probe
+  // kernel dereferenced the other GPU's build pointers — illegal memory
+  // access on multi-GPU NL joins (first hit by Q22's avg-scalar compare).
+  mutable std::array<shared_ptr<GPUIntermediateRelation>, 8> right_temp_data_slots;
 
   unique_ptr<JoinFilterPushdownInfo> filter_pushdown;
 
