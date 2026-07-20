@@ -197,6 +197,55 @@ void HandleGroupByAggregateCuDF(vector<shared_ptr<GPUColumn>>& group_by_keys,
     }
   }
 
+  // COUNT(DISTINCT x): magi slots can't carry a distinct SET, so one shuffled
+  // aggregation cannot merge partial distinct counts across GPUs. Run TWO
+  // magi rounds instead:
+  //   (A) group by (group keys + x), dummy COUNT_STAR — the hash shuffle
+  //       globally dedups the compound key and leaves each GPU a disjoint
+  //       slice of the distinct tuples;
+  //   (B) group by the original keys, COUNT_STAR over A's slice — counting
+  //       deduped rows IS the distinct count, and the output lands in the
+  //       normal partitioned-slice contract.
+  // Both rounds are collective and the branch is plan-derived (identical on
+  // every worker), so the magi barriers stay balanced. Restricted to the
+  // single-aggregate shape (Q16); mixing DISTINCT with other aggregates
+  // throws -> DuckDB fallback (never a wrong answer).
+  {
+    bool has_distinct = false;
+    for (size_t i = 0; i < aggregates.size(); ++i) {
+      if (agg_mode[i] == AggregationType::COUNT_DISTINCT) { has_distinct = true; }
+    }
+    if (has_distinct) {
+      if (aggregates.size() != 1) {
+        throw NotImplementedException(
+          "COUNT(DISTINCT) mixed with other aggregates not supported yet (falls back)");
+      }
+      AggregationType* star_mode = gpuBufferManager->customCudaHostAlloc<AggregationType>(1);
+      star_mode[0] = AggregationType::COUNT_STAR;
+
+      vector<shared_ptr<GPUColumn>> pa_keys;
+      for (int k = 0; k < num_group_keys; ++k) { pa_keys.push_back(group_by_keys[k]); }
+      pa_keys.push_back(aggregate_keys[0]);
+      vector<shared_ptr<GPUColumn>> pa_aggs(1);
+      pa_aggs[0] = make_shared_ptr<GPUColumn>(0, GPUColumnType(GPUColumnTypeId::INT64),
+                                              nullptr, nullptr);
+      magi_groupby::Run(sirius_current_gpu, pa_keys, pa_aggs, num_group_keys + 1, 1,
+                        star_mode);
+
+      vector<shared_ptr<GPUColumn>> pb_keys;
+      for (int k = 0; k < num_group_keys; ++k) { pb_keys.push_back(pa_keys[k]); }
+      vector<shared_ptr<GPUColumn>> pb_aggs(1);
+      pb_aggs[0] = make_shared_ptr<GPUColumn>(0, GPUColumnType(GPUColumnTypeId::INT64),
+                                              nullptr, nullptr);
+      magi_groupby::Run(sirius_current_gpu, pb_keys, pb_aggs, num_group_keys, 1,
+                        star_mode);
+
+      for (int k = 0; k < num_group_keys; ++k) { group_by_keys[k] = pb_keys[k]; }
+      aggregate_keys[0] = pb_aggs[0];
+      return;
+    }
+  }
+
   // HIGH-CARDINALITY local pre-aggregation with cudf. magi's open-addressing
   // local hash is weak when a per-GPU slice has millions of distinct keys (it
   // routes to the XLARGE tier whose O(slots) init/flush dominates, or — before
