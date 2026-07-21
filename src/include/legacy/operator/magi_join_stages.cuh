@@ -43,8 +43,11 @@ namespace duckdb {
 namespace magi_join {
 
 // Max payload columns carried inline on a wire tuple (and in JoinResultRow).
-// Shared by the build and probe wires.
-constexpr int JOIN_MAX_PAYLOAD = 4;
+// Shared by the build and probe wires. 4 -> 6: Q9's probe side carries 5
+// numeric payload columns (l_extendedprice/discount/quantity, ps_supplycost,
+// s_nationkey); 6 makes each wire tuple exactly 64B (= CELL_SIZE, nicer than
+// the old 48B) and still fits H_build's AggSlot64<i64,64> values (N_DOUBLES=6).
+constexpr int JOIN_MAX_PAYLOAD = 6;
 
 // Build-side wire tuple. 48B. `index` is magi's EOF/validity marker (receiver
 // checks index != -1). `key` is the full join key (partition + hash). `payload`
@@ -57,7 +60,7 @@ struct alignas(16) JoinBuildWire {
   int64_t key;        // join key — routed by the partition functor, hashed into H_build
   int64_t payload[JOIN_MAX_PAYLOAD];   // build payload (RHS output cols), raw 8B
 };
-static_assert(sizeof(JoinBuildWire) == 48, "JoinBuildWire must be 48B");
+static_assert(sizeof(JoinBuildWire) == 64, "JoinBuildWire must be 64B");
 
 // Receiver/partition actions are functor structs (not lambdas): the legacy
 // build does not enable nvcc --extended-lambda, and functors are the idiom the
@@ -107,7 +110,7 @@ struct alignas(16) JoinProbeWire {
   int64_t key;       // join key
   int64_t payload[JOIN_MAX_PAYLOAD];
 };
-static_assert(sizeof(JoinProbeWire) == 48, "JoinProbeWire must be 48B");
+static_assert(sizeof(JoinProbeWire) == 64, "JoinProbeWire must be 64B");
 
 // Find-only open-addressing probe of H_build (never claims a slot). Returns the
 // matching slot or nullptr. v1 supports <=8B keys (Q11's join key is int32).

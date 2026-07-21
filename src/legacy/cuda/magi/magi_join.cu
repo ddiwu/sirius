@@ -105,7 +105,11 @@ BuildJoinInputs(const std::vector<shared_ptr<GPUColumn>>& keys,
       in.cols.d_cols[d_idx] = reinterpret_cast<const double*>(data);
       out_payload_tbl.push_back({JoinPayloadEntry::Src::DOUBLE, (int16_t)d_idx, (int16_t)dst_slot});
       ++d_idx; ++dst_slot;
-    } else if (id == GPUColumnTypeId::INT32) {  // INTEGER — widened to int64 on the wire
+    } else if (id == GPUColumnTypeId::INT32 ||
+               id == GPUColumnTypeId::DATE) {  // 4-byte — widened to int64 on
+      // the wire; DATE packs identically to INTEGER (int32 day count) and the
+      // emit re-tags from the prototype column, so dates come back as DATE
+      // (first needed by Q9's o_orderdate build payload).
       in.cols.i_cols[i_idx] = reinterpret_cast<const int32_t*>(data);
       out_payload_tbl.push_back({JoinPayloadEntry::Src::INT32, (int16_t)i_idx, (int16_t)dst_slot});
       ++i_idx; ++dst_slot;

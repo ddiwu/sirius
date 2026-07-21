@@ -224,9 +224,12 @@ static BcastStrategy PickBcastStrategy(uint64_t probe_total,
   // rules below additionally keep it small RELATIVE to the other side.
   // TPC-H SF50 reference: Q14 probe 3.7M, Q3 builds 1.5M/7.3M, Q12 build
   // 1.6M — all far under the cap.
+  // 16M -> 20M: Q9's probe (part-filtered lineitem side) is 16.32M rows —
+  // 2% over the old cap — and broadcasting it (~784MB, ~2ms NVLink) beats the
+  // v1 shuffle, which stalls at 75M-tuple wire volume (host-relayed).
   static const uint64_t probe_max = [] {
     const char* e = std::getenv("MAGI_BCAST_PROBE_MAX");
-    return e ? std::strtoull(e, nullptr, 10) : uint64_t(16'000'000);
+    return e ? std::strtoull(e, nullptr, 10) : uint64_t(20'000'000);
   }();
   static const uint64_t build_max = [] {
     const char* e = std::getenv("MAGI_BCAST_BUILD_MAX");
@@ -1091,7 +1094,7 @@ OperatorResultType GPUPhysicalHashJoin::Execute(GPUIntermediateRelation& input_r
     auto is_supported = [](GPUColumnTypeId tid) {
       return tid == GPUColumnTypeId::INT32 || tid == GPUColumnTypeId::INT64 ||
              tid == GPUColumnTypeId::FLOAT64 || tid == GPUColumnTypeId::DECIMAL ||
-             tid == GPUColumnTypeId::VARCHAR;
+             tid == GPUColumnTypeId::VARCHAR || tid == GPUColumnTypeId::DATE;
     };
     // Wire-slot budget per side: a numeric payload is 1 slot, a VARCHAR is
     // inlined into 4 (length-prefixed, ≤31 chars). Each side's total slots must
@@ -1104,19 +1107,22 @@ OperatorResultType GPUPhysicalHashJoin::Execute(GPUIntermediateRelation& input_r
       auto tid = input_relation.columns[col_idx]->data_wrapper.type.id();
       if (!is_supported(tid))
         throw NotImplementedException(
-          "magi shuffle join v1: LHS payload column type unsupported (INT32/INT64/DECIMAL/FLOAT64/VARCHAR)");
+          "magi shuffle join v1: LHS payload column type unsupported (INT32/INT64/DECIMAL/FLOAT64/VARCHAR/DATE)");
       lhs_slots += slot_width(tid);
     }
     for (idx_t i = 0; i < rhs_output_columns.col_idxs.size(); i++) {
       auto tid = rstate.shuffle_build_payload->columns[i]->data_wrapper.type.id();
       if (!is_supported(tid))
         throw NotImplementedException(
-          "magi shuffle join v1: RHS payload column type unsupported (INT32/INT64/DECIMAL/FLOAT64/VARCHAR)");
+          "magi shuffle join v1: RHS payload column type unsupported (INT32/INT64/DECIMAL/FLOAT64/VARCHAR/DATE)");
       rhs_slots += slot_width(tid);
     }
-    if (lhs_slots > 4 || rhs_slots > 4)
+    // 6 == magi_join::JOIN_MAX_PAYLOAD (magi_join_stages.cuh) — kept as a
+    // literal because that header is device code this TU can't include.
+    if (lhs_slots > 6 || rhs_slots > 6)
       throw NotImplementedException(
-        "magi shuffle join v1: payload exceeds 4 wire slots/side (a VARCHAR uses all 4)");
+        "magi shuffle join v1: payload exceeds the per-side wire slot budget "
+        "(6 slots; a VARCHAR uses 4)");
 
     vector<shared_ptr<GPUColumn>> build_key_cols;
     for (idx_t c = 0; c < conditions.size(); c++)
