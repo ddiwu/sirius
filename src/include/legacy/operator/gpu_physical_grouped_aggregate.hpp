@@ -18,6 +18,7 @@
 
 #include "duckdb/execution/operator/aggregate/distinct_aggregate_data.hpp"
 #include "duckdb/execution/operator/aggregate/grouped_aggregate_data.hpp"
+#include "operator/magi_groupby.hpp"
 #include "duckdb/execution/operator/aggregate/physical_hash_aggregate.hpp"
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/execution/radix_partitioned_hashtable.hpp"
@@ -77,6 +78,13 @@ struct GroupedAggregateRuntimeState : OpRuntimeState {
   vector<uint64_t>                            pending_rows;
 };
 
+// Concatenate two dense GPU columns of the same type (defined in
+// gpu_physical_grouped_aggregate.cpp; also used by the ungrouped aggregate's
+// multi-batch FinalizeSink).
+shared_ptr<GPUColumn> CombineColumns(shared_ptr<GPUColumn> column1,
+                                     shared_ptr<GPUColumn> column2,
+                                     GPUBufferManager* gpuBufferManager);
+
 class GPUPhysicalGroupedAggregate : public GPUPhysicalOperator {
  public:
   GPUPhysicalGroupedAggregate(ClientContext& context,
@@ -102,6 +110,12 @@ class GPUPhysicalGroupedAggregate : public GPUPhysicalOperator {
 
   //! The grouping sets
   GroupedAggregateData grouped_aggregate_data;
+
+  // HAVING pushdown (set at plan time when a FILTER(agg cmp constant) sits
+  // directly above this aggregate): applied inside the magi flush compaction
+  // so only qualifying groups are extracted. The plan FILTER stays as the
+  // exact residual check. cmp==0 -> disabled.
+  magi_groupby::SlotPredicate having_pushdown;
 
   vector<GroupingSet> grouping_sets;
   //! The radix partitioned hash tables (one per grouping set)

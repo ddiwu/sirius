@@ -17,6 +17,21 @@
 namespace duckdb {
 namespace magi_groupby {
 
+// HAVING pushdown: keep a group iff `slot-value cmp threshold`, applied inside
+// the magi flush compaction on the FINAL (post-shuffle, fully merged) table —
+// so the predicate sees GLOBAL aggregates. The comparison runs on the SLOT
+// REPRESENTATION: raw int64 for SUM over INT/DECIMAL and COUNT (the caller
+// pre-scales DECIMAL thresholds by 10^scale, with 1-unit CONSERVATIVE slack so
+// rounding can only keep extra rows — the residual plan FILTER trims those),
+// double for SUM over FLOAT64. cmp: 0=off, 1 '>', 2 '>=', 3 '<', 4 '<='.
+struct SlotPredicate {
+  int       cmp            = 0;
+  int       slot           = 0;
+  bool      value_is_int64 = false;
+  double    d_threshold    = 0.0;
+  long long i_threshold    = 0;
+};
+
 // gpu_id: this thread's GPU index in [0, kSiriusLegacyNumGpus).
 //
 // On entry: group_by_keys[i] / aggregate_keys[i] hold this GPU's input
@@ -37,7 +52,8 @@ void Run(int                                gpu_id,
          vector<shared_ptr<GPUColumn>>&     aggregate_keys,
          int                                num_group_keys,
          int                                num_aggregates,
-         sirius::AggregationType*           agg_mode);
+         sirius::AggregationType*           agg_mode,
+         const SlotPredicate&               having_pred = {});
 
 // True iff this per-GPU slice is high-cardinality (would route magi to XLARGE).
 // The operator runs a cudf local groupby first for these, then calls Run() on the

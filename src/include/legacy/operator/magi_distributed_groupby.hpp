@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <vector>
 
+#include "operator/magi_groupby.hpp"
 #include "data_plane/ops/agg_kinds.cuh"
 #include "data_plane/ops/agg_slot.cuh"
 #include "data_plane/ops/col_pack.cuh"
@@ -50,15 +51,18 @@ enum class KeyKind : std::int8_t {
 // PickTableSize routes low-cardinality BIGINT-keyed queries (Q11) down to the
 // small tiers, so only genuinely high-card queries pay the big-tier copyback.
 enum class TableSize : std::int8_t {
-  SMALL  = 0,
-  MEDIUM = 1,
-  LARGE  = 2,
-  XLARGE = 3,
+  SMALL   = 0,
+  MEDIUM  = 1,
+  LARGE   = 2,
+  XLARGE  = 3,
+  XXLARGE = 4,
 };
 
 // Tier slot counts. Single source of truth shared by the cardinality→tier
 // routing policy (PickTableSize, magi_groupby.cu) and the kernel
 // instantiations / dispatch (magi_groupby_runtime.cu) so they cannot drift.
+using SlotPredicate = ::duckdb::magi_groupby::SlotPredicate;
+
 constexpr int N_SLOTS_SMALL  = 256;
 constexpr int N_SLOTS_MEDIUM = 16 * 1024;
 constexpr int N_SLOTS_LARGE  = 1024 * 1024;
@@ -69,6 +73,13 @@ constexpr int N_SLOTS_LARGE  = 1024 * 1024;
 // g_agg_dev/g_stage_dev grow to 16M*64B = 1 GB each per GPU (always allocated).
 // Must stay a power of two (open-addressing uses `& (N_SLOTS-1)`); 16M = 2^24.
 constexpr int N_SLOTS_XLARGE = 16 * 1024 * 1024;
+// XXLARGE (64M = 2^26): Q18-class cardinality — group by l_orderkey leaves
+// ~37.5M partials PER GPU after the cudf local pre-agg (est ×1.33 ≈ 50M).
+// Beyond the tier the global hash overflowed and kernel B DEADLOCKED (the
+// overflow drain never reached EOF); Run() now throws a cross-GPU-consistent
+// NotImplemented beyond XXLARGE instead. 64B slots only (≤6 agg values) —
+// a 128B XXLARGE table would double the always-allocated arena again.
+constexpr int N_SLOTS_XXLARGE = 64 * 1024 * 1024;
 
 // One worker thread's input: how many rows + the packed column views the
 // kernel will read. ColPack column ordering must match the KeyFieldEntry[]
@@ -113,7 +124,9 @@ std::size_t distributed_hash_groupby_run_per_gpu(
     // device_emit=true: skip the host slice build and instead return (via
     // d_rows_out) a device AggResultRow buffer for on-device column emit.
     bool                                             device_emit = false,
-    AggResultRow**                                   d_rows_out  = nullptr);
+    AggResultRow**                                   d_rows_out  = nullptr,
+    // HAVING pushdown predicate applied in the flush compaction (default off).
+    const SlotPredicate&                             having_pred = {});
 
 // Number of GPUs the runtime expects, mirrored from
 // `magi_runtime::NUM_GPUS` (= `kSiriusLegacyNumGpus`). Exposed so sirius

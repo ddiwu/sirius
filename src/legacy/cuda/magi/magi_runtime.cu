@@ -256,18 +256,24 @@ void MagiInitOnce()
 }
 
 // ── Identity row_ids[0..n) per GPU, cached and grown on demand ────────────
+__global__ static void k_iota_u64(uint64_t* p, size_t n)
+{
+  const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) p[i] = i;
+}
+
 static uint64_t* GetIdentityRowIds(MagiState& s, int gpu, size_t n)
 {
   if (s.row_ids_capacity[gpu] >= n) return s.row_ids_dev[gpu];
   CHECK_CUDA_ERR(cudaSetDevice(gpu));
   if (s.row_ids_dev[gpu]) cudaFree(s.row_ids_dev[gpu]);
   CHECK_CUDA_ERR(cudaMalloc(&s.row_ids_dev[gpu], n * sizeof(uint64_t)));
-  std::vector<uint64_t> host_ids(n);
-  for (size_t i = 0; i < n; ++i) host_ids[i] = i;
-  CHECK_CUDA_ERR(cudaMemcpy(s.row_ids_dev[gpu],
-                            host_ids.data(),
-                            n * sizeof(uint64_t),
-                            cudaMemcpyHostToDevice));
+  // Device-side fill. The old host loop + pageable H2D cost ~74ms for a
+  // 37.5M-row first touch (Q18); the kernel is ~0.2ms.
+  constexpr int TPB = 256;
+  const unsigned grid = static_cast<unsigned>((n + TPB - 1) / TPB);
+  k_iota_u64<<<grid, TPB>>>(s.row_ids_dev[gpu], n);
+  CHECK_CUDA_ERR(cudaDeviceSynchronize());
   s.row_ids_capacity[gpu] = n;
   return s.row_ids_dev[gpu];
 }

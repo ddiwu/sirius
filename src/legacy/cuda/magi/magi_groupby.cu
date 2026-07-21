@@ -170,7 +170,9 @@ magi_generic::TableSize PickTableSize(const vector<shared_ptr<GPUColumn>>& keys,
   if (est <= magi_generic::N_SLOTS_SMALL)  return magi_generic::TableSize::SMALL;
   if (est <= magi_generic::N_SLOTS_MEDIUM) return magi_generic::TableSize::MEDIUM;
   if (est <= magi_generic::N_SLOTS_LARGE)  return magi_generic::TableSize::LARGE;
-  return magi_generic::TableSize::XLARGE;
+  if (est <= magi_generic::N_SLOTS_XLARGE) return magi_generic::TableSize::XLARGE;
+  // Beyond XXLARGE Run()'s cross-GPU-consistent guard throws (fallback).
+  return magi_generic::TableSize::XXLARGE;
 }
 
 magi_generic::PerGpuInputs BuildGenericInputs(
@@ -1080,7 +1082,8 @@ void RunWideKey(int                            gpu_id,
                 vector<shared_ptr<GPUColumn>>& aggs,
                 int                            num_group_keys,
                 int                            num_aggregates,
-                sirius::AggregationType*       agg_mode)
+                sirius::AggregationType*       agg_mode,
+                const magi_generic::SlotPredicate& having_pred = {})
 {
   GPUBufferManager* gbm      = &GPUBufferManager::GetInstance();
   const int         num_gpus = static_cast<int>(gbm->tables_per_gpu.size());
@@ -1208,7 +1211,7 @@ void RunWideKey(int                            gpu_id,
   magi_generic::AggResultRow*             d_rows = nullptr;
   const std::size_t N = magi_generic::distributed_hash_groupby_run_per_gpu(
       gpu_id, in, key_fields, ops, key_kind, table_size, slice,
-      /*device_emit=*/true, &d_rows);
+      /*device_emit=*/true, &d_rows, having_pred);
   const auto t_run = std::chrono::steady_clock::now();
   if (phase_time) {
     cudaError_t e = cudaGetLastError();
@@ -1373,7 +1376,10 @@ static uint64_t CrossGpuMaxRows(int gpu_id, uint64_t local_rows)
 
 bool ShouldCudfPreAgg(int gpu_id, vector<shared_ptr<GPUColumn>>& keys, int n_keys)
 {
-  if (PickTableSize(keys, n_keys) == magi_generic::TableSize::XLARGE) { return true; }
+  // >= : the predicate means "big-tier bound" — adding XXLARGE above XLARGE
+  // silently disabled the pre-agg for Q18-class inputs (150M raw rows went
+  // straight at the tier guard and fell back).
+  if (PickTableSize(keys, n_keys) >= magi_generic::TableSize::XLARGE) { return true; }
   // Inputs headed for the WIDE path benefit from a local pre-agg regardless
   // of the tier estimate: the 320B-slot machinery costs O(input rows) at
   // random-access bandwidth, so collapse duplicates locally first. Q4's
@@ -1446,7 +1452,8 @@ void Run(int                                gpu_id,
          vector<shared_ptr<GPUColumn>>&     aggregate_keys,
          int                                num_group_keys,
          int                                num_aggregates,
-         sirius::AggregationType*           agg_mode)
+         sirius::AggregationType*           agg_mode,
+         const SlotPredicate&               having_pred)
 {
   // ── Widen narrow SUM/AVG inputs up front ────────────────────────────────
   // SUM over INT32 (e.g. Q12's `CASE WHEN .. THEN 1 ELSE 0`) has no device
@@ -1491,7 +1498,7 @@ void Run(int                                gpu_id,
     if (std::getenv("MAGI_NO_WIDE_GROUPBY") == nullptr &&
         WideKeyShapeSupported(group_by_keys, num_group_keys)) {
       RunWideKey(gpu_id, group_by_keys, aggregate_keys, num_group_keys,
-                 num_aggregates, agg_mode);
+                 num_aggregates, agg_mode, having_pred);
       return;
     }
     throw NotImplementedException(
@@ -1514,7 +1521,7 @@ void Run(int                                gpu_id,
   magi_generic::AggResultRow* d_rows = nullptr;
   const std::size_t n_rows = magi_generic::distributed_hash_groupby_run_per_gpu(
       gpu_id, in, key_fields, ops, key_kind, table_size, slice,
-      /*device_emit=*/true, &d_rows);
+      /*device_emit=*/true, &d_rows, having_pred);
 
   // Build the output GPUColumns ON-DEVICE directly from the device AggResultRow
   // buffer (no D2H of slots + host slice construction + per-column host transpose).

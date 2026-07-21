@@ -125,7 +125,8 @@ void HandleGroupByAggregateCuDF(vector<shared_ptr<GPUColumn>>& group_by_keys,
                                 GPUBufferManager* gpuBufferManager,
                                 const vector<unique_ptr<Expression>>& aggregates,
                                 int num_group_keys,
-                                idx_t estimated_output_groups)
+                                idx_t estimated_output_groups,
+                                const magi_groupby::SlotPredicate& having_pred = {})
 {
   AggregationType* agg_mode =
     gpuBufferManager->customCudaHostAlloc<AggregationType>(aggregates.size());
@@ -297,7 +298,8 @@ void HandleGroupByAggregateCuDF(vector<shared_ptr<GPUColumn>>& group_by_keys,
                     aggregate_keys,
                     num_group_keys,
                     static_cast<int>(aggregates.size()),
-                    agg_mode);
+                    agg_mode,
+                    having_pred);
 }
 
 void HandleDistinctGroupByCuDF(vector<shared_ptr<GPUColumn>>& group_by_keys,
@@ -746,7 +748,8 @@ void GPUPhysicalGroupedAggregate::RunAggregation(vector<shared_ptr<GPUColumn>>& 
                                  gpuBufferManager,
                                  aggregates,
                                  num_group_keys,
-                                 estimated_cardinality);
+                                 estimated_cardinality,
+                                 having_pushdown);
     }
   }
 

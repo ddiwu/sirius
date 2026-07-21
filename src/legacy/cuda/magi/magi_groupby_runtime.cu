@@ -20,6 +20,7 @@
 // Build is gated by ENABLE_MAGI_TPCH; this TU is not compiled when off.
 
 #include <array>
+#include <algorithm>
 #include <barrier>
 #include <chrono>
 #include <cstddef>
@@ -69,7 +70,9 @@ constexpr int MAX_TIER_SLOTS   = N_SLOTS_XLARGE;
 // the Q3 cuco-style global hashagg work.
 constexpr int N_LOCAL_SLOTS    = N_SLOTS_SMALL;
 constexpr size_t AGG_BUF_BYTES =
-    sizeof(magi_ops::AggSlot64<std::uint64_t, 128>) * MAX_TIER_SLOTS;
+    std::max(sizeof(magi_ops::AggSlot64<std::uint64_t, 128>) * MAX_TIER_SLOTS,
+             sizeof(magi_ops::AggSlot64<std::uint64_t, 64>) *
+                 (size_t)N_SLOTS_XXLARGE);
 
 // Wide-key (320B-slot) table sizes. Two tiers, both fitting the 2GB arena:
 //  - WIDE_M (2M slots, 640MB): picked when this GPU's input rows fit at ≤~60%
@@ -97,6 +100,7 @@ constexpr int slots_for(TableSize t) {
     case TableSize::MEDIUM: return N_SLOTS_MEDIUM;
     case TableSize::LARGE:  return N_SLOTS_LARGE;
     case TableSize::XLARGE: return N_SLOTS_XLARGE;
+    case TableSize::XXLARGE: return N_SLOTS_XXLARGE;
   }
   return N_SLOTS_SMALL;
 }
@@ -128,11 +132,34 @@ template <typename KeyT, int SB>
 __global__ void compact_live_slots_kernel(const magi_ops::AggSlot64<KeyT, SB>* __restrict__ in,
                                           magi_ops::AggSlot64<KeyT, SB>* __restrict__       out,
                                           unsigned int* __restrict__                    count,
-                                          int                                           n_slots)
+                                          int                                           n_slots,
+                                          SlotPredicate                                 pred)
 {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n_slots) return;
   if (in[i].key == magi_ops::empty_key_v<KeyT>) return;
+  // HAVING pushdown: this table is the FINAL (post-shuffle, fully merged)
+  // per-GPU partition, so slot values are GLOBAL aggregates — filtering here
+  // is exact. Thresholds carry conservative slack (may keep extra rows, never
+  // drops a qualifying one); the residual plan FILTER trims the rest.
+  if (pred.cmp != 0) {
+    bool keep;
+    if (pred.value_is_int64) {
+      long long v;
+      memcpy(&v, &in[i].values[pred.slot], sizeof(v));
+      keep = (pred.cmp == 1) ? (v > pred.i_threshold)
+           : (pred.cmp == 2) ? (v >= pred.i_threshold)
+           : (pred.cmp == 3) ? (v < pred.i_threshold)
+                             : (v <= pred.i_threshold);
+    } else {
+      const double v = in[i].values[pred.slot];
+      keep = (pred.cmp == 1) ? (v > pred.d_threshold)
+           : (pred.cmp == 2) ? (v >= pred.d_threshold)
+           : (pred.cmp == 3) ? (v < pred.d_threshold)
+                             : (v <= pred.d_threshold);
+    }
+    if (!keep) return;
+  }
   out[atomicAdd(count, 1u)] = in[i];
 }
 }}  // namespace duckdb::magi_generic
@@ -206,6 +233,8 @@ MAGI_INSTANTIATE_SINGLE(std::uint64_t, 128);
   MAGI_INSTANTIATE_BOTH(KEY_TYPE, duckdb::magi_generic::N_SLOTS_XLARGE, SB)
 
 MAGI_INST_ALLTIERS(std::int32_t,      64);
+MAGI_INSTANTIATE_BOTH(std::int32_t,  duckdb::magi_generic::N_SLOTS_XXLARGE, 64);
+MAGI_INSTANTIATE_BOTH(std::uint64_t, duckdb::magi_generic::N_SLOTS_XXLARGE, 64);
 MAGI_INST_ALLTIERS(std::int32_t,      128);
 MAGI_INST_ALLTIERS(std::uint64_t,     64);
 MAGI_INST_ALLTIERS(std::uint64_t,     128);
@@ -280,6 +309,9 @@ struct GenericExchange {
              NUM_GPUS>                            kfields_host_ptrs{};
   std::array<int, NUM_GPUS>                       n_key_fields{};
   KeyKind                                         key_kind_for_this_query = KeyKind::INT32;
+  // HAVING pushdown predicate, applied in the flush compaction (per-GPU copy;
+  // plan-derived so every worker publishes the identical value).
+  std::array<SlotPredicate, NUM_GPUS>             having_pred{};
   TableSize                                       table_size_for_this_query = TableSize::SMALL;
   std::uint64_t                                   session_id = 0;
 };
@@ -609,12 +641,14 @@ static std::size_t run_per_gpu_typed_tier(int                        gpu_id,
   constexpr int CB = 256;
   const int     cg = (N_SLOTS + CB - 1) / CB;
   compact_live_slots_kernel<KeyT, SB><<<cg, CB, 0, st>>>(agg_d, dense,
-                                                     g_overflow_dev[gpu_id], N_SLOTS);
+                                                     g_overflow_dev[gpu_id], N_SLOTS,
+                                                     exchange().having_pred[gpu_id]);
   unsigned int live = 0;
   cudaMemcpyAsync(&live, g_overflow_dev[gpu_id], sizeof(unsigned int),
                   cudaMemcpyDeviceToHost, st);
   cudaStreamSynchronize(st);
   auto pt_tC = pt_clock::now();
+  bool rows_alloc_failed = false;
   if (device_emit) {
     // On-device: convert the compacted slots to a flat device AggResultRow
     // buffer and hand it to the caller (no D2H of slots + host slice
@@ -630,14 +664,28 @@ static std::size_t run_per_gpu_typed_tier(int                        gpu_id,
       if (static_cast<size_t>(live) * sizeof(AggResultRow) <= AGG_BUF_BYTES) {
         d_rows = reinterpret_cast<AggResultRow*>(g_agg_dev[gpu_id]);
       } else {
-        cudaMalloc(reinterpret_cast<void**>(&d_rows),
+        // Overflow allocation can be huge (AggResultRow is sized for the
+        // widest slot: live 37.5M × ~312B ≈ 11.7GB on Q18) and CAN FAIL —
+        // unchecked, the conversion kernel then writes through garbage
+        // (cudaErrorIllegalAddress poisoning the whole context). Check, and
+        // defer the throw past xc.end like the overflow counter — a
+        // one-sided throw here would strand the peer at the barrier.
+        cudaError_t e = cudaMalloc(reinterpret_cast<void**>(&d_rows),
                    static_cast<size_t>(live) * sizeof(AggResultRow));
-        g_rows_malloc[gpu_id] = d_rows;
+        if (e != cudaSuccess || d_rows == nullptr) {
+          (void)cudaGetLastError();
+          d_rows            = nullptr;
+          rows_alloc_failed = true;
+        } else {
+          g_rows_malloc[gpu_id] = d_rows;
+        }
       }
-      constexpr int RB = 256;
-      const unsigned rg = static_cast<unsigned>((live + RB - 1) / RB);
-      aggslot_to_resultrow<KeyT, SB><<<rg, RB, 0, st>>>(dense, live, d_rows);
-      cudaStreamSynchronize(st);
+      if (d_rows != nullptr) {
+        constexpr int RB = 256;
+        const unsigned rg = static_cast<unsigned>((live + RB - 1) / RB);
+        aggslot_to_resultrow<KeyT, SB><<<rg, RB, 0, st>>>(dense, live, d_rows);
+        cudaStreamSynchronize(st);
+      }
     }
     if (d_rows_out) *d_rows_out = d_rows;
   } else {
@@ -690,6 +738,11 @@ static std::size_t run_per_gpu_typed_tier(int                        gpu_id,
   // GPU result silently undercounts. Throwing makes gpu_processing fall back to
   // DuckDB (correct) instead of returning wrong numbers. Native high-cardinality
   // support is the Q3 cuco-style hashagg work.
+  if (rows_alloc_failed) {
+    throw std::runtime_error(
+        "magi_groupby: device-emit row buffer allocation failed (live rows too "
+        "large); falling back to DuckDB.");
+  }
   if (overflow_count != 0) {
     // std::runtime_error (not a duckdb type) keeps this .cu free of duckdb
     // headers — GPUContext::GPUExecuteQuery catches std::exception and falls
@@ -723,6 +776,16 @@ static std::size_t run_tier(int gpu_id, int n_slots,
   if (std::getenv("MAGI_SB_DEBUG"))
     std::fprintf(stderr, "[magi-sb] gpu=%d n_slots=%d N64=%d -> SB=%dB\n",
                  gpu_id, n_slots, N64, sb);
+  if constexpr (N_SLOTS >= duckdb::magi_generic::N_SLOTS_XXLARGE) {
+    // XXLARGE is instantiated for 64B slots only (arena cost). n_slots is
+    // identical on every GPU (same ops table) so this throw is symmetric.
+    if (n_slots > N64) {
+      throw std::runtime_error(
+        "magi groupby: XXLARGE tier supports at most " + std::to_string(N64) +
+        " aggregate slots (falls back)");
+    }
+    return run_per_gpu_typed_tier<KeyT, N_SLOTS, 64>(gpu_id, my_slice, device_emit, d_rows_out);
+  } else {
   if (n_slots <= N64)  return run_per_gpu_typed_tier<KeyT, N_SLOTS, 64 >(gpu_id, my_slice, device_emit, d_rows_out);
   if (n_slots <= N128) return run_per_gpu_typed_tier<KeyT, N_SLOTS, 128>(gpu_id, my_slice, device_emit, d_rows_out);
   // 320B slots (5 cells): wide-key GROUP BY — 128-bit hash key + inline
@@ -744,6 +807,7 @@ static std::size_t run_tier(int gpu_id, int n_slots,
                  "supported for 128-bit keys\n", n_slots);
     return 0;
   }
+  }
 }
 
 // ── dispatch over (KeyKind, TableSize) × runtime SlotSize ────────────────
@@ -762,6 +826,7 @@ static std::size_t dispatch_by_kind_and_tier(int                        gpu_id,
         case TableSize::MEDIUM: return run_tier<std::int32_t, N_SLOTS_MEDIUM>(gpu_id, n_slots, my_slice, device_emit, d_rows_out);
         case TableSize::LARGE:  return run_tier<std::int32_t, N_SLOTS_LARGE >(gpu_id, n_slots, my_slice, device_emit, d_rows_out);
         case TableSize::XLARGE: return run_tier<std::int32_t, N_SLOTS_XLARGE>(gpu_id, n_slots, my_slice, device_emit, d_rows_out);
+        case TableSize::XXLARGE: return run_tier<std::int32_t, N_SLOTS_XXLARGE>(gpu_id, n_slots, my_slice, device_emit, d_rows_out);
       }
       break;
     case KeyKind::UINT64:
@@ -770,6 +835,7 @@ static std::size_t dispatch_by_kind_and_tier(int                        gpu_id,
         case TableSize::MEDIUM: return run_tier<std::uint64_t, N_SLOTS_MEDIUM>(gpu_id, n_slots, my_slice, device_emit, d_rows_out);
         case TableSize::LARGE:  return run_tier<std::uint64_t, N_SLOTS_LARGE >(gpu_id, n_slots, my_slice, device_emit, d_rows_out);
         case TableSize::XLARGE: return run_tier<std::uint64_t, N_SLOTS_XLARGE>(gpu_id, n_slots, my_slice, device_emit, d_rows_out);
+        case TableSize::XXLARGE: return run_tier<std::uint64_t, N_SLOTS_XXLARGE>(gpu_id, n_slots, my_slice, device_emit, d_rows_out);
       }
       break;
     case KeyKind::UINT128:
@@ -794,7 +860,8 @@ std::size_t distributed_hash_groupby_run_per_gpu(
     TableSize                                        table_size,
     std::vector<AggResultRow>&                       my_slice,
     bool                                             device_emit,
-    AggResultRow**                                   d_rows_out)
+    AggResultRow**                                   d_rows_out,
+    const SlotPredicate&                             having_pred)
 {
   if (gpu_id < 0 || gpu_id >= NUM_GPUS) {
     std::fprintf(stderr,
@@ -829,6 +896,7 @@ std::size_t distributed_hash_groupby_run_per_gpu(
 
   auto& xc = exchange();
   xc.inputs[gpu_id]            = inputs;
+  xc.having_pred[gpu_id]       = having_pred;
   xc.ops_host_ptrs[gpu_id]     = ops.data();
   xc.n_ops[gpu_id]             = static_cast<int>(ops.size());
   xc.kfields_host_ptrs[gpu_id] = key_fields.data();
@@ -838,6 +906,23 @@ std::size_t distributed_hash_groupby_run_per_gpu(
     xc.table_size_for_this_query = table_size;
   }
   xc.begin.arrive_and_wait();
+
+  // Over-tier guard. Past this barrier every worker sees all xc.inputs, so
+  // the cross-GPU MAX gives an identical verdict on every GPU — a one-sided
+  // throw would strand the peer at the next barrier. Cardinality beyond the
+  // largest tier used to overflow the global hash and DEADLOCK kernel B
+  // (Q18 first hit this at ~37.5M partials/GPU before XXLARGE existed).
+  {
+    std::uint64_t mx = 0;
+    for (int i = 0; i < NUM_GPUS; ++i) {
+      mx = std::max<std::uint64_t>(mx, xc.inputs[i].n_filtered);
+    }
+    if (mx + mx / 3 > (std::uint64_t)N_SLOTS_XXLARGE) {
+      throw std::runtime_error(
+        "magi groupby: cardinality estimate exceeds the largest tier "
+        "(falls back to DuckDB)");
+    }
+  }
 
   // Number of agg value-slots this query uses = max dst_slot_idx + 1 over the
   // ops table (includes the hidden AVG COUNT carrier). Drives the 64B-vs-128B
