@@ -285,6 +285,15 @@ size_t GPUPhysicalMaterializedCollector::FinalMaterialize(GPUIntermediateRelatio
           size_bytes = output_relation.columns[col]->column_length * sizeof(int64_t);
           break;
         }
+        case sizeof(__int128_t): {
+          FinalMaterializeInternal<__int128_t>(input_relation, output_relation, col);
+          size_bytes = output_relation.columns[col]->column_length * sizeof(__int128_t);
+          break;
+        }
+        default:
+          // The throw was previously unreachable (no `default:` label): an
+          // unlisted size fell out of the switch silently, leaving the
+          // column unmaterialized.
           throw NotImplementedException(
             "Unsupported sirius DECIMAL column type size in `FinalMaterialize`: %zu",
             input_relation.columns[col]->data_wrapper.getColumnTypeSize());

@@ -39,12 +39,13 @@ void cudf_aggregate(vector<shared_ptr<GPUColumn>>& column,
 // GPUPhysicalMaterializedCollector::GetResult.
 struct UngroupedAggregateRuntimeState : OpRuntimeState {
   shared_ptr<GPUIntermediateRelation> aggregation_result;
-  //! Multi-batch guard: this Sink still assumes ONE batch per worker per
-  //! query. A RIGHT/OUTER join upstream sinks twice (matched + unmatched
-  //! batches) — until the stash/FinalizeSink treatment (see grouped
-  //! aggregate) is applied here too, a second Sink call throws → DuckDB
-  //! fallback instead of a silently overwritten partial.
-  int sink_calls = 0;
+  //! Multi-batch stash: a RIGHT/OUTER join upstream legally sinks twice
+  //! (matched + unmatched batches, see the grouped aggregate's FinalizeSink
+  //! contract). Sink materializes and stashes each batch's aggregate-input
+  //! columns; FinalizeSink concatenates and aggregates ONCE. Single batch =
+  //! the same work, just moved.
+  vector<vector<shared_ptr<GPUColumn>>> pending;
+  vector<uint64_t>                      pending_sizes;
   // For AVG aggregates: per-aggregate non-null row count on this GPU's
   // partition. Sized aggregates.size(); 0 for non-AVG indices. Cross-GPU
   // reduce uses this to compute a count-weighted average from the per-GPU
@@ -96,6 +97,7 @@ class GPUPhysicalUngroupedAggregate : public GPUPhysicalOperator {
 
  public:
   SinkResultType Sink(GPUIntermediateRelation& input_relation) const override;
+  void FinalizeSink() const override;
 
   bool IsSink() const override { return true; }
 

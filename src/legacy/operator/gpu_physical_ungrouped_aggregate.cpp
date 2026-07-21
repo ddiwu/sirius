@@ -16,6 +16,8 @@
 
 #include "operator/gpu_physical_ungrouped_aggregate.hpp"
 
+#include "operator/gpu_physical_grouped_aggregate.hpp"
+
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "gpu_buffer_manager.hpp"
 #include "log/logging.hpp"
@@ -152,15 +154,6 @@ SinkResultType GPUPhysicalUngroupedAggregate::Sink(GPUIntermediateRelation& inpu
       "Multi-GPU ungrouped aggregate over fully-replicated input (small tables only) is not "
       "supported; falling back to DuckDB");
   }
-  // Multi-batch guard: a RIGHT/OUTER join upstream sinks twice; this Sink
-  // still assumes one batch (the second would overwrite the first's partial).
-  // Fail loudly → DuckDB fallback until the stash/FinalizeSink treatment
-  // (see GPUPhysicalGroupedAggregate) is applied here.
-  if (++runtime_state<UngroupedAggregateRuntimeState>(sirius_current_gpu).sink_calls > 1) {
-    throw NotImplementedException(
-      "Multi-batch ungrouped aggregate (RIGHT/OUTER join upstream) is not supported yet; "
-      "falling back to DuckDB");
-  }
   vector<shared_ptr<GPUColumn>> aggregate_column(aggregates.size());
   for (int aggr_idx = 0; aggr_idx < aggregates.size(); aggr_idx++) {
     aggregate_column[aggr_idx] = nullptr;
@@ -242,13 +235,71 @@ SinkResultType GPUPhysicalUngroupedAggregate::Sink(GPUIntermediateRelation& inpu
     }
   }
 
+  // Stash this batch; FinalizeSink (called by the executor at this op's LAST
+  // sinking pipeline) concatenates the batches and aggregates once. A
+  // RIGHT/OUTER join upstream legally sinks twice — the old single-batch
+  // Sink threw here and the whole query fell back (Q17's root sum sits above
+  // the delim's RIGHT-family join).
+  {
+    auto& stash_state = runtime_state<UngroupedAggregateRuntimeState>(sirius_current_gpu);
+    stash_state.pending.push_back(std::move(aggregate_column));
+    stash_state.pending_sizes.push_back(column_size);
+  }
+
+  auto sink_end      = std::chrono::high_resolution_clock::now();
+  auto sink_duration = std::chrono::duration_cast<std::chrono::microseconds>(sink_end - start);
+  SIRIUS_LOG_DEBUG("Ungrouped aggregate Sink time: {:.2f} ms", sink_duration.count() / 1000.0);
+  return SinkResultType::FINISHED;
+}
+
+void GPUPhysicalUngroupedAggregate::FinalizeSink() const
+{
+  auto start = std::chrono::high_resolution_clock::now();
+  GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
+  auto& rstate = runtime_state<UngroupedAggregateRuntimeState>(sirius_current_gpu);
+  if (rstate.pending.empty()) { return; }
+
+  // Drop empty batches (a RIGHT-family probe pipeline legally emits a 0-row
+  // batch); keep one batch if all are empty so the aggregate still produces
+  // its empty-input value (NULL for SUM, 0 for COUNT).
+  vector<size_t> keep;
+  for (size_t b = 0; b < rstate.pending.size(); ++b) {
+    if (rstate.pending_sizes[b] > 0) { keep.push_back(b); }
+  }
+  if (keep.empty()) { keep.push_back(0); }
+
+  if (keep.size() > 1 && interior_cross_gpu_merge) {
+    throw NotImplementedException(
+      "Multi-batch INTERIOR ungrouped aggregate not supported yet (falls back)");
+  }
+
+  vector<shared_ptr<GPUColumn>> aggregate_column(aggregates.size());
+  uint64_t total_size = 0;
+  for (size_t k : keep) { total_size += rstate.pending_sizes[k]; }
+  for (idx_t aggr_idx = 0; aggr_idx < aggregates.size(); ++aggr_idx) {
+    auto& first = rstate.pending[keep[0]][aggr_idx];
+    const bool placeholder = !first || first->data_wrapper.data == nullptr;
+    if (placeholder) {
+      // count(*)-style placeholder: no data, the LENGTH is the value.
+      aggregate_column[aggr_idx] = make_shared_ptr<GPUColumn>(
+        total_size, GPUColumnType(GPUColumnTypeId::INT64), nullptr, nullptr);
+    } else {
+      auto acc = first;
+      for (size_t i = 1; i < keep.size(); ++i) {
+        acc = CombineColumns(acc, rstate.pending[keep[i]][aggr_idx], gpuBufferManager);
+      }
+      aggregate_column[aggr_idx] = acc;
+    }
+  }
+  rstate.pending.clear();
+  rstate.pending_sizes.clear();
+
   if (aggregate_column[0]->column_length > INT32_MAX) {
     throw NotImplementedException("Column length greater than INT32_MAX is not supported");
   }
 
   // Stage the partial 1-row aggregate into per-GPU runtime state. Cross-GPU
   // reduce of partials happens later in GPUPhysicalMaterializedCollector::GetResult.
-  auto& rstate = runtime_state<UngroupedAggregateRuntimeState>(sirius_current_gpu);
   if (!rstate.aggregation_result) {
     rstate.aggregation_result = make_shared_ptr<GPUIntermediateRelation>(aggregates.size());
   }
@@ -318,8 +369,7 @@ SinkResultType GPUPhysicalUngroupedAggregate::Sink(GPUIntermediateRelation& inpu
 
   auto end      = std::chrono::high_resolution_clock::now();
   auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-  SIRIUS_LOG_DEBUG("Ungrouped aggregate Sink time: {:.2f} ms", duration.count() / 1000.0);
-  return SinkResultType::FINISHED;
+  SIRIUS_LOG_DEBUG("Ungrouped aggregate Finalize time: {:.2f} ms", duration.count() / 1000.0);
 }
 
 // Interior multi-GPU path: this aggregate's output feeds another operator

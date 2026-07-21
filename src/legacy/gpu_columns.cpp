@@ -477,6 +477,15 @@ void GPUColumn::setFromCudfScalar(cudf::scalar& cudf_scalar, GPUBufferManager* g
     scalar_size       = sizeof(int64_t);
     data_wrapper.type = GPUColumnType(GPUColumnTypeId::DECIMAL);
     data_wrapper.type.SetDecimalTypeInfo(Decimal::MAX_WIDTH_INT64, -s.type().scale());
+  } else if (scalar_type.id() == cudf::type_id::DECIMAL128) {
+    // cudf widens SUM over decimal64 to a decimal128 scalar (Q17's root
+    // sum(l_extendedprice)); the collector-side cross-GPU reduce and the
+    // CPU conversion already handle 16-byte decimals.
+    auto& s           = static_cast<cudf::fixed_point_scalar<numeric::decimal128>&>(cudf_scalar);
+    scalar_ptr        = s.data();
+    scalar_size       = sizeof(__int128_t);
+    data_wrapper.type = GPUColumnType(GPUColumnTypeId::DECIMAL);
+    data_wrapper.type.SetDecimalTypeInfo(Decimal::MAX_WIDTH_INT128, -s.type().scale());
   } else if (scalar_type.id() == cudf::type_id::TIMESTAMP_DAYS) {
     auto& s           = static_cast<cudf::numeric_scalar<int32_t>&>(cudf_scalar);
     scalar_ptr        = s.data();
