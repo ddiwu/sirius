@@ -105,11 +105,15 @@ static shared_ptr<GPUColumn> AllgatherProbeColumn(const shared_ptr<GPUColumn>& c
   int next_stream = 0;
   auto pick = [&]() { return ag_streams[g][next_stream++ % AG_STREAMS]; };
 
-  // Our own materialization kernels (null stream) must have landed before
-  // peers read the buffer. Null-stream sync — NOT device sync — so our own
-  // in-flight allgather copies from the previous column don't serialize the
-  // pipeline.
-  cudaStreamSynchronize(nullptr);
+  // Our own writes to the source buffer must have landed before peers read
+  // it. A null-stream sync is NOT enough: the source may have been produced
+  // on a non-null stream (cudf's default stream for an upstream join's
+  // output, or this pool's own streams) — Q20's RIGHT_SEMI build gather
+  // caught exactly that, with the two GPUs copying DIFFERENT orderings of a
+  // supplier⋈nation output whose gather kernel was still in flight. Full
+  // device sync before publish; the cross-column overlap this costs is minor
+  // next to a wrong result.
+  cudaDeviceSynchronize();
   slots[g] = {col->data_wrapper.data, col->data_wrapper.offset, col->column_length,
               col->data_wrapper.num_bytes};
   bar->arrive_and_wait();  // every partition published
@@ -163,8 +167,36 @@ static shared_ptr<GPUColumn> AllgatherProbeColumn(const shared_ptr<GPUColumn>& c
     }
     out = make_shared_ptr<GPUColumn>(total, col->data_wrapper.type, dst, nullptr);
   }
-  bar->arrive_and_wait();  // slots may be republished; in-flight reads stay valid
+  // Complete our gather copies BEFORE releasing the peers. The "in-flight
+  // reads stay valid" assumption (query-lifetime pool sources) is NOT safe in
+  // every call path: once a peer passes this barrier it may reuse/overwrite
+  // its published source while our async copy is still draining — observed as
+  // run-to-run divergent gathered builds in Q20's RIGHT_SEMI (the two GPUs'
+  // flag row-id spaces disagreed, churning ~3k of 11.7k result rows per run).
+  cudaDeviceSynchronize();
+  bar->arrive_and_wait();  // every gather copy has fully drained on every GPU
   return out;
+}
+
+// Canonical broadcast for a REPLICATED build consumed by a build-row-emitting
+// join (RIGHT_SEMI/RIGHT_ANTI/RIGHT). Replication guarantees identical
+// CONTENT on every GPU, but not identical ROW ORDER — each GPU ran its own
+// cudf join whose output order is nondeterministic. The cross-GPU match-flags
+// OR-merge in GetData is indexed by build row id, so every GPU must hold the
+// SAME ordering: all GPUs adopt GPU 0's copy (peers contribute an empty
+// column to the allgather, so the concatenation equals GPU 0's column).
+static shared_ptr<GPUColumn> BcastCanonicalColumn(shared_ptr<GPUColumn> col,
+                                                  GPUBufferManager* gpuBufferManager)
+{
+  if (sirius_current_gpu == 0) { return AllgatherProbeColumn(col, gpuBufferManager); }
+  shared_ptr<GPUColumn> empty;
+  if (col->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR) {
+    empty = make_shared_ptr<GPUColumn>(0, col->data_wrapper.type, nullptr, nullptr, 0, true,
+                                       nullptr);
+  } else {
+    empty = make_shared_ptr<GPUColumn>(0, col->data_wrapper.type, nullptr, nullptr);
+  }
+  return AllgatherProbeColumn(empty, gpuBufferManager);
 }
 
 // TPC-H-style data routinely carries an ALL-VALID validity mask (no actual
@@ -756,6 +788,11 @@ SourceResultType GPUPhysicalHashJoin::GetData(GPUIntermediateRelation& output_re
     static std::unique_ptr<std::barrier<>> fbar;
     static std::once_flag                  fonce;
     std::call_once(fonce, [&] { fbar = std::make_unique<std::barrier<>>(num_gpus); });
+    // The memset and the flags kernel above are ASYNC on this GPU's stream;
+    // the host barrier alone does not order them against the peer's D2D read.
+    // Without this sync the peer can copy pre-memset garbage (spurious rows)
+    // or a partially-written flag array (dropped rows), varying run to run.
+    cudaDeviceSynchronize();
     flag_slots[sirius_current_gpu] = flags;
     fbar->arrive_and_wait();  // every GPU's flags fully written & published
     if (total > 0) {
@@ -1453,7 +1490,8 @@ SinkResultType GPUPhysicalHashJoin::Sink(GPUIntermediateRelation& input_relation
   //      merge; they need the magi shuffle join.
   //   2. Build layout: a partitioned (large) build side can't broadcast;
   //      large-large joins also need the magi shuffle join.
-  bool semi_bcast_gather = false;
+  bool semi_bcast_gather    = false;
+  bool semi_canonical_bcast = false;
   if (num_gpus > 1) {
     // Multi-GPU coverage: the cudf probe path (INNER/LEFT) plus the SEMI
     // family via the replicated-build scheme below. MARK/RIGHT/OUTER still
@@ -1518,6 +1556,23 @@ SinkResultType GPUPhysicalHashJoin::Sink(GPUIntermediateRelation& input_relation
       auto& srstate      = runtime_state<HashJoinRuntimeState>(gpu);
       srstate.semi_bcast = true;
       semi_bcast_gather  = !build_replicated;
+      // Build-row-emitting types index the cross-GPU flags merge by build row
+      // id. A replicated build has identical content per GPU but NOT
+      // identical row order (independent cudf joins) — canonicalize on GPU
+      // 0's copy. Probe-side-emitting types (SEMI/ANTI/LEFT/MARK) consume the
+      // build only through key lookups, where order is irrelevant.
+      semi_canonical_bcast = build_replicated &&
+                             (join_type == JoinType::RIGHT_SEMI ||
+                              join_type == JoinType::RIGHT_ANTI ||
+                              join_type == JoinType::RIGHT);
+      if (std::getenv("MAGI_SEMI_PATH_LOG") && gpu == 0) {
+        std::fprintf(stderr,
+                     "[semi-path] jt=%d build_replicated=%d -> %s\n",
+                     (int)join_type, (int)build_replicated,
+                     semi_canonical_bcast ? "canonical(GPU0)"
+                     : semi_bcast_gather  ? "allgather(all partitions)"
+                                          : "local(replicated,order-agnostic)");
+      }
     } else {
     // Broadcast CANDIDATE gate — plan-deterministic checks only, so every
     // worker takes the same Sink branch. The actual shuffle / broadcast-probe
@@ -1592,9 +1647,12 @@ SinkResultType GPUPhysicalHashJoin::Sink(GPUIntermediateRelation& input_relation
       // GPU-index order on every worker, so the build ROW-ID space is
       // identical across GPUs (the flags merge in GetData relies on this).
       build_keys[cond_idx] = AllgatherProbeColumn(build_keys[cond_idx], gpuBufferManager);
+    } else if (semi_canonical_bcast) {
+      // Replicated build, build-row-emitting join: adopt GPU 0's row order.
+      build_keys[cond_idx] = BcastCanonicalColumn(build_keys[cond_idx], gpuBufferManager);
     }
   }
-  if (semi_bcast_gather) {
+  if (semi_bcast_gather || semi_canonical_bcast) {
     // AllgatherProbeColumn enqueues on non-blocking streams; the build kernel
     // below reads the gathered columns on the null stream.
     cudaDeviceSynchronize();
@@ -1639,7 +1697,7 @@ SinkResultType GPUPhysicalHashJoin::Sink(GPUIntermediateRelation& input_relation
   // row-ids in the GATHERED space — the emission columns must be the gathered
   // full build, not local partition references.
   const bool semi_gather_rhs =
-    semi_bcast_gather &&
+    (semi_bcast_gather || semi_canonical_bcast) &&
     (join_type == JoinType::RIGHT_SEMI || join_type == JoinType::RIGHT_ANTI ||
      join_type == JoinType::RIGHT || join_type == JoinType::LEFT);
   int right_idx = 0;
@@ -1659,7 +1717,11 @@ SinkResultType GPUPhysicalHashJoin::Sink(GPUIntermediateRelation& input_relation
     SIRIUS_LOG_DEBUG("Passing column idx {} from input relation to index {} in RHS hash table",
                      payload_idx,
                      right_idx + i);
-    if (semi_gather_rhs) {
+    if (semi_gather_rhs && semi_canonical_bcast) {
+      rstate.hash_table_result->columns[right_idx + i] = BcastCanonicalColumn(
+        HandleMaterializeExpression(input_relation.columns[payload_idx], gpuBufferManager),
+        gpuBufferManager);
+    } else if (semi_gather_rhs) {
       rstate.hash_table_result->columns[right_idx + i] = AllgatherProbeColumn(
         HandleMaterializeExpression(input_relation.columns[payload_idx], gpuBufferManager),
         gpuBufferManager);

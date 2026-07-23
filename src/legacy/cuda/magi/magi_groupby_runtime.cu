@@ -235,6 +235,7 @@ MAGI_INSTANTIATE_SINGLE(std::uint64_t, 128);
 MAGI_INST_ALLTIERS(std::int32_t,      64);
 MAGI_INSTANTIATE_BOTH(std::int32_t,  duckdb::magi_generic::N_SLOTS_XXLARGE, 64);
 MAGI_INSTANTIATE_BOTH(std::uint64_t, duckdb::magi_generic::N_SLOTS_XXLARGE, 64);
+MAGI_INSTANTIATE_BOTH(unsigned __int128, duckdb::magi_generic::N_SLOTS_XXLARGE, 64);
 MAGI_INST_ALLTIERS(std::int32_t,      128);
 MAGI_INST_ALLTIERS(std::uint64_t,     64);
 MAGI_INST_ALLTIERS(std::uint64_t,     128);
@@ -844,10 +845,18 @@ static std::size_t dispatch_by_kind_and_tier(int                        gpu_id,
         case TableSize::MEDIUM: return run_tier<unsigned __int128, N_SLOTS_MEDIUM>(gpu_id, n_slots, my_slice, device_emit, d_rows_out);
         case TableSize::LARGE:  return run_tier<unsigned __int128, N_SLOTS_LARGE >(gpu_id, n_slots, my_slice, device_emit, d_rows_out);
         case TableSize::XLARGE: return run_tier<unsigned __int128, N_SLOTS_XLARGE>(gpu_id, n_slots, my_slice, device_emit, d_rows_out);
+        case TableSize::XXLARGE: return run_tier<unsigned __int128, N_SLOTS_XXLARGE>(gpu_id, n_slots, my_slice, device_emit, d_rows_out);
       }
       break;
   }
-  return 0;
+  // Every (KeyKind, TableSize) pair must dispatch above. This used to be a
+  // silent `return 0`: a UINT128 XXLARGE query (missing case) returned an
+  // EMPTY result with no error — Q20's first standalone repro reported
+  // "live=0" through exactly this hole. Throw is cross-GPU consistent (every
+  // worker computes the same (kind, tier)) so nobody strands at a barrier.
+  throw std::runtime_error(
+    "magi groupby: no kernel instantiation for this (key kind, table tier) "
+    "(falls back to DuckDB)");
 }
 
 // ── Public entry ─────────────────────────────────────────────────────────
@@ -912,7 +921,13 @@ std::size_t distributed_hash_groupby_run_per_gpu(
   // throw would strand the peer at the next barrier. Cardinality beyond the
   // largest tier used to overflow the global hash and DEADLOCK kernel B
   // (Q18 first hit this at ~37.5M partials/GPU before XXLARGE existed).
-  {
+  //
+  // n_filtered is only a cardinality proxy when the caller cudf-pre-agged the
+  // input (ShouldCudfPreAgg gates that at tier >= XLARGE, so post-preagg rows
+  // ≈ per-GPU distinct groups). Below XLARGE the input is RAW rows — Q1 feeds
+  // 148M rows for 4 groups — and the guard must not fire (it silently sent
+  // Q1 back to CPU for weeks: every battery showed 1 OVERRIDE-FAIL unread).
+  if (table_size >= magi_generic::TableSize::XLARGE) {
     std::uint64_t mx = 0;
     for (int i = 0; i < NUM_GPUS; ++i) {
       mx = std::max<std::uint64_t>(mx, xc.inputs[i].n_filtered);

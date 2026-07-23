@@ -1390,7 +1390,10 @@ bool ShouldCudfPreAgg(int gpu_id, vector<shared_ptr<GPUColumn>>& keys, int n_key
   if (CrossGpuMaxRows(gpu_id, n_rows) <= 65536) { return false; }
   magi_generic::KeyKind                key_kind;
   std::vector<magi_ops::KeyFieldEntry> key_fields;
-  const bool shape_ok = DeriveKeyShape(keys, n_keys, key_kind, key_fields);
+  bool shape_ok = DeriveKeyShape(keys, n_keys, key_kind, key_fields);
+  // Lockstep with Run()'s u128-typed-tier quarantine: compound keys go wide.
+  static const bool u128_typed = std::getenv("MAGI_U128_TYPED") != nullptr;
+  if (shape_ok && !u128_typed && key_kind == magi_generic::KeyKind::UINT128) { shape_ok = false; }
   if (!shape_ok) { return WideKeyShapeSupported(keys, n_keys); }
   // VarcharPrefixInsufficient rendezvouses across workers behind
   // type-deterministic gates only, and its verdict is a cross-GPU OR —
@@ -1485,6 +1488,14 @@ void Run(int                                gpu_id,
   magi_generic::KeyKind                 key_kind;
   std::vector<magi_ops::KeyFieldEntry>  key_fields;
   bool shape_ok = DeriveKeyShape(group_by_keys, num_group_keys, key_kind, key_fields);
+  // QUARANTINE: the u128 TYPED tier (16B compound keys, e.g. Q20's
+  // (l_partkey, l_suppkey)) misbehaved on the 2-int64 shape — probe storms
+  // (A 2.5s/B 11.5s on a 600k-row input), empty/undercounted results,
+  // intermittent kernel-B hangs. Route compound keys through the WIDE
+  // hash128 path (proven by Q16 at 3M rows/GPU) unless MAGI_U128_TYPED=1
+  // (debug/repair knob). Lockstep with ShouldCudfPreAgg's override.
+  static const bool u128_typed = std::getenv("MAGI_U128_TYPED") != nullptr;
+  if (shape_ok && !u128_typed && key_kind == magi_generic::KeyKind::UINT128) { shape_ok = false; }
   if (shape_ok && VarcharPrefixInsufficient(gpu_id, group_by_keys, key_fields)) {
     // Strings exceed the prefix budget → the packed-prefix path would emit
     // truncated keys (and could merge distinct groups). Reroute to the wide
