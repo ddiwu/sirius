@@ -69,14 +69,30 @@ def parse_runs(path):
         if line:
             lines.append(line)
     # Majority field count over plausible data lines picks the result shape.
-    counts = {}
+    # Two candidate shapes are counted independently: lines with a numeric
+    # field (any field count — covers single-column measures like Q14), and
+    # multi-field lines regardless of content (covers ALL-STRING results like
+    # Q20's s_name,s_address). Whichever shape has more supporting lines wins;
+    # ties prefer the numeric gate (data rows dominate junk in both regimes,
+    # so a handful of stray numeric junk lines can't outvote thousands of
+    # string data rows, and vice versa).
+    counts_num, counts_str = {}, {}
     for line in lines:
         if BOUNDARY in line or line.startswith(("[", "=")):
             continue
+        if "fallback to DuckDB" in line or "GPUBufferManager" in line:
+            continue  # engine banners that contain commas — never data
         f = split_csv(line)
         if any(is_number(x) for x in f):
-            counts[len(f)] = counts.get(len(f), 0) + 1
-    shape = max(counts, key=counts.get) if counts else -1
+            counts_num[len(f)] = counts_num.get(len(f), 0) + 1
+        if len(f) >= 2:
+            counts_str[len(f)] = counts_str.get(len(f), 0) + 1
+    sn = max(counts_num, key=counts_num.get) if counts_num else -1
+    ss = max(counts_str, key=counts_str.get) if counts_str else -1
+    if counts_num.get(sn, 0) >= counts_str.get(ss, 0):
+        shape, require_num = sn, True
+    else:
+        shape, require_num = ss, False
     for line in lines:
         if BOUNDARY in line:
             if cur:
@@ -85,7 +101,9 @@ def parse_runs(path):
             continue
         f = split_csv(line)
         if (len(f) == shape and not line.startswith(("[", "=")) and
-                any(is_number(x) for x in f)):
+                "fallback to DuckDB" not in line and
+                "GPUBufferManager" not in line and
+                (not require_num or any(is_number(x) for x in f))):
             cur.append(f)
         else:
             junk += 1
