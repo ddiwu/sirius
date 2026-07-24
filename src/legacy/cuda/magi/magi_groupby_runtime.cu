@@ -279,18 +279,31 @@ static void EnsureDeviceBuffers()
 {
   std::lock_guard<std::mutex> lk(g_init_mu);
   if (g_agg_dev[0] != nullptr) return;
+  // Arenas come out of sirius's CACHE pool (persistent across queries — the
+  // per-query ResetBuffer clears only the processing pool). Raw cudaMalloc
+  // here used to fight table caching for the residual free memory OUTSIDE
+  // the pools: at SF100 that residual was ~0.3GB, the mallocs failed
+  // unchecked, and the first kernel through the garbage pointers took the
+  // whole process down. gpu_buffer_init calls magi_groupby_prealloc_arenas()
+  // right after the pools are reserved, so this normally runs while the
+  // cache bump pointer is still 0 and can never fail.
   for (int i = 0; i < NUM_GPUS; ++i) {
-    int gpu = magi_runtime::magi_phys_gpu(i);
-    cudaSetDevice(gpu);
-    cudaMalloc(reinterpret_cast<void**>(&g_agg_dev[i]), AGG_BUF_BYTES);
-    cudaMalloc(reinterpret_cast<void**>(&g_stage_dev[i]), AGG_BUF_BYTES);
-    cudaMalloc(reinterpret_cast<void**>(&g_ops_dev[i]),
-               sizeof(magi_ops::AggOpEntry) * MAX_AGG_OPS);
-    cudaMalloc(reinterpret_cast<void**>(&g_kfields_dev[i]),
-               sizeof(magi_ops::KeyFieldEntry) * MAX_KEY_FIELDS);
-    cudaMalloc(reinterpret_cast<void**>(&g_overflow_dev[i]), sizeof(unsigned int));
+    g_agg_dev[i]   = reinterpret_cast<std::byte*>(
+      magi_runtime::magi_pool_alloc(AGG_BUF_BYTES, i, /*persistent=*/true));
+    g_stage_dev[i] = reinterpret_cast<std::byte*>(
+      magi_runtime::magi_pool_alloc(AGG_BUF_BYTES, i, true));
+    g_ops_dev[i]   = reinterpret_cast<magi_ops::AggOpEntry*>(
+      magi_runtime::magi_pool_alloc(sizeof(magi_ops::AggOpEntry) * MAX_AGG_OPS, i, true));
+    g_kfields_dev[i] = reinterpret_cast<magi_ops::KeyFieldEntry*>(
+      magi_runtime::magi_pool_alloc(sizeof(magi_ops::KeyFieldEntry) * MAX_KEY_FIELDS, i, true));
+    g_overflow_dev[i] = reinterpret_cast<unsigned int*>(
+      magi_runtime::magi_pool_alloc(sizeof(unsigned int), i, true));
   }
 }
+
+// Eager arena carve-out, called from gpu_buffer_init (via
+// magi_runtime::magi_prealloc_arenas) before any table is cached.
+void magi_groupby_prealloc_arenas() { EnsureDeviceBuffers(); }
 
 // ── Per-thread barrier exchange ──────────────────────────────────────────
 // Same shape as Q5Exchange: stash inputs, sync, run, sync, return slice.

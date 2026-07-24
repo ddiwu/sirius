@@ -55,5 +55,26 @@ void magi_sync_after_session(int gpu_id, std::uint64_t session_id);
 // works for every query — we just need a device buffer to feed magi.
 std::uint64_t* GetIdentityRowIdsShared(int phys_gpu, std::size_t n);
 
+// ── Unified-pool allocation (implemented in magi_runtime.cu, which can see
+// GPUBufferManager). magi's device memory comes out of sirius's reserved
+// pools instead of raw cudaMalloc, so it never competes for the residual
+// free memory outside the pools (at SF100 the pools left ~0.3GB free and
+// magi's unchecked lazy-init mallocs handed out garbage pointers → illegal
+// memory access on 16 of 22 queries).
+//   persistent=true  → CACHE pool (explicit gpu index; survives the per-query
+//                      ResetBuffer, freed only by ResetCache — arena-class).
+//   persistent=false → PROCESSING pool (routes to the CALLING thread's GPU;
+//                      reclaimed automatically by end-of-query ResetBuffer —
+//                      per-query wire buffers / counters).
+// Throws duckdb InvalidInputException when the pool is exhausted.
+std::uint8_t* magi_pool_alloc(std::size_t bytes, int gpu_id, bool persistent);
+
+// Eagerly carve magi's persistent arenas (groupby agg/stage + join H_build +
+// the small ops/fields tables) out of the CACHE pool. Called from
+// gpu_buffer_init right after the pools are reserved — the cache bump pointer
+// is still 0, so the arenas always fit and table caching gets what remains
+// (its own cache-size check reports overflow cleanly).
+void magi_prealloc_arenas();
+
 }  // namespace magi_runtime
 }  // namespace duckdb

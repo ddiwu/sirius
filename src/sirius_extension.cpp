@@ -45,6 +45,7 @@ extern "C" int cudaProfilerStop();
 // #include "from_substrait.hpp"
 #ifdef SIRIUS_ENABLE_LEGACY
 #include "gpu_buffer_manager.hpp"
+#include "legacy/operator/magi_runtime_shared.hpp"  // magi_prealloc_arenas
 #include "gpu_context.hpp"
 #include "gpu_physical_plan_generator.hpp"
 #endif
@@ -631,6 +632,12 @@ void SiriusExtension::GPUBufferInitFunction(ClientContext& context,
       pinned_memory_size);
     GPUBufferManager* gpuBufferManager =
       &(GPUBufferManager::GetInstance(cache_size, processing_size, pinned_memory_size));
+    // Carve magi's persistent device arenas out of the CACHE pool NOW, while
+    // its bump pointer is still 0 — table caching then gets what remains and
+    // reports overflow through its own clean cache-size check. Lazily
+    // allocating these on the first magi query competed with cached tables
+    // for the memory left OUTSIDE the pools (~0.3GB at SF100) and crashed.
+    duckdb::magi_runtime::magi_prealloc_arenas();
     buffer_is_initialized = true;
   } else {
     SIRIUS_LOG_WARN("GPUBufferManager already initialized");

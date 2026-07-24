@@ -52,6 +52,13 @@
 // NUM_GPUS matches sirius's `kSiriusLegacyNumGpus` (declared in
 // magi_runtime_shared.hpp). PARTITIONS_COUNT is a compile-time template
 // parameter to Endpoint.
+// Arena preallocators implemented in the per-query dispatcher TUs (their
+// arena statics are file-local); forward-declared to avoid the heavy headers.
+namespace duckdb { namespace magi_generic {
+void magi_groupby_prealloc_arenas();
+void magi_join_prealloc_arenas();
+}}  // namespace duckdb::magi_generic
+
 namespace duckdb {
 namespace magi_runtime {
 
@@ -320,6 +327,18 @@ void magi_sync_after_session(int gpu_id, std::uint64_t session_id)
   auto& s = magi_state();
   int gpu = s.gpu_ids[gpu_id];
   s.channels[gpu_id].sync_after_session(s.endpoints[gpu], session_id);
+}
+
+std::uint8_t* magi_pool_alloc(std::size_t bytes, int gpu_id, bool persistent)
+{
+  auto& mgr = GPUBufferManager::GetInstance();
+  return mgr.customCudaMalloc<std::uint8_t>(bytes, gpu_id, persistent);
+}
+
+void magi_prealloc_arenas()
+{
+  duckdb::magi_generic::magi_groupby_prealloc_arenas();
+  duckdb::magi_generic::magi_join_prealloc_arenas();
 }
 
 }  // namespace magi_runtime

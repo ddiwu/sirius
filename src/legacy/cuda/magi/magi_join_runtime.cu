@@ -130,27 +130,41 @@ static void EnsureJoinBuffers()
 {
   std::lock_guard<std::mutex> lk(g_jinit_mu);
   if (g_hbuild_dev[0] != nullptr) return;
+  // Persistent arenas from sirius's CACHE pool (see EnsureDeviceBuffers in
+  // magi_groupby_runtime.cu for the rationale — raw cudaMalloc here competed
+  // for the sliver of memory left outside the pools and crashed at SF100).
+  // gpu_buffer_init preallocates via magi_join_prealloc_arenas() while the
+  // cache bump pointer is still 0.
   for (int i = 0; i < NUM_GPUS; ++i) {
-    int gpu = magi_runtime::magi_phys_gpu(i);
-    cudaSetDevice(gpu);
-    cudaMalloc(reinterpret_cast<void**>(&g_hbuild_dev[i]), JOIN_HBUILD_BYTES);
-    cudaMalloc(reinterpret_cast<void**>(&g_jkfields_dev[i]),
-               sizeof(magi_ops::KeyFieldEntry) * JOIN_MAX_KEY_FIELDS);
-    cudaMalloc(reinterpret_cast<void**>(&g_jppl_dev[i]),
-               sizeof(JoinPayloadEntry) * JOIN_MAX_PAYLOAD_ENTRIES);
-    cudaMalloc(reinterpret_cast<void**>(&g_jbpl_dev[i]),
-               sizeof(JoinPayloadEntry) * JOIN_MAX_PAYLOAD_ENTRIES);
-    cudaMalloc(reinterpret_cast<void**>(&g_joverflow_dev[i]), sizeof(unsigned int));
+    g_hbuild_dev[i] = reinterpret_cast<std::byte*>(
+      magi_runtime::magi_pool_alloc(JOIN_HBUILD_BYTES, i, /*persistent=*/true));
+    g_jkfields_dev[i] = reinterpret_cast<magi_ops::KeyFieldEntry*>(
+      magi_runtime::magi_pool_alloc(sizeof(magi_ops::KeyFieldEntry) * JOIN_MAX_KEY_FIELDS, i, true));
+    g_jppl_dev[i] = reinterpret_cast<JoinPayloadEntry*>(
+      magi_runtime::magi_pool_alloc(sizeof(JoinPayloadEntry) * JOIN_MAX_PAYLOAD_ENTRIES, i, true));
+    g_jbpl_dev[i] = reinterpret_cast<JoinPayloadEntry*>(
+      magi_runtime::magi_pool_alloc(sizeof(JoinPayloadEntry) * JOIN_MAX_PAYLOAD_ENTRIES, i, true));
+    g_joverflow_dev[i] = reinterpret_cast<unsigned int*>(
+      magi_runtime::magi_pool_alloc(sizeof(unsigned int), i, true));
   }
 }
+
+// Eager arena carve-out, called from gpu_buffer_init (via
+// magi_runtime::magi_prealloc_arenas) before any table is cached.
+void magi_join_prealloc_arenas() { EnsureJoinBuffers(); }
 
 // ── Per-GPU barrier exchange ────────────────────────────────────────────────
 struct JoinExchange {
   std::barrier<> begin{NUM_GPUS};
+  std::barrier<> alloc_check{NUM_GPUS};
   std::barrier<> build_start{NUM_GPUS};
   std::barrier<> after_build{NUM_GPUS};
   std::barrier<> probe_start{NUM_GPUS};
   std::barrier<> end{NUM_GPUS};
+
+  // Per-GPU verdict of the pre-flight wire-buffer memory check. Published
+  // before build_start so every worker throws symmetrically (no stranded peer).
+  std::array<int, NUM_GPUS>                             alloc_failed{};
 
   std::array<PerGpuJoinInputs, NUM_GPUS>                 build_in{};
   std::array<PerGpuJoinInputs, NUM_GPUS>                 probe_in{};
@@ -200,6 +214,44 @@ static std::size_t join_run_typed_tier(int gpu_id, std::vector<JoinResultRow>& m
                    gpu_id, N_SLOTS, what, cudaGetErrorString(e));
   };
 
+  // Wire buffers for BOTH phases, from sirius's PROCESSING pool (unified
+  // accounting; reclaimed automatically by the end-of-query ResetBuffer, so
+  // no explicit frees). Allocation happens up front and the per-GPU verdict
+  // is exchanged BEFORE any collective work: pool exhaustion on one GPU must
+  // throw on EVERY GPU (a one-sided throw strands the peer at build_start).
+  // The old raw cudaMalloc was unchecked and at SF100 handed the pack kernel
+  // a garbage pointer -> illegal memory access -> process crash.
+  magi_join::JoinBuildWire* bw = nullptr;
+  unsigned int*             bw_count = nullptr;
+  magi_join::JoinProbeWire* pw = nullptr;
+  unsigned int*             pw_count = nullptr;
+  unsigned int*             out_count_dev = nullptr;
+  {
+    bool ok = true;
+    try {
+      const std::uint64_t bn0 = std::max<std::uint64_t>(xc.build_in[gpu_id].n_rows, 1);
+      const std::uint64_t pn0 = std::max<std::uint64_t>(xc.probe_in[gpu_id].n_rows, 1);
+      bw = reinterpret_cast<magi_join::JoinBuildWire*>(
+        magi_runtime::magi_pool_alloc(sizeof(magi_join::JoinBuildWire) * bn0, gpu_id, false));
+      pw = reinterpret_cast<magi_join::JoinProbeWire*>(
+        magi_runtime::magi_pool_alloc(sizeof(magi_join::JoinProbeWire) * pn0, gpu_id, false));
+      bw_count = reinterpret_cast<unsigned int*>(
+        magi_runtime::magi_pool_alloc(sizeof(unsigned int), gpu_id, false));
+      pw_count = reinterpret_cast<unsigned int*>(
+        magi_runtime::magi_pool_alloc(sizeof(unsigned int), gpu_id, false));
+      out_count_dev = reinterpret_cast<unsigned int*>(
+        magi_runtime::magi_pool_alloc(sizeof(unsigned int), gpu_id, false));
+    } catch (...) { ok = false; }
+    xc.alloc_failed[gpu_id] = ok ? 0 : 1;
+    xc.alloc_check.arrive_and_wait();
+    bool any = false;
+    for (int i = 0; i < NUM_GPUS; ++i) any = any || xc.alloc_failed[i];
+    if (any)
+      throw std::runtime_error(
+          "magi shuffle join: wire buffers exceed the processing pool "
+          "(falls back to DuckDB)");
+  }
+
   // Clear H_build prefix + push the per-query key_fields / probe-payload tables.
   const int clear_grid = (N_SLOTS + 255) / 256;
   magi::join_clear_hbuild<KeyT><<<clear_grid, 256, 0, st>>>(H, N_SLOTS);
@@ -223,11 +275,6 @@ static std::size_t join_run_typed_tier(int gpu_id, std::vector<JoinResultRow>& m
 
   // ── BUILD: pack rows → wire tuples ────────────────────────────────────────
   const std::uint64_t bn = xc.build_in[gpu_id].n_rows;
-  magi_join::JoinBuildWire* bw = nullptr;
-  unsigned int*             bw_count = nullptr;
-  cudaMalloc(reinterpret_cast<void**>(&bw),
-             sizeof(magi_join::JoinBuildWire) * std::max<std::uint64_t>(bn, 1));
-  cudaMalloc(reinterpret_cast<void**>(&bw_count), sizeof(unsigned int));
   cudaMemsetAsync(bw_count, 0, sizeof(unsigned int), st);
   cudaMemsetAsync(g_joverflow_dev[gpu_id], 0, sizeof(unsigned int), st);
   std::uint64_t* brow = magi_runtime::GetIdentityRowIdsShared(gpu, bn);
@@ -262,11 +309,6 @@ static std::size_t join_run_typed_tier(int gpu_id, std::vector<JoinResultRow>& m
 
   // ── PROBE: pack rows → wire tuples ────────────────────────────────────────
   const std::uint64_t pn = xc.probe_in[gpu_id].n_rows;
-  magi_join::JoinProbeWire* pw = nullptr;
-  unsigned int*             pw_count = nullptr;
-  cudaMalloc(reinterpret_cast<void**>(&pw),
-             sizeof(magi_join::JoinProbeWire) * std::max<std::uint64_t>(pn, 1));
-  cudaMalloc(reinterpret_cast<void**>(&pw_count), sizeof(unsigned int));
   cudaMemsetAsync(pw_count, 0, sizeof(unsigned int), st);
   std::uint64_t* prow = magi_runtime::GetIdentityRowIdsShared(gpu, pn);
   // Make this GPU's cross-device-uploaded probe slice coherent before the pack
@@ -294,7 +336,7 @@ static std::size_t join_run_typed_tier(int gpu_id, std::vector<JoinResultRow>& m
     std::fprintf(stderr, "[magi-join g%d] pn=%lu pw_n=%u out_cap=%lu out_bytes=%.2fGB\n",
                  gpu_id, (unsigned long)pn, pw_n, (unsigned long)out_cap,
                  sizeof(JoinResultRow) * (double)out_cap / 1e9);
-  cudaMalloc(reinterpret_cast<void**>(&out_count), sizeof(unsigned int));
+  out_count = out_count_dev;  // pooled; the wrapper-passed buffer stays unused
   cudaMemsetAsync(out_count, 0, sizeof(unsigned int), st);
   cudaMemsetAsync(g_joverflow_dev[gpu_id], 0, sizeof(unsigned int), st);
   cudaMemsetAsync(pw_count, 0, sizeof(unsigned int), st);  // reuse as DRAINED counter
@@ -377,8 +419,7 @@ static std::size_t join_run_typed_tier(int gpu_id, std::vector<JoinResultRow>& m
   cudaMemcpy(&overflow_count, g_joverflow_dev[gpu_id], sizeof(unsigned int),
              cudaMemcpyDeviceToHost);
 
-  cudaFree(bw); cudaFree(bw_count);
-  cudaFree(pw); cudaFree(pw_count);
+  // bw/pw/counters live in the processing pool — reclaimed by ResetBuffer.
   // out / out_count are wrapper-owned (sirius processing pool) — not freed here.
 
   if (phase_time) {
