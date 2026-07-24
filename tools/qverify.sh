@@ -119,6 +119,10 @@ if [ "$DO_CPU" = 1 ]; then
   # is NOT usable on the fork binary (emits nothing / can segfault on heavy
   # queries), and count(*)-wrapping misplans — never use either as truth.
   { echo ".mode csv"; echo ".headers off"
+    # Optional extra statements for the CPU-truth run (e.g. QV_CPU_INIT=
+    # "PRAGMA memory_limit='64GB';" — SF100 CPU fallbacks can otherwise blow
+    # the slurm cgroup and get the whole step OOM-killed).
+    [ -n "${QV_CPU_INIT:-}" ] && echo "$QV_CPU_INIT"
     echo "call gpu_processing(\"$Q\");"; echo "$B"; } > "$T/cpu.sql"
   env LD_LIBRARY_PATH="$LIBS" timeout 1800 "$BIN" "$DB" -unsigned \
       < "$T/cpu.sql" > "$T/cpu.out" 2> "$T/cpu.err"
