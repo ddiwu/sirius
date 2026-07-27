@@ -55,9 +55,10 @@ bool DeriveKeyShape(const std::vector<shared_ptr<GPUColumn>>& keys,
       return false;  // v1: fixed-width INT keys only
     }
   }
-  if (byte_off > 8) return false;  // v1 instantiates INT32/UINT64 only
-  out_kind = (byte_off <= 4) ? magi_generic::KeyKind::INT32
-                             : magi_generic::KeyKind::UINT64;
+  if (byte_off > 16) return false;  // > 128-bit compound key -> not supported
+  out_kind = (byte_off <= 4)  ? magi_generic::KeyKind::INT32
+             : (byte_off <= 8) ? magi_generic::KeyKind::UINT64
+                               : magi_generic::KeyKind::UINT128;
   return true;
 }
 
@@ -454,7 +455,8 @@ void Run(int                                       gpu_id,
       (est <= magi_generic::N_SLOTS_SMALL)  ? magi_generic::TableSize::SMALL
       : (est <= magi_generic::N_SLOTS_MEDIUM) ? magi_generic::TableSize::MEDIUM
       : (est <= magi_generic::N_SLOTS_LARGE)  ? magi_generic::TableSize::LARGE
-                                              : magi_generic::TableSize::XLARGE;
+      : (est <= magi_generic::N_SLOTS_XLARGE) ? magi_generic::TableSize::XLARGE
+                                              : magi_generic::TableSize::XXLARGE;
 
   std::vector<JoinPayloadEntry> build_pl_tbl, probe_pl_tbl;
   auto build_in = BuildJoinInputs(build_keys, build_payload, build_pl_tbl);
@@ -462,9 +464,18 @@ void Run(int                                       gpu_id,
 
   // Output buffer from sirius's processing pool (NOT raw cudaMalloc → no OOM vs
   // the pre-reserved pool). Size ≈ this GPU's probe rows (≈ what the owner
-  // receives, hash-partitioned) + 50% headroom for partition imbalance.
+  // receives, hash-partitioned) + headroom for partition imbalance. 1/8 (12.5%)
+  // headroom, not 50%: at XXLARGE-tier scale (150M probe/GPU) the old 1.5× blew
+  // 8GB of processing pool on never-touched JoinResultRows and OOM'd the
+  // downstream groupby. Uniform hash keys keep the received count ≈ input.
   const uint64_t probe_rows = probe_keys.empty() ? 0 : probe_keys[0]->column_length;
-  const uint64_t out_cap    = std::max<uint64_t>(probe_rows + probe_rows / 2, 1);
+  // Fused grouped-agg (scheme ①) never writes out_buf — matches go straight into
+  // the group table. Allocate a token buffer instead of probe_rows×112B (18.9GB
+  // at full scale) so the processing pool has room for the wire.
+  static const bool fused_grouped_out = std::getenv("MAGI_FUSE_GROUPED") != nullptr;
+  const uint64_t out_cap = fused_grouped_out
+                               ? (1u << 20)
+                               : std::max<uint64_t>(probe_rows + probe_rows / 8, 1);
   auto* out_buf = reinterpret_cast<magi_generic::JoinResultRow*>(
       gbm->customCudaMalloc<uint8_t>(out_cap * sizeof(magi_generic::JoinResultRow), gpu_id, false));
   auto* out_count_buf = gbm->customCudaMalloc<uint32_t>(1, gpu_id, false);

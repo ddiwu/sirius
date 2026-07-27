@@ -184,6 +184,21 @@ void MagiInitOnce()
                 total_b / (1024.0 * 1024 * 1024));
   }
 
+  // Remember pre-init free memory so the post-init print can report what the
+  // channel endpoints actually cost. Those live in Magi-Dev and allocate with
+  // raw cudaMalloc — they are NOT part of the sirius pool, so they have to fit
+  // in whatever gpu_buffer_init left over.
+  // CAVEAT: this free-delta UNDER-reports. A buffer whose pages are never
+  // touched is not fully committed, so the delta can be far below the bytes
+  // requested (measured: an 18 GB send-partitioning buffer moved `free` by only
+  // 2.2 GB). For the actual request sizes set MAGI_ALLOC_DEBUG=1, which logs
+  // every endpoint cudaMalloc; the total there is K * GRID * (NGPU+1) * INTER.
+  std::vector<size_t> free_before(NUM_GPUS, 0);
+  for (int i = 0; i < NUM_GPUS; ++i) {
+    cudaSetDevice(s.gpu_ids[i]);
+    size_t f = 0, t = 0; cudaMemGetInfo(&f, &t); free_before[i] = f;
+  }
+
   s.nvlink = std::make_unique<magi::P2PMemcpyOp>();
 
   s.endpoints.assign(NUM_GPUS, nullptr);
@@ -259,6 +274,17 @@ void MagiInitOnce()
   std::this_thread::sleep_for(std::chrono::seconds(1));
 
   s.initialised = true;
+  for (int i = 0; i < NUM_GPUS; ++i) {
+    cudaSetDevice(s.gpu_ids[i]);
+    size_t f = 0, t = 0; cudaMemGetInfo(&f, &t);
+    std::printf("[magi] GPU %d channel cost: %.2f GB (free %.2f -> %.2f GB), "
+                "user_grid=%zu intra=%zuMiB inter=%zuMiB\n",
+                s.gpu_ids[i], (free_before[i] - f) / (1024.0 * 1024 * 1024),
+                free_before[i] / (1024.0 * 1024 * 1024), f / (1024.0 * 1024 * 1024),
+                USER_KERNEL_GRID_SIZE,
+                KBUFFERING_INTRA_PARTITION_SIZE >> 20,
+                KBUFFERING_INTER_PARTITION_SIZE >> 20);
+  }
   std::printf("[magi] runtime initialised: %d GPUs\n", NUM_GPUS);
 }
 

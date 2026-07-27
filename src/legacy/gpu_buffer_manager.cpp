@@ -392,6 +392,15 @@ T* GPUBufferManager::customCudaMalloc(size_t size, int gpu, bool caching)
   //  size_t alignment = alignof(double);
   size_t alignment = rmm::CUDA_ALLOCATION_ALIGNMENT;
   alloc += (alignment - (alloc % alignment)) % alignment;
+  // An empty result legitimately asks for a 0-byte buffer (e.g. a HAVING whose
+  // threshold filters out every group). rmm answers a 0-byte request with
+  // nullptr, which used to abort the whole query as "Pointer is nullptr" and
+  // force a CPU fallback. Round such a request up to one alignment unit so the
+  // empty column still gets a valid, uniquely-freeable pointer.
+  if (alloc == 0) {
+    SIRIUS_LOG_DEBUG("customCudaMalloc: zero-size request rounded up to {} bytes", alignment);
+    alloc = alignment;
+  }
   if (caching) {
     // Caching path keeps the explicit `gpu` argument (used by the scan to
     // write per-GPU partitions of cached tables).

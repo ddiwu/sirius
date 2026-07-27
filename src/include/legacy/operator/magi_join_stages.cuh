@@ -39,25 +39,56 @@
 #include "legacy/operator/magi_distributed_join.hpp"  // JoinResultRow
 #include "legacy/operator/magi_fused_agg.hpp"          // FusedAggProgram + device VM
 
+#include <utility>              // std::declval (cuco ref type deduction)
+#include <cuco/static_map.cuh>  // Option A: cudf-quality find inside the persistent kernel
+
 namespace duckdb {
 namespace magi_join {
 
-// Max payload columns carried inline on a wire tuple (and in JoinResultRow).
-// Shared by the build and probe wires. 4 -> 6: Q9's probe side carries 5
-// numeric payload columns (l_extendedprice/discount/quantity, ps_supplycost,
-// s_nationkey); 6 makes each wire tuple exactly 64B (= CELL_SIZE, nicer than
-// the old 48B) and still fits H_build's AggSlot64<i64,64> values (N_DOUBLES=6).
-constexpr int JOIN_MAX_PAYLOAD = 6;
+// ── cuco hash map for the shuffle-join probe (Option A) ─────────────────────
+// Replaces the hand-rolled open-addressing global_find (DRAM-latency-bound at
+// ~1M probe/s) with cuco's bucketized find — the exact map cudf's hash join
+// uses (~1e9 probe/s). Key is packed to <=8B uint64 (cuco caps keys at 8B);
+// value = the H_build slot index, so the existing emit path reuses
+// H_build[slot].values for the build payload. scalar probing (cg_size=1) so it
+// drops straight into the 1-thread-per-tuple recv drain — no magi-core change.
+using CucoMap = cuco::static_map<
+    std::uint64_t, std::int32_t, cuco::extent<std::size_t>,
+    cuda::thread_scope_device, cuda::std::equal_to<std::uint64_t>,
+    cuco::linear_probing<1, cuco::default_hash_function<std::uint64_t>>,
+    cuco::cuda_allocator<cuco::pair<std::uint64_t, std::int32_t>>,
+    cuco::storage<1>>;
+using CucoFindRef   = decltype(std::declval<CucoMap&>().ref(cuco::find));
+using CucoInsertRef = decltype(std::declval<CucoMap&>().ref(cuco::insert));
 
-// Build-side wire tuple. 48B. `index` is magi's EOF/validity marker (receiver
-// checks index != -1). `key` is the full join key (partition + hash). `payload`
-// carries the build-side output columns (the join's RHS output) as raw 8-byte
-// values; the receiver stores them into the H_build slot so the probe can emit
-// them on a match.
+// Max payload columns carried inline on a wire tuple (and in JoinResultRow).
+// Shared by the build and probe wires. Real max usage is 5 (Q9's probe side:
+// l_extendedprice/discount/quantity, ps_supplycost, s_nationkey). The wire key
+// is a fixed 16-byte `unsigned __int128` so a single wire layout serves every
+// key kind (INT32/UINT64 use the low bytes; compound 16B keys like Q-custom's
+// (l_partkey, l_suppkey) use the full width) — that plus the 24B header (key16
+// + index4 + pad4) leaves exactly 5 payload slots at 64B (= CELL_SIZE).
+constexpr int JOIN_MAX_PAYLOAD = 5;
+
+// Fused join+grouped-agg (scheme ①): when the join feeds a GROUP BY whose key is
+// carried in the probe (e.g. custom-Q's ps_suppkey == l_suppkey, a component of
+// the compound join key), the probe aggregates each match directly into this
+// per-owner group table INSTEAD of materializing a JoinResultRow — killing the
+// 16.8GB out_buf write + the slot->values read, and overlapping the aggregate
+// with the shuffle (it runs inside the persistent recv drain). 1M slots handles
+// ~700K groups (SF50 has 500K suppliers).
+constexpr int GROUP_N_SLOTS = 1 << 20;
+
+// Build-side wire tuple, 64B. `key` FIRST so the 16-byte compound key is
+// naturally 16-aligned with no interior padding (same layout discipline as
+// AggSlot64). `index` is magi's EOF/validity marker (receiver checks
+// index != -1). `payload` carries the build-side output columns (the join's
+// RHS output) as raw 8-byte values; the receiver stores them into the H_build
+// slot so the probe can emit them on a match.
 struct alignas(16) JoinBuildWire {
-  int32_t index;      // 1 = valid; magi EOF protocol uses -1
+  unsigned __int128 key;   // full join key (routed by the partition functor, hashed into H_build)
+  int32_t index;           // 1 = valid; magi EOF protocol uses -1
   int32_t _pad;
-  int64_t key;        // join key — routed by the partition functor, hashed into H_build
   int64_t payload[JOIN_MAX_PAYLOAD];   // build payload (RHS output cols), raw 8B
 };
 static_assert(sizeof(JoinBuildWire) == 64, "JoinBuildWire must be 64B");
@@ -105,12 +136,29 @@ struct JoinKeyPartition {
 // flow to the join output, packed as raw 8-byte values (host re-narrows by the
 // JoinPayloadEntry table). 48B, 16-aligned.
 struct alignas(16) JoinProbeWire {
-  int32_t index;     // 1 = valid; magi EOF protocol uses -1
+  unsigned __int128 key;   // full join key (16B; low bytes for narrow kinds)
+  int32_t index;           // 1 = valid; magi EOF protocol uses -1
   int32_t _pad;
-  int64_t key;       // join key
   int64_t payload[JOIN_MAX_PAYLOAD];
 };
 static_assert(sizeof(JoinProbeWire) == 64, "JoinProbeWire must be 64B");
+
+// Inputs the send loop needs to pack rows itself, instead of reading a wire
+// array that a separate kernel materialized first. `scratch` is a per-block
+// staging area of `chunk` wire tuples (grid * chunk * sizeof(WireT) total);
+// scratch == nullptr selects the old pre-packed path.
+struct WirePackSrc {
+  const std::uint64_t*                          row_ids;
+  std::uint64_t                                 n_rows;
+  magi_ops::ColPack                             cols;
+  const magi_ops::KeyFieldEntry*                key_fields;
+  const duckdb::magi_generic::JoinPayloadEntry* pl;
+  void*                                         scratch;
+  int                                           n_key_fields;
+  int                                           n_pl;
+  int                                           chunk;
+};
+
 
 // Find-only open-addressing probe of H_build (never claims a slot). Returns the
 // matching slot or nullptr. v1 supports <=8B keys (Q11's join key is int32).
@@ -118,10 +166,30 @@ template <typename KeyT, int N_SLOTS>
 __device__ __forceinline__ magi_ops::AggSlot64<KeyT>*
 global_find(magi_ops::AggSlot64<KeyT>* __restrict__ H, KeyT key)
 {
-  const std::uint64_t k64 =
-      static_cast<std::uint64_t>(static_cast<std::make_unsigned_t<KeyT>>(key));
-  const unsigned int h =
-      static_cast<unsigned int>(k64 ^ (k64 >> 32)) * 2654435761u;
+  // Hash MUST match magi_ops::global_find_or_insert (build side) or the probe
+  // lands in a different slot and every match is missed. For 16B compound keys
+  // that means folding BOTH halves (lo^hi), exactly as the build path does —
+  // a low64-only hash would ignore the high 8 bytes of e.g. (partkey,suppkey).
+  unsigned int h;
+  if constexpr (sizeof(KeyT) > 8) {
+    const unsigned __int128 ku = static_cast<unsigned __int128>(key);
+    const std::uint64_t lo = static_cast<std::uint64_t>(ku);
+    const std::uint64_t hi = static_cast<std::uint64_t>(ku >> 64);
+    // Mix lo and hi INDEPENDENTLY (splitmix64 finalizer over lo*ODD ^ hi), not a
+    // plain lo^hi: correlated compound keys like TPC-H (partkey,suppkey) collapse
+    // under xor into few buckets → O(n) probe chains (the 45s custom-join case).
+    // MUST stay byte-identical to global_find_or_insert (groupby_stages.cuh) or
+    // build and probe hash a key to different slots and every match is missed.
+    std::uint64_t z = lo * 0x9E3779B97F4A7C15ull ^ hi;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    z =  z ^ (z >> 31);
+    h = static_cast<unsigned int>(z);
+  } else {
+    const std::uint64_t k64 =
+        static_cast<std::uint64_t>(static_cast<std::make_unsigned_t<KeyT>>(key));
+    h = static_cast<unsigned int>(k64 ^ (k64 >> 32)) * 2654435761u;
+  }
   const int start = static_cast<int>(h) & (N_SLOTS - 1);
   for (int probe = 0; probe < N_SLOTS; ++probe) {
     const int  idx      = (start + probe) & (N_SLOTS - 1);
@@ -149,27 +217,103 @@ struct ProbeEmit {
   // per-GPU `agg_accum` — overlapping the agg with the shuffle, no out_buf needed.
   double*                                       agg_accum;
   const duckdb::magi_fused::FusedAggProgram*    agg_prog;
+  // Option A: when non-null, look the key up in the cuco map (cudf-quality) and
+  // read the build payload from H_build at the returned slot index; else use
+  // the hand-rolled open-addressing find. Only wired for the uint64 key path.
+  const CucoFindRef*                            cuco_ref;
+  // Fused grouped-agg (scheme ①): when group_tbl != nullptr, a match aggregates
+  // into the group table (group key = high 64 bits of the compound join key =
+  // l_suppkey; aggs = COUNT + SUM(probe payload[1])) instead of emitting to
+  // out_buf. group_key_hi selects which half of the 16B key is the group key.
+  magi_ops::AggSlot64<std::uint64_t>*           group_tbl;
+  unsigned int*                                 group_overflow;
+  int                                           fuse_sum_idx;
   __device__ __forceinline__ void operator()(JoinProbeWire& t) const {
-    if (t.index == -1) return;
-    if (n_drained) atomicAdd(n_drained, 1u);
-    magi_ops::AggSlot64<KeyT>* slot =
-        global_find<KeyT, N_SLOTS>(H_build, static_cast<KeyT>(t.key));
-    if (slot == nullptr) return;                 // no match (INNER → drop)
-    if (agg_prog != nullptr) {
-      double probe_d[JOIN_MAX_PAYLOAD];
-#pragma unroll
-      for (int i = 0; i < JOIN_MAX_PAYLOAD; ++i)
-        __builtin_memcpy(&probe_d[i], &t.payload[i], sizeof(double));
-      for (int a = 0; a < agg_prog->n_aggs; ++a) {
-        double v = (agg_prog->kind[a] == duckdb::magi_fused::AGG_COUNT)
-                       ? 1.0
-                       : duckdb::magi_fused::magi_vm_eval(*agg_prog, a,
-                                                          slot->values, probe_d);
-        atomicAdd(&agg_accum[a], v);
+    // No early returns before the warp ballot below: every active lane must
+    // reach it (non-matching lanes vote 0). We compute a `do_emit` flag + slot,
+    // then one atomicAdd(out_count) per WARP reserves a contiguous run so the
+    // 112B JoinResultRow stores land coalesced (base+rank) instead of scattering
+    // — the 150M-row full-join emit was atomic-serialized + DRAM-scattered
+    // (~5.3s); warp aggregation cuts atomics 32× and coalesces the writes.
+    const unsigned active = __activemask();
+    bool                        do_emit = false;
+    magi_ops::AggSlot64<KeyT>*  slot    = nullptr;
+    if (t.index != -1) {
+      if (n_drained) atomicAdd(n_drained, 1u);
+      if (cuco_ref != nullptr) {
+        // cuco caps keys at 8B; a 16B compound (partkey,suppkey) whose halves
+        // fit 32 bits packs losslessly into one uint64 (partkey lo32 | suppkey
+        // lo32<<32). MUST match cuco_insert_from_hbuild's packing.
+        std::uint64_t ck;
+        if constexpr (sizeof(KeyT) > 8) {
+          const unsigned __int128 ku = static_cast<unsigned __int128>(t.key);
+          ck = static_cast<std::uint64_t>(static_cast<std::uint32_t>(static_cast<std::uint64_t>(ku))) |
+               (static_cast<std::uint64_t>(static_cast<std::uint32_t>(static_cast<std::uint64_t>(ku >> 64))) << 32);
+        } else {
+          ck = static_cast<std::uint64_t>(t.key);
+        }
+        auto it = cuco_ref->find(ck);
+        if (it != cuco_ref->end()) slot = &H_build[(*it).second];
+      } else {
+        slot = global_find<KeyT, N_SLOTS>(H_build, static_cast<KeyT>(t.key));
       }
-      return;  // fused: the match is consumed into agg_accum — skip out_buf entirely
+      if (slot != nullptr) {
+        if (group_tbl != nullptr) {
+          // FUSED GROUPED AGG (scheme ①): group by the high 64 bits of the
+          // compound join key (l_suppkey), aggregate inline into the per-owner
+          // group table. Runs inside the recv drain so it overlaps the shuffle;
+          // no slot->values read, no out_buf write. This lane votes 0 below.
+          const std::uint64_t gkey =
+              static_cast<std::uint64_t>(static_cast<unsigned __int128>(t.key) >> 64);
+          auto* g = magi_ops::global_find_or_insert<std::uint64_t, GROUP_N_SLOTS>(
+              group_tbl, gkey, group_overflow);
+          if (g != nullptr) {
+            atomicAdd(&g->values[0], 1.0);                              // COUNT(*)
+            // The payload carries RAW 8-byte column bits; a DECIMAL column is an
+            // int64, so sum it as int64 (exact) — reading those bits as a double
+            // gives denormals that sum to 0.0, which is what the first cut did.
+            const long long sv = static_cast<long long>(t.payload[fuse_sum_idx]);
+            atomicAdd(reinterpret_cast<unsigned long long*>(&g->values[1]),
+                      static_cast<unsigned long long>(sv));             // SUM(col)
+          } else if (group_overflow != nullptr) {
+            atomicAdd(group_overflow, 1u);                              // table full
+          }
+        } else if (agg_prog != nullptr) {
+          // Fused ungrouped agg (Option 3): consume the match into agg_accum,
+          // no out_buf emit (this lane votes 0 in the ballot below).
+          double probe_d[JOIN_MAX_PAYLOAD];
+#pragma unroll
+          for (int i = 0; i < JOIN_MAX_PAYLOAD; ++i)
+            __builtin_memcpy(&probe_d[i], &t.payload[i], sizeof(double));
+          for (int a = 0; a < agg_prog->n_aggs; ++a) {
+            double v = (agg_prog->kind[a] == duckdb::magi_fused::AGG_COUNT)
+                           ? 1.0
+                           : duckdb::magi_fused::magi_vm_eval(*agg_prog, a,
+                                                              slot->values, probe_d);
+            atomicAdd(&agg_accum[a], v);
+          }
+        } else {
+          do_emit = true;
+        }
+      }
     }
-    const unsigned pos = atomicAdd(out_count, 1u);
+    // Fused path never emits to out_buf — skip the warp-aggregated emit entirely.
+    // group_tbl is warp-uniform (same pointer for all lanes) so this branch is
+    // divergence-free: all lanes return, or none do → __syncwarp(active) below is
+    // only reached by all-non-fused warps (no stale-mask UB).
+    if (group_tbl != nullptr) return;
+    __syncwarp(active);
+    const unsigned emask = __ballot_sync(active, do_emit);
+    if (emask == 0u) return;                          // warp-uniform: all or none
+    const int      lane   = static_cast<int>(threadIdx.x & 31u);
+    const int      leader = __ffs(emask) - 1;
+    const int      rank   = __popc(emask & ((1u << lane) - 1u));
+    const int      nmatch = __popc(emask);
+    unsigned       base   = 0u;
+    if (lane == leader) base = atomicAdd(out_count, static_cast<unsigned>(nmatch));
+    base = __shfl_sync(active, base, leader);
+    if (!do_emit) return;
+    const unsigned pos = base + static_cast<unsigned>(rank);
     if (pos >= out_cap) { if (overflow) atomicAdd(overflow, 1u); return; }
     duckdb::magi_generic::JoinResultRow& r = out[pos];
     r.key_packed =
@@ -192,6 +336,68 @@ struct ProbeEmit {
 
 namespace magi {
 
+// ── Pack ONE row into a wire tuple ─────────────────────────────────────────
+// Shared by the standalone pack kernels and by the fused pack-inside-send path
+// (see WirePackSrc). Build and probe wires are structurally identical (key,
+// index, _pad, payload[JOIN_MAX_PAYLOAD]), so one template covers both — they
+// MUST stay identical, or the two sides disagree on the wire layout.
+// Returns false for a row filtered out by the validity mask.
+template <typename KeyT, typename WireT>
+__device__ __forceinline__ bool
+pack_wire_row(std::uint64_t r, const magi_ops::ColPack& cols,
+              const magi_ops::KeyFieldEntry* __restrict__ key_fields,
+              int n_key_fields,
+              const duckdb::magi_generic::JoinPayloadEntry* __restrict__ pl,
+              int n_pl, WireT& w)
+{
+  using duckdb::magi_generic::JoinPayloadEntry;
+  if (!magi_ops::row_is_valid(cols.row_validity, r)) return false;
+  const KeyT key =
+      magi_ops::pack_key_from_fields<KeyT>(cols, r, key_fields, n_key_fields);
+  w.index = 1;
+  w._pad  = 0;
+  if constexpr (sizeof(KeyT) > 8) {
+    w.key = static_cast<unsigned __int128>(key);  // already u128, no make_unsigned
+  } else {
+    w.key = static_cast<unsigned __int128>(static_cast<std::make_unsigned_t<KeyT>>(key));
+  }
+  #pragma unroll
+  for (int i = 0; i < duckdb::magi_join::JOIN_MAX_PAYLOAD; ++i) w.payload[i] = 0;
+  for (int i = 0; i < n_pl; ++i) {
+    const int dst = pl[i].dst_idx;
+    const int src = pl[i].src_col_idx;
+    if (dst < 0 || dst >= duckdb::magi_join::JOIN_MAX_PAYLOAD) continue;
+    if (pl[i].src_kind == JoinPayloadEntry::Src::VARCHAR) {
+      // Inline the local string into VARCHAR_PAYLOAD_SLOTS slots: [len][chars…].
+      // Done before the key-partition shuffle, so the bytes ride the fixed-width
+      // tuple to the owner GPU like any other payload.
+      const std::uint8_t*  vch = cols.v_chars[src];
+      const std::uint64_t* vof = cols.v_offsets[src];
+      const std::uint64_t  s0  = vof[r];
+      std::uint32_t len = static_cast<std::uint32_t>(vof[r + 1] - s0);
+      if (len > duckdb::magi_generic::VARCHAR_PAYLOAD_MAXLEN)
+        len = duckdb::magi_generic::VARCHAR_PAYLOAD_MAXLEN;
+      unsigned char buf[duckdb::magi_generic::VARCHAR_PAYLOAD_SLOTS * 8];
+      #pragma unroll
+      for (int b = 0; b < duckdb::magi_generic::VARCHAR_PAYLOAD_SLOTS * 8; ++b) buf[b] = 0;
+      buf[0] = static_cast<unsigned char>(len);
+      for (std::uint32_t b = 0; b < len; ++b) buf[1 + b] = vch[s0 + b];
+      #pragma unroll
+      for (int ws = 0; ws < duckdb::magi_generic::VARCHAR_PAYLOAD_SLOTS; ++ws)
+        if (dst + ws < duckdb::magi_join::JOIN_MAX_PAYLOAD)
+          __builtin_memcpy(&w.payload[dst + ws], &buf[ws * 8], sizeof(std::int64_t));
+    } else if (pl[i].src_kind == JoinPayloadEntry::Src::INT64) {
+      w.payload[dst] = cols.i64_agg_cols[src][r];
+    } else if (pl[i].src_kind == JoinPayloadEntry::Src::INT32) {
+      w.payload[dst] = static_cast<int64_t>(cols.i_cols[src][r]);  // widen INT32 → int64
+    } else {  // DOUBLE — bit-cast into the int64 wire slot
+      const double d = cols.d_cols[src][r];
+      __builtin_memcpy(&w.payload[dst], &d, sizeof(int64_t));
+    }
+  }
+  return true;
+}
+
 // ── Pack build rows (ColPack) into wire tuples ──────────────────────────────
 // Grid-strided over local build rows; packs the join key (via the table-driven
 // pack_key_from_fields) into a JoinBuildWire. suppkey = low32(key) is the
@@ -208,54 +414,15 @@ join_pack_build_kernel(const std::uint64_t* __restrict__       row_ids,
                        duckdb::magi_join::JoinBuildWire* __restrict__ out,
                        unsigned int* __restrict__               out_count)
 {
-  using duckdb::magi_generic::JoinPayloadEntry;
   const std::uint64_t stride =
       static_cast<std::uint64_t>(gridDim.x) * blockDim.x;
   for (std::uint64_t k =
            static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
        k < n_rows; k += stride) {
-    const std::uint64_t r = row_ids[k];
-    if (!magi_ops::row_is_valid(cols.row_validity, r)) continue;
-    const KeyT key =
-        magi_ops::pack_key_from_fields<KeyT>(cols, r, key_fields, n_key_fields);
     duckdb::magi_join::JoinBuildWire w;
-    w.index = 1;
-    w._pad  = 0;
-    w.key   = static_cast<int64_t>(static_cast<std::make_unsigned_t<KeyT>>(key));
-    #pragma unroll
-    for (int i = 0; i < duckdb::magi_join::JOIN_MAX_PAYLOAD; ++i) w.payload[i] = 0;
-    for (int i = 0; i < n_build_pl; ++i) {
-      const int dst = build_pl[i].dst_idx;
-      const int src = build_pl[i].src_col_idx;
-      if (dst < 0 || dst >= duckdb::magi_join::JOIN_MAX_PAYLOAD) continue;
-      if (build_pl[i].src_kind == JoinPayloadEntry::Src::VARCHAR) {
-        // Inline the local string into VARCHAR_PAYLOAD_SLOTS slots: [len][chars…].
-        // Done here (before the key-partition shuffle), so the bytes ride the
-        // fixed-width tuple to the owner GPU like any other payload.
-        const std::uint8_t*  vch = cols.v_chars[src];
-        const std::uint64_t* vof = cols.v_offsets[src];
-        const std::uint64_t  s0  = vof[r];
-        std::uint32_t len = static_cast<std::uint32_t>(vof[r + 1] - s0);
-        if (len > duckdb::magi_generic::VARCHAR_PAYLOAD_MAXLEN)
-          len = duckdb::magi_generic::VARCHAR_PAYLOAD_MAXLEN;
-        unsigned char buf[duckdb::magi_generic::VARCHAR_PAYLOAD_SLOTS * 8];
-        #pragma unroll
-        for (int b = 0; b < duckdb::magi_generic::VARCHAR_PAYLOAD_SLOTS * 8; ++b) buf[b] = 0;
-        buf[0] = static_cast<unsigned char>(len);
-        for (std::uint32_t b = 0; b < len; ++b) buf[1 + b] = vch[s0 + b];
-        #pragma unroll
-        for (int ws = 0; ws < duckdb::magi_generic::VARCHAR_PAYLOAD_SLOTS; ++ws)
-          if (dst + ws < duckdb::magi_join::JOIN_MAX_PAYLOAD)
-            __builtin_memcpy(&w.payload[dst + ws], &buf[ws * 8], sizeof(std::int64_t));
-      } else if (build_pl[i].src_kind == JoinPayloadEntry::Src::INT64) {
-        w.payload[dst] = cols.i64_agg_cols[src][r];
-      } else if (build_pl[i].src_kind == JoinPayloadEntry::Src::INT32) {
-        w.payload[dst] = static_cast<int64_t>(cols.i_cols[src][r]);  // widen INT32 → int64
-      } else {  // DOUBLE — bit-cast into the int64 wire slot
-        const double d = cols.d_cols[src][r];
-        __builtin_memcpy(&w.payload[dst], &d, sizeof(int64_t));
-      }
-    }
+    if (!pack_wire_row<KeyT>(row_ids[k], cols, key_fields, n_key_fields,
+                             build_pl, n_build_pl, w))
+      continue;
     const unsigned pos = atomicAdd(out_count, 1u);
     out[pos] = w;
   }
@@ -274,30 +441,75 @@ join_build_kernel(const duckdb::magi_join::JoinBuildWire* __restrict__ tuples,
                   magi_ops::AggSlot64<KeyT>* __restrict__  H_build,
                   int                                      n_build_pl,
                   bool                                     just_load,
-                  unsigned int* __restrict__               overflow)
+                  unsigned int* __restrict__               overflow,
+                  duckdb::magi_join::WirePackSrc           pack_src)
 {
   if (just_load) return;
   using Wire = duckdb::magi_join::JoinBuildWire;
 
-  const std::uint64_t rows_per_block = (n + gridDim.x - 1) / gridDim.x;
+  // Same fused-packing scheme as the probe kernel — see the comment there.
+  const bool          fused_pack = (pack_src.scratch != nullptr);
+  const std::uint64_t total      = fused_pack ? pack_src.n_rows : n;
+
+  const std::uint64_t rows_per_block = (total + gridDim.x - 1) / gridDim.x;
   const std::uint64_t start_row      = static_cast<std::uint64_t>(blockIdx.x) * rows_per_block;
-  const std::uint64_t end_row        = min(start_row + rows_per_block, n);
-  const std::uint64_t rows           = (start_row >= n) ? 0 : (end_row - start_row);
+  const std::uint64_t end_row        = min(start_row + rows_per_block, total);
+  const std::uint64_t rows           = (start_row >= total) ? 0 : (end_row - start_row);
+
+  Wire* const my_scratch =
+      fused_pack ? static_cast<Wire*>(pack_src.scratch) +
+                       static_cast<std::size_t>(blockIdx.x) * pack_src.chunk
+                 : nullptr;
+  __shared__ unsigned int s_packed;
+  __shared__ int          s_taken;
 
   bool recv_eof = false;
 
   duckdb::magi_join::BuildInsert<KeyT, N_SLOTS>      insert{H_build, n_build_pl, overflow};
   duckdb::magi_join::JoinKeyPartition<Wire>          part;
 
-  std::uint64_t offset = 0;
-  while (offset < rows) {
+  std::uint64_t offset  = 0;
+  bool          pending = false;
+  while (offset < rows || pending) {
     while (true) {
-      int items = static_cast<int>(rows - offset);
-      if (items > 64 * static_cast<int>(blockDim.x)) items = 64 * static_cast<int>(blockDim.x);
-      const int status = magi::send_direct<Wire, K_INTRA, K_INTER>(
-          &tuples[offset + start_row], items, part);
-      if (status == MAGI_STATUS_SUCCESS) offset += items;
-      else break;
+      const Wire* send_ptr;
+      int         items;
+      if (fused_pack) {
+        if (!pending) {
+          if (offset >= rows) break;
+          const int want = static_cast<int>(
+              min(rows - offset, static_cast<std::uint64_t>(pack_src.chunk)));
+          if (threadIdx.x == 0) { s_packed = 0u; s_taken = want; }
+          __syncthreads();
+          for (int i = threadIdx.x; i < want; i += blockDim.x) {
+            Wire w;
+            if (pack_wire_row<KeyT>(pack_src.row_ids[start_row + offset + i],
+                                    pack_src.cols, pack_src.key_fields,
+                                    pack_src.n_key_fields, pack_src.pl,
+                                    pack_src.n_pl, w)) {
+              my_scratch[atomicAdd(&s_packed, 1u)] = w;
+            }
+          }
+          __syncthreads();
+          pending = true;
+        }
+        send_ptr = my_scratch;
+        items    = static_cast<int>(s_packed);
+      } else {
+        if (offset >= rows) break;
+        items = static_cast<int>(rows - offset);
+        if (items > 64 * static_cast<int>(blockDim.x)) items = 64 * static_cast<int>(blockDim.x);
+        send_ptr = &tuples[offset + start_row];
+      }
+      const int status = (items > 0)
+                             ? magi::send_direct<Wire, K_INTRA, K_INTER>(send_ptr, items, part)
+                             : MAGI_STATUS_SUCCESS;
+      if (status == MAGI_STATUS_SUCCESS) {
+        if (fused_pack) { offset += static_cast<std::uint64_t>(s_taken); pending = false; }
+        else            { offset += items; }
+      } else {
+        break;
+      }
     }
     while (true) {
       const int s = magi::recv_direct_self_drain<Wire>(insert);
@@ -347,54 +559,92 @@ join_pack_probe_kernel(const std::uint64_t* __restrict__       row_ids,
                        duckdb::magi_join::JoinProbeWire* __restrict__ out,
                        unsigned int* __restrict__               out_count)
 {
-  using duckdb::magi_generic::JoinPayloadEntry;
   const std::uint64_t stride =
       static_cast<std::uint64_t>(gridDim.x) * blockDim.x;
   for (std::uint64_t k =
            static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
        k < n_rows; k += stride) {
-    const std::uint64_t r = row_ids[k];
-    if (!magi_ops::row_is_valid(cols.row_validity, r)) continue;
-    const KeyT key =
-        magi_ops::pack_key_from_fields<KeyT>(cols, r, key_fields, n_key_fields);
     duckdb::magi_join::JoinProbeWire w;
-    w.index = 1;
-    w._pad  = 0;
-    w.key   = static_cast<int64_t>(static_cast<std::make_unsigned_t<KeyT>>(key));
-    #pragma unroll
-    for (int i = 0; i < duckdb::magi_join::JOIN_MAX_PAYLOAD; ++i) w.payload[i] = 0;
-    for (int i = 0; i < n_probe_pl; ++i) {
-      const int dst = probe_pl[i].dst_idx;
-      const int src = probe_pl[i].src_col_idx;
-      if (dst < 0 || dst >= duckdb::magi_join::JOIN_MAX_PAYLOAD) continue;
-      if (probe_pl[i].src_kind == JoinPayloadEntry::Src::VARCHAR) {
-        const std::uint8_t*  vch = cols.v_chars[src];
-        const std::uint64_t* vof = cols.v_offsets[src];
-        const std::uint64_t  s0  = vof[r];
-        std::uint32_t len = static_cast<std::uint32_t>(vof[r + 1] - s0);
-        if (len > duckdb::magi_generic::VARCHAR_PAYLOAD_MAXLEN)
-          len = duckdb::magi_generic::VARCHAR_PAYLOAD_MAXLEN;
-        unsigned char buf[duckdb::magi_generic::VARCHAR_PAYLOAD_SLOTS * 8];
-        #pragma unroll
-        for (int b = 0; b < duckdb::magi_generic::VARCHAR_PAYLOAD_SLOTS * 8; ++b) buf[b] = 0;
-        buf[0] = static_cast<unsigned char>(len);
-        for (std::uint32_t b = 0; b < len; ++b) buf[1 + b] = vch[s0 + b];
-        #pragma unroll
-        for (int ws = 0; ws < duckdb::magi_generic::VARCHAR_PAYLOAD_SLOTS; ++ws)
-          if (dst + ws < duckdb::magi_join::JOIN_MAX_PAYLOAD)
-            __builtin_memcpy(&w.payload[dst + ws], &buf[ws * 8], sizeof(std::int64_t));
-      } else if (probe_pl[i].src_kind == JoinPayloadEntry::Src::INT64) {
-        w.payload[dst] = cols.i64_agg_cols[src][r];
-      } else if (probe_pl[i].src_kind == JoinPayloadEntry::Src::INT32) {
-        w.payload[dst] = static_cast<int64_t>(cols.i_cols[src][r]);  // widen INT32 → int64
-      } else {  // DOUBLE — bit-cast into the int64 wire slot
-        const double d = cols.d_cols[src][r];
-        __builtin_memcpy(&w.payload[dst], &d, sizeof(int64_t));
-      }
-    }
+    if (!pack_wire_row<KeyT>(row_ids[k], cols, key_fields, n_key_fields,
+                             probe_pl, n_probe_pl, w))
+      continue;
     const unsigned pos = atomicAdd(out_count, 1u);
     out[pos] = w;
   }
+}
+
+// Option A: bulk-insert (key -> H_build slot index) into the cuco map after the
+// build session. One thread per H_build slot; occupied slots (key != empty)
+// insert their packed uint64 key with the slot index as value. Scalar insert
+// (cg_size=1). Only instantiated/launched for the uint64 key path.
+template <typename KeyT, int N_SLOTS>
+__global__ void cuco_insert_from_hbuild(duckdb::magi_join::CucoInsertRef ins,
+                                        const magi_ops::AggSlot64<KeyT>* __restrict__ H)
+{
+  const std::uint64_t i = blockIdx.x * (std::uint64_t)blockDim.x + threadIdx.x;
+  if (i >= (std::uint64_t)N_SLOTS) return;
+  const KeyT k = H[i].key;
+  if (k == magi_ops::empty_key_v<KeyT>) return;
+  std::uint64_t ck;
+  if constexpr (sizeof(KeyT) > 8) {  // pack 16B compound key -> uint64 (see ProbeEmit)
+    const unsigned __int128 ku = static_cast<unsigned __int128>(k);
+    ck = static_cast<std::uint64_t>(static_cast<std::uint32_t>(static_cast<std::uint64_t>(ku))) |
+         (static_cast<std::uint64_t>(static_cast<std::uint32_t>(static_cast<std::uint64_t>(ku >> 64))) << 32);
+  } else {
+    ck = static_cast<std::uint64_t>(k);
+  }
+  ins.insert(cuco::pair<std::uint64_t, std::int32_t>{ck, static_cast<std::int32_t>(i)});
+}
+
+// NOTE: a device-side stats kernel over the fused group table used to live here.
+// It reported impossible results (90% "lost writes", two reads of the same slot
+// key disagreeing within one kernel) and burned a session on a phantom race; the
+// host copy in join_run_typed_tier's DBG block is the ground truth. Don't add one.
+
+// Compact the fused group table into join output rows — one row per non-empty
+// group instead of one per match (150M -> 500K here). The per-GPU rows are
+// PARTIAL aggregates; the downstream GROUP BY merges them (SUM of partial SUMs
+// is the true SUM), i.e. this is classic two-phase aggregation with phase 1
+// pushed into the shuffle-join probe.
+static __global__ void fused_group_compact(
+    const magi_ops::AggSlot64<std::uint64_t>* __restrict__ g, int n_slots,
+    duckdb::magi_generic::JoinResultRow* __restrict__ out,
+    unsigned int* __restrict__ out_count, unsigned int out_cap,
+    int key_dst, int sum_dst)
+{
+  const std::uint64_t i = blockIdx.x * (std::uint64_t)blockDim.x + threadIdx.x;
+  if (i >= (std::uint64_t)n_slots) return;
+  const std::uint64_t k = g[i].key;
+  if (k == magi_ops::empty_key_v<std::uint64_t>) return;
+  const unsigned pos = atomicAdd(out_count, 1u);
+  if (pos >= out_cap) return;
+  duckdb::magi_generic::JoinResultRow& r = out[pos];
+  // The group key is the HIGH half of the compound join key (l_suppkey), so put
+  // it back where the key layout expects it — the caller rebuilds the join-key
+  // columns by splitting key_packed (low = partkey, high = suppkey).
+  r.key_packed = static_cast<unsigned __int128>(k) << 64;
+  for (int j = 0; j < duckdb::magi_generic::JoinResultRow::N_VALUES; ++j) {
+    r.build_values[j] = 0.0;
+    r.probe_values[j] = 0.0;
+  }
+  {
+    const long long kk = static_cast<long long>(k);      // group key column
+    double d; __builtin_memcpy(&d, &kk, sizeof(d));      // raw bits; host narrows
+    if (key_dst >= 0) {
+      if (key_dst < duckdb::magi_generic::JoinResultRow::N_VALUES)
+        r.build_values[key_dst] = d;
+    } else {
+      // key_dst < 0: POC probe mode — put the group key in EVERY slot on both
+      // sides (except the aggregate's own slot) so the downstream GROUP BY
+      // finds it whichever column the plan reads.
+      for (int j = 0; j < duckdb::magi_generic::JoinResultRow::N_VALUES; ++j) {
+        r.build_values[j] = d;
+        if (j != sum_dst) r.probe_values[j] = d;
+      }
+    }
+  }
+  if (sum_dst >= 0 && sum_dst < duckdb::magi_generic::JoinResultRow::N_VALUES)
+    r.probe_values[sum_dst] = g[i].values[1];            // int64 sum bits
 }
 
 // ── Probe kernel: send probe tuples to owners, look up H_build, emit matches ─
@@ -416,31 +666,88 @@ join_probe_kernel(const duckdb::magi_join::JoinProbeWire* __restrict__ tuples,
                   unsigned int* __restrict__               overflow,
                   unsigned int* __restrict__               n_drained,
                   double* __restrict__                     agg_accum,
-                  const duckdb::magi_fused::FusedAggProgram* __restrict__ agg_prog)
+                  const duckdb::magi_fused::FusedAggProgram* __restrict__ agg_prog,
+                  const duckdb::magi_join::CucoFindRef* __restrict__ cuco_ref,
+                  magi_ops::AggSlot64<std::uint64_t>* __restrict__ group_tbl,
+                  unsigned int* __restrict__ group_overflow,
+                  int fuse_sum_idx,
+                  duckdb::magi_join::WirePackSrc pack_src)
 {
   if (just_load) return;
   using Wire = duckdb::magi_join::JoinProbeWire;
 
-  const std::uint64_t rows_per_block = (n + gridDim.x - 1) / gridDim.x;
+  // Fused packing: pack each chunk right before sending it, instead of reading a
+  // wire array a separate kernel materialized up front. That array is
+  // n_probe_rows * 64B (9.6 GB/GPU at SF50) and its pack kernel is dead time on
+  // the link — the shuffle cannot start until the last row is packed.
+  const bool          fused_pack = (pack_src.scratch != nullptr);
+  const std::uint64_t total      = fused_pack ? pack_src.n_rows : n;
+
+  const std::uint64_t rows_per_block = (total + gridDim.x - 1) / gridDim.x;
   const std::uint64_t start_row      = static_cast<std::uint64_t>(blockIdx.x) * rows_per_block;
-  const std::uint64_t end_row        = min(start_row + rows_per_block, n);
-  const std::uint64_t rows           = (start_row >= n) ? 0 : (end_row - start_row);
+  const std::uint64_t end_row        = min(start_row + rows_per_block, total);
+  const std::uint64_t rows           = (start_row >= total) ? 0 : (end_row - start_row);
+
+  Wire* const my_scratch =
+      fused_pack ? static_cast<Wire*>(pack_src.scratch) +
+                       static_cast<std::size_t>(blockIdx.x) * pack_src.chunk
+                 : nullptr;
+  __shared__ unsigned int s_packed;  // tuples that survived the validity mask
+  __shared__ int          s_taken;   // source rows the packed chunk consumed
 
   bool recv_eof = false;
   duckdb::magi_join::ProbeEmit<KeyT, N_SLOTS> emit{H_build,  out,       out_count,
                                                    out_cap,  n_build_pl, overflow,
-                                                   n_drained, agg_accum, agg_prog};
+                                                   n_drained, agg_accum, agg_prog, cuco_ref,
+                                                   group_tbl, group_overflow,
+                                                   fuse_sum_idx};
   duckdb::magi_join::JoinKeyPartition<Wire>   part;
 
-  std::uint64_t offset = 0;
-  while (offset < rows) {
+  std::uint64_t offset  = 0;
+  bool          pending = false;  // scratch holds a packed chunk not yet sent
+  while (offset < rows || pending) {
     while (true) {
-      int items = static_cast<int>(rows - offset);
-      if (items > 64 * static_cast<int>(blockDim.x)) items = 64 * static_cast<int>(blockDim.x);
-      const int status = magi::send_direct<Wire, K_INTRA, K_INTER>(
-          &tuples[offset + start_row], items, part);
-      if (status == MAGI_STATUS_SUCCESS) offset += items;
-      else break;
+      const Wire* send_ptr;
+      int         items;
+      if (fused_pack) {
+        if (!pending) {
+          if (offset >= rows) break;
+          const int want = static_cast<int>(
+              min(rows - offset, static_cast<std::uint64_t>(pack_src.chunk)));
+          if (threadIdx.x == 0) { s_packed = 0u; s_taken = want; }
+          __syncthreads();
+          for (int i = threadIdx.x; i < want; i += blockDim.x) {
+            Wire w;
+            if (pack_wire_row<KeyT>(pack_src.row_ids[start_row + offset + i],
+                                    pack_src.cols, pack_src.key_fields,
+                                    pack_src.n_key_fields, pack_src.pl,
+                                    pack_src.n_pl, w)) {
+              // Order within a chunk is irrelevant: send_direct routes each
+              // tuple by key, and the receiver hashes it.
+              my_scratch[atomicAdd(&s_packed, 1u)] = w;
+            }
+          }
+          __syncthreads();
+          pending = true;
+        }
+        send_ptr = my_scratch;
+        items    = static_cast<int>(s_packed);
+      } else {
+        if (offset >= rows) break;
+        items = static_cast<int>(rows - offset);
+        if (items > 64 * static_cast<int>(blockDim.x)) items = 64 * static_cast<int>(blockDim.x);
+        send_ptr = &tuples[offset + start_row];
+      }
+      // An all-filtered chunk sends nothing but still consumes its source rows.
+      const int status = (items > 0)
+                             ? magi::send_direct<Wire, K_INTRA, K_INTER>(send_ptr, items, part)
+                             : MAGI_STATUS_SUCCESS;
+      if (status == MAGI_STATUS_SUCCESS) {
+        if (fused_pack) { offset += static_cast<std::uint64_t>(s_taken); pending = false; }
+        else            { offset += items; }
+      } else {
+        break;  // back-pressure: keep the packed chunk, drain, retry
+      }
     }
     while (true) {
       const int s = magi::recv_direct_self_drain<Wire>(emit);

@@ -19,6 +19,8 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <memory>
+#include <type_traits>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -56,7 +58,8 @@ namespace magi {
                     KBUFFERING_INTRA_PARTITION_SIZE,                            \
                     KBUFFERING_INTER_PARTITION_SIZE>(                           \
       const duckdb::magi_join::JoinBuildWire*, std::uint64_t,                   \
-      magi_ops::AggSlot64<KEY_TYPE>*, int, bool, unsigned int*)
+      magi_ops::AggSlot64<KEY_TYPE>*, int, bool, unsigned int*,                 \
+      duckdb::magi_join::WirePackSrc)
 
 #define MAGI_JOIN_INST_PROBE(KEY_TYPE, N_SLOTS)                                 \
   template __global__ void                                                      \
@@ -67,7 +70,10 @@ namespace magi {
       magi_ops::AggSlot64<KEY_TYPE>*,                                           \
       duckdb::magi_generic::JoinResultRow*, unsigned int*, unsigned int, int,   \
       bool, unsigned int*, unsigned int*,                                       \
-      double*, const duckdb::magi_fused::FusedAggProgram*)
+      double*, const duckdb::magi_fused::FusedAggProgram*,                      \
+      const duckdb::magi_join::CucoFindRef*,                                    \
+      magi_ops::AggSlot64<std::uint64_t>*, unsigned int*, int,                  \
+      duckdb::magi_join::WirePackSrc)
 
 #define MAGI_JOIN_INST_ALL(KEY_TYPE)                                            \
   MAGI_JOIN_INST_PACK_BUILD(KEY_TYPE);                                          \
@@ -76,13 +82,16 @@ namespace magi {
   MAGI_JOIN_INST_BUILD(KEY_TYPE, duckdb::magi_generic::N_SLOTS_MEDIUM);         \
   MAGI_JOIN_INST_BUILD(KEY_TYPE, duckdb::magi_generic::N_SLOTS_LARGE);          \
   MAGI_JOIN_INST_BUILD(KEY_TYPE, duckdb::magi_generic::N_SLOTS_XLARGE);         \
+  MAGI_JOIN_INST_BUILD(KEY_TYPE, duckdb::magi_generic::N_SLOTS_XXLARGE);        \
   MAGI_JOIN_INST_PROBE(KEY_TYPE, duckdb::magi_generic::N_SLOTS_SMALL);          \
   MAGI_JOIN_INST_PROBE(KEY_TYPE, duckdb::magi_generic::N_SLOTS_MEDIUM);         \
   MAGI_JOIN_INST_PROBE(KEY_TYPE, duckdb::magi_generic::N_SLOTS_LARGE);          \
-  MAGI_JOIN_INST_PROBE(KEY_TYPE, duckdb::magi_generic::N_SLOTS_XLARGE)
+  MAGI_JOIN_INST_PROBE(KEY_TYPE, duckdb::magi_generic::N_SLOTS_XLARGE);         \
+  MAGI_JOIN_INST_PROBE(KEY_TYPE, duckdb::magi_generic::N_SLOTS_XXLARGE)
 
 MAGI_JOIN_INST_ALL(std::int32_t);
 MAGI_JOIN_INST_ALL(std::uint64_t);
+MAGI_JOIN_INST_ALL(unsigned __int128);
 
 // Clear an H_build tier prefix to the empty-key sentinel (memset to 0 mis-marks
 // int32 slots, whose empty key is -1).
@@ -94,6 +103,7 @@ __global__ void join_clear_hbuild(magi_ops::AggSlot64<KeyT>* H, int n_slots)
 }
 template __global__ void join_clear_hbuild<std::int32_t>(magi_ops::AggSlot64<std::int32_t>*, int);
 template __global__ void join_clear_hbuild<std::uint64_t>(magi_ops::AggSlot64<std::uint64_t>*, int);
+template __global__ void join_clear_hbuild<unsigned __int128>(magi_ops::AggSlot64<unsigned __int128>*, int);
 
 }  // namespace magi
 
@@ -111,10 +121,29 @@ namespace magi_generic {
 // H_build sized to the XLARGE tier (16M slots × 64B = 1 GB) so realistic
 // large-large joins (e.g. lineitem⋈part, ~10M distinct partkey) fit. Wire/output
 // buffers are per-query (sizes vary widely) — allocated/freed inside the run.
-constexpr int    JOIN_MAX_TIER_SLOTS = N_SLOTS_XLARGE;
+constexpr int    JOIN_MAX_TIER_SLOTS = N_SLOTS_XXLARGE;  // 64M slots × 64B = 4GB/GPU arena
 constexpr size_t JOIN_HBUILD_BYTES =
     sizeof(magi_ops::AggSlot64<std::uint64_t>) * JOIN_MAX_TIER_SLOTS;
 constexpr int    JOIN_BLOCK = 1024;
+
+// Grid size for the join's user kernels. MAGI_USER_GRID can only lower it:
+// USER_KERNEL_GRID_SIZE is baked into the channel's data structures — kbuffering
+// keeps `size_t write_slots[USER_KERNEL_GRID_SIZE]` / `read_slots[...]` indexed
+// by blockIdx, and endpoint allocates KBUFFERING_K * USER_KERNEL_GRID_SIZE
+// staging buffers. Launching MORE blocks than the constant makes blocks past the
+// end scribble out of bounds (measured: grid 96/128 segfault, 132 hangs). To
+// raise the grid, raise the constant in Magi-Dev/include/data_plane/config.cuh
+// so the structures grow with it.
+static inline int magi_user_grid()
+{
+  static const int g = [] {
+    const char* e = std::getenv("MAGI_USER_GRID");
+    const int   v = e ? std::atoi(e) : 0;
+    const int   c = static_cast<int>(USER_KERNEL_GRID_SIZE);
+    return (v > 0 && v < c) ? v : c;
+  }();
+  return g;
+}
 
 static std::byte*               g_hbuild_dev   [NUM_GPUS] = { nullptr };
 static magi_ops::KeyFieldEntry* g_jkfields_dev [NUM_GPUS] = { nullptr };
@@ -226,15 +255,32 @@ static std::size_t join_run_typed_tier(int gpu_id, std::vector<JoinResultRow>& m
   magi_join::JoinProbeWire* pw = nullptr;
   unsigned int*             pw_count = nullptr;
   unsigned int*             out_count_dev = nullptr;
+  // Fused packing: the send loop packs each chunk itself, so the full-size wire
+  // arrays (n_rows * 64B — 9.6 GB/GPU for SF50's probe side) collapse to a
+  // per-block staging area of grid * FUSE_PACK_CHUNK tuples, and the pack
+  // kernels' ~17 ms of dead time before the shuffle disappears.
+  static const bool fuse_pack = std::getenv("MAGI_FUSE_PACK") != nullptr;
+  constexpr int     FUSE_PACK_CHUNK = 64 * JOIN_BLOCK;  // matches the old send chunk
+  std::uint8_t*     bpack_scratch = nullptr;
+  std::uint8_t*     ppack_scratch = nullptr;
   {
     bool ok = true;
     try {
       const std::uint64_t bn0 = std::max<std::uint64_t>(xc.build_in[gpu_id].n_rows, 1);
       const std::uint64_t pn0 = std::max<std::uint64_t>(xc.probe_in[gpu_id].n_rows, 1);
-      bw = reinterpret_cast<magi_join::JoinBuildWire*>(
-        magi_runtime::magi_pool_alloc(sizeof(magi_join::JoinBuildWire) * bn0, gpu_id, false));
-      pw = reinterpret_cast<magi_join::JoinProbeWire*>(
-        magi_runtime::magi_pool_alloc(sizeof(magi_join::JoinProbeWire) * pn0, gpu_id, false));
+      if (fuse_pack) {
+        const std::size_t bsz = sizeof(magi_join::JoinBuildWire) *
+                                static_cast<std::size_t>(magi_user_grid()) * FUSE_PACK_CHUNK;
+        const std::size_t psz = sizeof(magi_join::JoinProbeWire) *
+                                static_cast<std::size_t>(magi_user_grid()) * FUSE_PACK_CHUNK;
+        bpack_scratch = magi_runtime::magi_pool_alloc(bsz, gpu_id, false);
+        ppack_scratch = magi_runtime::magi_pool_alloc(psz, gpu_id, false);
+      } else {
+        bw = reinterpret_cast<magi_join::JoinBuildWire*>(
+          magi_runtime::magi_pool_alloc(sizeof(magi_join::JoinBuildWire) * bn0, gpu_id, false));
+        pw = reinterpret_cast<magi_join::JoinProbeWire*>(
+          magi_runtime::magi_pool_alloc(sizeof(magi_join::JoinProbeWire) * pn0, gpu_id, false));
+      }
       bw_count = reinterpret_cast<unsigned int*>(
         magi_runtime::magi_pool_alloc(sizeof(unsigned int), gpu_id, false));
       pw_count = reinterpret_cast<unsigned int*>(
@@ -279,14 +325,27 @@ static std::size_t join_run_typed_tier(int gpu_id, std::vector<JoinResultRow>& m
   cudaMemsetAsync(g_joverflow_dev[gpu_id], 0, sizeof(unsigned int), st);
   std::uint64_t* brow = magi_runtime::GetIdentityRowIdsShared(gpu, bn);
   cudaDeviceSynchronize();  // make this GPU's cached input coherent (cf. groupby)
-  magi::join_pack_build_kernel<KeyT><<<USER_KERNEL_GRID_SIZE, JOIN_BLOCK, 0, st>>>(
-      brow, bn, xc.build_in[gpu_id].cols, g_jkfields_dev[gpu_id], xc.n_kf[gpu_id],
-      g_jbpl_dev[gpu_id], xc.n_bpl[gpu_id], bw, bw_count);
-  cudaStreamSynchronize(st);
-  chk("pack_build");
+  magi_join::WirePackSrc bsrc{};
+  if (fuse_pack) {
+    bsrc.row_ids      = brow;
+    bsrc.n_rows       = bn;
+    bsrc.cols         = xc.build_in[gpu_id].cols;
+    bsrc.key_fields   = g_jkfields_dev[gpu_id];
+    bsrc.pl           = g_jbpl_dev[gpu_id];
+    bsrc.scratch      = bpack_scratch;
+    bsrc.n_key_fields = xc.n_kf[gpu_id];
+    bsrc.n_pl         = xc.n_bpl[gpu_id];
+    bsrc.chunk        = FUSE_PACK_CHUNK;
+  } else {
+    magi::join_pack_build_kernel<KeyT><<<magi_user_grid(), JOIN_BLOCK, 0, st>>>(
+        brow, bn, xc.build_in[gpu_id].cols, g_jkfields_dev[gpu_id], xc.n_kf[gpu_id],
+        g_jbpl_dev[gpu_id], xc.n_bpl[gpu_id], bw, bw_count);
+    cudaStreamSynchronize(st);
+    chk("pack_build");
+  }
   auto pt_t1 = pt_clock::now();
   unsigned int bw_n = 0;
-  cudaMemcpy(&bw_n, bw_count, sizeof(unsigned int), cudaMemcpyDeviceToHost);
+  if (!fuse_pack) cudaMemcpy(&bw_n, bw_count, sizeof(unsigned int), cudaMemcpyDeviceToHost);
   if (DBG) std::fprintf(stderr, "[magi-join g%d] bn=%lu bw_n=%u n_bpl=%d n_ppl=%d\n",
                         gpu_id, (unsigned long)bn, bw_n, xc.n_bpl[gpu_id], xc.n_ppl[gpu_id]);
 
@@ -298,14 +357,47 @@ static std::size_t join_run_typed_tier(int gpu_id, std::vector<JoinResultRow>& m
   magi::join_build_kernel<KeyT, N_SLOTS,
                           KBUFFERING_INTRA_PARTITION_SIZE,
                           KBUFFERING_INTER_PARTITION_SIZE>
-      <<<USER_KERNEL_GRID_SIZE, JOIN_BLOCK, 0, st>>>(
-          bw, bw_n, H, n_bpl_slots, /*just_load=*/false, g_joverflow_dev[gpu_id]);
+      <<<magi_user_grid(), JOIN_BLOCK, 0, st>>>(
+          bw, bw_n, H, n_bpl_slots, /*just_load=*/false, g_joverflow_dev[gpu_id], bsrc);
   cudaStreamSynchronize(st);
   chk("build_kernel");
   auto pt_t3 = pt_clock::now();
   magi_runtime::magi_sync_after_session(gpu_id, xc.build_session);
   xc.after_build.arrive_and_wait();   // every owner's H_build is complete
   auto pt_t4 = pt_clock::now();
+
+  // ── Option A: build a cuco map (packed uint64 key -> H_build slot index) so
+  // the probe does a cudf-quality find instead of the hand-rolled open-address
+  // global_find. Only the uint64 key path (cuco caps keys at 8B). Gated by
+  // MAGI_CUCO. The map holds every owned build key; the value indexes back into
+  // H_build so the existing emit path (slot->values) is unchanged.
+  const bool use_cuco = std::getenv("MAGI_CUCO") != nullptr &&
+                        (std::is_same<KeyT, std::uint64_t>::value ||
+                         std::is_same<KeyT, unsigned __int128>::value);  // u128 packs to uint64
+  std::unique_ptr<magi_join::CucoMap> cuco_map;
+  magi_join::CucoFindRef*             d_find_ref = nullptr;
+  double                              cuco_build_ms = 0.0;
+  if (use_cuco) {
+    auto cb0 = pt_clock::now();
+    std::uint64_t total_build = 0;
+    for (int i = 0; i < NUM_GPUS; ++i) total_build += xc.build_in[i].n_rows;
+    const std::size_t cap = static_cast<std::size_t>(total_build) * 3 / 2 + 1024;
+    cuco_map = std::make_unique<magi_join::CucoMap>(
+        cap, cuco::empty_key<std::uint64_t>{0xFFFFFFFFFFFFFFFFULL},
+        cuco::empty_value<std::int32_t>{-1});
+    cudaDeviceSynchronize();  // map storage alloc (default stream) before insert on st
+    auto ins_ref = cuco_map->ref(cuco::insert);
+    const int g = (N_SLOTS + 255) / 256;
+    magi::cuco_insert_from_hbuild<KeyT, N_SLOTS><<<g, 256, 0, st>>>(ins_ref, H);
+    cudaStreamSynchronize(st);
+    chk("cuco_insert");
+    auto find_ref = cuco_map->ref(cuco::find);
+    cudaMalloc(reinterpret_cast<void**>(&d_find_ref), sizeof(find_ref));
+    cudaMemcpy(d_find_ref, &find_ref, sizeof(find_ref), cudaMemcpyHostToDevice);
+    cuco_build_ms = pt_ms(cb0, pt_clock::now());
+    if (DBG) std::fprintf(stderr, "[magi-join g%d] cuco build=%.2fms cap=%zu\n",
+                          gpu_id, cuco_build_ms, cap);
+  }
 
   // ── PROBE: pack rows → wire tuples ────────────────────────────────────────
   const std::uint64_t pn = xc.probe_in[gpu_id].n_rows;
@@ -316,14 +408,27 @@ static std::size_t join_run_typed_tier(int gpu_id, std::vector<JoinResultRow>& m
   // apply. Without it, a consuming GPU != 0 reads stale probe keys/payload →
   // nondeterministic wrong join results.
   cudaDeviceSynchronize();
-  magi::join_pack_probe_kernel<KeyT><<<USER_KERNEL_GRID_SIZE, JOIN_BLOCK, 0, st>>>(
-      prow, pn, xc.probe_in[gpu_id].cols, g_jkfields_dev[gpu_id], xc.n_kf[gpu_id],
-      g_jppl_dev[gpu_id], xc.n_ppl[gpu_id], pw, pw_count);
-  cudaStreamSynchronize(st);
-  chk("pack_probe");
+  magi_join::WirePackSrc psrc{};
+  if (fuse_pack) {
+    psrc.row_ids      = prow;
+    psrc.n_rows       = pn;
+    psrc.cols         = xc.probe_in[gpu_id].cols;
+    psrc.key_fields   = g_jkfields_dev[gpu_id];
+    psrc.pl           = g_jppl_dev[gpu_id];
+    psrc.scratch      = ppack_scratch;
+    psrc.n_key_fields = xc.n_kf[gpu_id];
+    psrc.n_pl         = xc.n_ppl[gpu_id];
+    psrc.chunk        = FUSE_PACK_CHUNK;
+  } else {
+    magi::join_pack_probe_kernel<KeyT><<<magi_user_grid(), JOIN_BLOCK, 0, st>>>(
+        prow, pn, xc.probe_in[gpu_id].cols, g_jkfields_dev[gpu_id], xc.n_kf[gpu_id],
+        g_jppl_dev[gpu_id], xc.n_ppl[gpu_id], pw, pw_count);
+    cudaStreamSynchronize(st);
+    chk("pack_probe");
+  }
   auto pt_t5 = pt_clock::now();
   unsigned int pw_n = 0;
-  cudaMemcpy(&pw_n, pw_count, sizeof(unsigned int), cudaMemcpyDeviceToHost);
+  if (!fuse_pack) cudaMemcpy(&pw_n, pw_count, sizeof(unsigned int), cudaMemcpyDeviceToHost);
 
   // Output buffer is pre-allocated by the wrapper from sirius's processing pool
   // (customCudaMalloc, sized ≈ this GPU's probe count = received + headroom).
@@ -362,16 +467,101 @@ static std::size_t join_run_typed_tier(int gpu_id, std::vector<JoinResultRow>& m
                     sizeof(duckdb::magi_fused::FusedAggProgram),
                     cudaMemcpyHostToDevice, st);
   }
+  // Fused grouped-agg (scheme ① POC): a per-owner group table the probe
+  // aggregates matches into (group key = high-64 of the compound join key =
+  // l_suppkey), instead of materializing JoinResultRows. Env-gated + u128 only.
+  magi_ops::AggSlot64<std::uint64_t>* group_tbl = nullptr;
+  unsigned int*                       group_of  = nullptr;
+  static const bool use_fuse_group =
+      std::getenv("MAGI_FUSE_GROUPED") != nullptr;
+  // Fused-agg column wiring (POC: env-driven; the planner will supply these once
+  // the join->groupby detection lands). fuse_sum_idx = wire/result slot of the
+  // summed probe column; fuse_key_dst = result slot of the group-key build column.
+  const char* e_sum = std::getenv("MAGI_FUSE_SUM_IDX");
+  const char* e_key = std::getenv("MAGI_FUSE_KEY_DST");
+  const int fuse_sum_idx = e_sum ? std::atoi(e_sum) : 0;
+  const int fuse_key_dst = e_key ? std::atoi(e_key) : 0;
+  if (DBG && use_fuse_group) {
+    for (int i = 0; i < xc.n_ppl[gpu_id]; ++i)
+      std::fprintf(stderr, "[fuse-cols g%d] probe_pl[%d] kind=%d src=%d dst=%d\n",
+                   gpu_id, i, (int)xc.ppl_ptr[gpu_id][i].src_kind,
+                   (int)xc.ppl_ptr[gpu_id][i].src_col_idx,
+                   (int)xc.ppl_ptr[gpu_id][i].dst_idx);
+    for (int i = 0; i < xc.n_bpl[gpu_id]; ++i)
+      std::fprintf(stderr, "[fuse-cols g%d] build_pl[%d] kind=%d src=%d dst=%d\n",
+                   gpu_id, i, (int)xc.bpl_ptr[gpu_id][i].src_kind,
+                   (int)xc.bpl_ptr[gpu_id][i].src_col_idx,
+                   (int)xc.bpl_ptr[gpu_id][i].dst_idx);
+  }
+  if (use_fuse_group && std::is_same<KeyT, unsigned __int128>::value) {
+    // group_tbl from the SAME pool allocator as out_count_dev (which works with
+    // zero loss). Raw cudaMalloc during a live magi session returned memory that
+    // overlapped the channel k-buffers → scattered group writes were clobbered
+    // by incoming wire traffic (single-slot survived, scatter lost 93-99%).
+    const size_t gt_bytes =
+        sizeof(magi_ops::AggSlot64<std::uint64_t>) * magi_join::GROUP_N_SLOTS;
+    group_tbl = reinterpret_cast<magi_ops::AggSlot64<std::uint64_t>*>(
+        magi_runtime::magi_pool_alloc(gt_bytes, gpu_id, false));
+    group_of = reinterpret_cast<unsigned int*>(
+        magi_runtime::magi_pool_alloc(sizeof(unsigned int), gpu_id, false));
+    cudaMemsetAsync(group_of, 0, sizeof(unsigned int), st);
+    if (DBG) {
+      int cur_dev = -1; cudaGetDevice(&cur_dev);
+      std::fprintf(stderr, "[fuse-alloc g%d] pool ptr=%p bytes=%zu cur_dev=%d\n",
+          gpu_id, (void*)group_tbl, gt_bytes, cur_dev);
+    }
+    // Clear and probe are both issued on `st`, so the clear is ordered before
+    // the probe's group writes without an explicit sync.
+    const int gclear = (magi_join::GROUP_N_SLOTS + 255) / 256;
+    magi::join_clear_hbuild<std::uint64_t>
+        <<<gclear, 256, 0, st>>>(group_tbl, magi_join::GROUP_N_SLOTS);
+  }
   magi::join_probe_kernel<KeyT, N_SLOTS,
                           KBUFFERING_INTRA_PARTITION_SIZE,
                           KBUFFERING_INTER_PARTITION_SIZE>
-      <<<USER_KERNEL_GRID_SIZE, JOIN_BLOCK, 0, st>>>(
+      <<<magi_user_grid(), JOIN_BLOCK, 0, st>>>(
           pw, pw_n, H, out, out_count, static_cast<unsigned int>(out_cap),
           n_bpl_slots, /*just_load=*/false, g_joverflow_dev[gpu_id],
-          /*n_drained=*/pw_count,     // reuse pw_count (pw_n already read) as drained counter
-          d_accum, d_prog);
+          // Drained-tuple counter is diagnostic only, and it costs one global
+          // atomic on a single address per drained tuple (150M/GPU here) right
+          // in the probe's hot path — pass it only when debugging.
+          /*n_drained=*/(DBG ? pw_count : nullptr),
+          d_accum, d_prog, d_find_ref, group_tbl, group_of, fuse_sum_idx, psrc);
   cudaStreamSynchronize(st);
   chk("probe_kernel");
+  if (d_find_ref) cudaFree(d_find_ref);
+  if (group_tbl != nullptr) {          // fused: groups -> output rows
+    if (DBG) {
+      // Host-side verification only. A device-side stats kernel over this table
+      // reports impossible "lost writes" (two reads of one slot key inside the
+      // same kernel disagree) and cost a full session chasing a phantom race —
+      // the host copy has always shown the table to be correct. Never reinstate
+      // a device-side verifier here.
+      std::vector<magi_ops::AggSlot64<std::uint64_t>> h_slots(magi_join::GROUP_N_SLOTS);
+      cudaMemcpy(h_slots.data(), group_tbl,
+                 sizeof(magi_ops::AggSlot64<std::uint64_t>) * magi_join::GROUP_N_SLOTS,
+                 cudaMemcpyDeviceToHost);
+      long long groups = 0; double sumc = 0.0; long long sumv = 0;
+      for (int i = 0; i < magi_join::GROUP_N_SLOTS; ++i) {
+        if (h_slots[i].key == magi_ops::empty_key_v<std::uint64_t>) continue;
+        ++groups; sumc += h_slots[i].values[0];
+        long long v; __builtin_memcpy(&v, &h_slots[i].values[1], sizeof(v));
+        sumv += v;
+      }
+      unsigned int h_gof = 0;
+      cudaMemcpy(&h_gof, group_of, sizeof(unsigned int), cudaMemcpyDeviceToHost);
+      std::fprintf(stderr, "[fuse-host g%d] groups=%lld matches=%.0f sum_val=%lld overflow=%u\n",
+                   gpu_id, groups, sumc, sumv, h_gof);
+    }
+    // Emit one result row per group (the join's output for the fused path).
+    cudaMemsetAsync(out_count_dev, 0, sizeof(unsigned int), st);
+    const int cg = (magi_join::GROUP_N_SLOTS + 255) / 256;
+    magi::fused_group_compact<<<cg, 256, 0, st>>>(
+        group_tbl, magi_join::GROUP_N_SLOTS, out, out_count_dev,
+        static_cast<unsigned int>(out_cap), fuse_key_dst, fuse_sum_idx);
+    cudaStreamSynchronize(st);
+    chk("fused_group_compact");
+  }
   auto pt_t7 = pt_clock::now();
   if (agg_prog_host) {
     double h_accum[duckdb::magi_fused::MAX_FUSED_AGGS] = {0};
@@ -456,17 +646,27 @@ static std::size_t join_dispatch(int gpu_id, KeyKind kk, TableSize ts,
         case TableSize::SMALL:  return join_run_typed_tier<std::int32_t, N_SLOTS_SMALL >(gpu_id, my_slice, device_emit, agg_prog_host);
         case TableSize::MEDIUM: return join_run_typed_tier<std::int32_t, N_SLOTS_MEDIUM>(gpu_id, my_slice, device_emit, agg_prog_host);
         case TableSize::LARGE:  return join_run_typed_tier<std::int32_t, N_SLOTS_LARGE >(gpu_id, my_slice, device_emit, agg_prog_host);
-        default:                return join_run_typed_tier<std::int32_t, N_SLOTS_XLARGE>(gpu_id, my_slice, device_emit, agg_prog_host);
+        case TableSize::XLARGE: return join_run_typed_tier<std::int32_t, N_SLOTS_XLARGE >(gpu_id, my_slice, device_emit, agg_prog_host);
+        default:                return join_run_typed_tier<std::int32_t, N_SLOTS_XXLARGE>(gpu_id, my_slice, device_emit, agg_prog_host);
       }
     case KeyKind::UINT64:
       switch (ts) {
         case TableSize::SMALL:  return join_run_typed_tier<std::uint64_t, N_SLOTS_SMALL >(gpu_id, my_slice, device_emit, agg_prog_host);
         case TableSize::MEDIUM: return join_run_typed_tier<std::uint64_t, N_SLOTS_MEDIUM>(gpu_id, my_slice, device_emit, agg_prog_host);
         case TableSize::LARGE:  return join_run_typed_tier<std::uint64_t, N_SLOTS_LARGE >(gpu_id, my_slice, device_emit, agg_prog_host);
-        default:                return join_run_typed_tier<std::uint64_t, N_SLOTS_XLARGE>(gpu_id, my_slice, device_emit, agg_prog_host);
+        case TableSize::XLARGE: return join_run_typed_tier<std::uint64_t, N_SLOTS_XLARGE >(gpu_id, my_slice, device_emit, agg_prog_host);
+        default:                return join_run_typed_tier<std::uint64_t, N_SLOTS_XXLARGE>(gpu_id, my_slice, device_emit, agg_prog_host);
+      }
+    case KeyKind::UINT128:
+      switch (ts) {
+        case TableSize::SMALL:  return join_run_typed_tier<unsigned __int128, N_SLOTS_SMALL >(gpu_id, my_slice, device_emit, agg_prog_host);
+        case TableSize::MEDIUM: return join_run_typed_tier<unsigned __int128, N_SLOTS_MEDIUM>(gpu_id, my_slice, device_emit, agg_prog_host);
+        case TableSize::LARGE:  return join_run_typed_tier<unsigned __int128, N_SLOTS_LARGE >(gpu_id, my_slice, device_emit, agg_prog_host);
+        case TableSize::XLARGE: return join_run_typed_tier<unsigned __int128, N_SLOTS_XLARGE >(gpu_id, my_slice, device_emit, agg_prog_host);
+        default:                return join_run_typed_tier<unsigned __int128, N_SLOTS_XXLARGE>(gpu_id, my_slice, device_emit, agg_prog_host);
       }
     default:
-      throw std::runtime_error("magi_join: unsupported key kind for v1 (int32/uint64 only)");
+      throw std::runtime_error("magi_join: unsupported key kind");
   }
 }
 
