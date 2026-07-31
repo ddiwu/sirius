@@ -200,6 +200,7 @@ GPUBufferManager::GPUBufferManager(size_t cache_size_per_gpu,
   gpuProcessingPointer = new size_t[NUM_GPUS];
   gpuCachingPointer    = new size_t[NUM_GPUS];
   cpuCachingPointer    = new size_t[NUM_GPUS];
+  gpuCachingFloor      = new size_t[NUM_GPUS];
   cpuProcessingPointer = 0;
   available_gpu_cache_size.resize(NUM_GPUS);
   tables_per_gpu.resize(NUM_GPUS);
@@ -255,6 +256,7 @@ GPUBufferManager::GPUBufferManager(size_t cache_size_per_gpu,
     gpuProcessing[gpu]        = nullptr;
     gpuCachingPointer[gpu]    = 0;
     cpuCachingPointer[gpu]    = 0;
+    gpuCachingFloor[gpu]      = 0;
   }
 
   warmup_gpu();
@@ -311,6 +313,7 @@ void GPUBufferManager::ResetBuffer()
   // Called single-threaded between queries, but take the lock defensively so
   // the table/buffer mutations here can never overlap a stray free.
   std::lock_guard<std::mutex> lk(alloc_mutex);
+  cache_touched_this_query = false;
   for (int gpu = 0; gpu < NUM_GPUS; gpu++) {
     SIRIUS_LOG_DEBUG("Resetting buffer for GPU {}", gpu);
     cudaSetDevice(gpu);
@@ -365,11 +368,28 @@ void GPUBufferManager::ResetBuffer()
   }
 }
 
+void GPUBufferManager::SealCacheFloor()
+{
+  // Arena carve-outs during init go through the caching allocator; they are
+  // below the floor and survive every reset, so they don't count as
+  // "this query touched the cache".
+  cache_touched_this_query = false;
+  for (int gpu = 0; gpu < NUM_GPUS; gpu++) {
+    gpuCachingFloor[gpu] = gpuCachingPointer[gpu];
+    SIRIUS_LOG_DEBUG("Cache floor sealed at {} bytes on GPU {}",
+                     gpuCachingFloor[gpu], gpu);
+  }
+}
+
 void GPUBufferManager::ResetCache()
 {
   SIRIUS_LOG_DEBUG("Resetting cache");
   for (int gpu = 0; gpu < NUM_GPUS; gpu++) {
-    gpuCachingPointer[gpu] = 0;
+    // Rewind to the floor, NOT to 0: everything below the floor (magi's
+    // persistent arenas, sealed at gpu_buffer_init) must survive a cache
+    // reset — handing those addresses back to table caching lets magi's
+    // per-query arena writes corrupt cached columns.
+    gpuCachingPointer[gpu] = gpuCachingFloor[gpu];
     cpuCachingPointer[gpu] = 0;
   }
   for (auto& tables : tables_per_gpu) {
@@ -404,18 +424,39 @@ T* GPUBufferManager::customCudaMalloc(size_t size, int gpu, bool caching)
   if (caching) {
     // Caching path keeps the explicit `gpu` argument (used by the scan to
     // write per-GPU partitions of cached tables).
+    static const bool kCacheAllocLog = std::getenv("MAGI_CACHE_ALLOC") != nullptr;
+    cache_touched_this_query = true;
     size_t start = __atomic_fetch_add(&gpuCachingPointer[gpu], alloc, __ATOMIC_RELAXED);
     T* ptr       = nullptr;
     if (start + alloc <= available_gpu_cache_size[gpu]) {
       ptr = reinterpret_cast<T*>(gpuCache[gpu] + start);
+      if (kCacheAllocLog && alloc >= (1u << 20)) {
+        std::fprintf(stderr, "[cache-alloc gpu=%d] start=%zu size=%zu ptr=%p GPU\n",
+                     gpu, start, alloc, (void*)ptr);
+      }
     } else {
       __atomic_fetch_sub(&gpuCachingPointer[gpu], alloc, __ATOMIC_RELAXED);
+      if (kCacheAllocLog) {
+        // The fetch_sub rollback above is UNSOUND if another thread's
+        // fetch_add interleaved between our add and sub: the pointer no
+        // longer equals "end of last successful allocation", and later
+        // GPU-region allocations OVERLAP earlier ones. Log every rollback —
+        // any occurrence while other caching allocs are in flight is the
+        // aliasing smoking gun.
+        std::fprintf(stderr,
+                     "[cache-alloc gpu=%d] size=%zu ROLLBACK@start=%zu avail=%zu -> host\n",
+                     gpu, alloc, start, available_gpu_cache_size[gpu]);
+      }
       start = __atomic_fetch_add(&cpuCachingPointer[gpu], alloc, __ATOMIC_RELAXED);
       if (start + alloc > cache_size_per_gpu - available_gpu_cache_size[gpu]) {
         __atomic_fetch_sub(&cpuCachingPointer[gpu], alloc, __ATOMIC_RELAXED);
         throw InvalidInputException("Out of caching memory");
       }
       ptr = reinterpret_cast<T*>(cpuCache[gpu] + start);
+      if (kCacheAllocLog && alloc >= (1u << 20)) {
+        std::fprintf(stderr, "[cache-alloc gpu=%d] start=%zu size=%zu ptr=%p HOST\n",
+                     gpu, start, alloc, (void*)ptr);
+      }
     }
     if (reinterpret_cast<uintptr_t>(ptr) % alignof(double) != 0) {
       throw InvalidInputException("Memory is not properly aligned");

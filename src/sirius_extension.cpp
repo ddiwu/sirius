@@ -638,6 +638,12 @@ void SiriusExtension::GPUBufferInitFunction(ClientContext& context,
     // allocating these on the first magi query competed with cached tables
     // for the memory left OUTSIDE the pools (~0.3GB at SF100) and crashed.
     duckdb::magi_runtime::magi_prealloc_arenas();
+    // The arenas are permanent: seal the cache floor so a scan-triggered
+    // ResetCache (cache too full for a new table) rewinds the bump pointer
+    // to just above them instead of 0. Without this, re-cached columns land
+    // on the arena addresses and magi's per-query writes (result slots, ops
+    // tables) silently corrupt them — the SF100 warm-run wrong-results bug.
+    gpuBufferManager->SealCacheFloor();
     buffer_is_initialized = true;
   } else {
     SIRIUS_LOG_WARN("GPUBufferManager already initialized");

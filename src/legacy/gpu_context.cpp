@@ -19,6 +19,8 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cuda_runtime.h>
+#include "gpu_buffer_manager.hpp"
 
 #include "duckdb/execution/operator/helper/physical_result_collector.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -203,6 +205,48 @@ unique_ptr<QueryResult> GPUContext::GPUExecuteQuery(
     const auto qt1 = std::chrono::high_resolution_clock::now();
     std::fprintf(stderr, "[query-time] %.1fms\n",
                  std::chrono::duration<double, std::milli>(qt1 - qt0).count());
+  }
+  // MAGI_CACHE_CRC=1: after every query, checksum each cached column partition
+  // on every GPU. The SF100 rerun corruption is foreign bytes appearing inside
+  // cached source columns between run1 and run2 of the same query — this
+  // pinpoints which query dirtied which column (checksums change exactly when
+  // the cache is written).
+  if (std::getenv("MAGI_CACHE_CRC")) {
+    auto& gbm = GPUBufferManager::GetInstance();
+    const int ngpu = GPUBufferManager::GetMaxGpus();
+    for (int g = 0; g < ngpu; ++g) {
+      cudaSetDevice(g);
+      for (auto& [tname, rel] : gbm.tables_per_gpu[g]) {
+        if (!rel) continue;
+        for (size_t c = 0; c < rel->columns.size(); ++c) {
+          auto& col = rel->columns[c];
+          if (!col || !col->data_wrapper.data) continue;
+          const size_t bytes = col->data_wrapper.num_bytes;
+          if (bytes == 0) continue;
+          constexpr size_t CH = 64u << 20;
+          static std::vector<uint64_t> h;  // reused scratch
+          h.resize(CH / 8);
+          uint64_t acc = 0;
+          for (size_t off = 0; off < bytes; off += CH) {
+            const size_t take = std::min(CH, bytes - off);
+            cudaMemcpy(h.data(), col->data_wrapper.data + off, take,
+                       cudaMemcpyDeviceToHost);
+            const size_t w = take / 8;
+            for (size_t i = 0; i < w; ++i)
+              acc = acc * 1099511628211ULL + h[i];  // FNV-ish rolling
+            for (size_t i = w * 8; i < take; ++i)
+              acc = acc * 1099511628211ULL +
+                    reinterpret_cast<const uint8_t*>(h.data())[i];
+          }
+          std::fprintf(stderr,
+                       "[cache-crc gpu=%d] %s.%s bytes=%zu crc=%016llx\n", g,
+                       tname.c_str(),
+                       c < rel->column_names.size() ? rel->column_names[c].c_str()
+                                                    : "?",
+                       bytes, (unsigned long long)acc);
+        }
+      }
+    }
   }
   return current_result;
 }

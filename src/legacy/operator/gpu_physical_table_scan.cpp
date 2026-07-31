@@ -1116,14 +1116,35 @@ SourceResultType GPUPhysicalTableScan::GetDataDuckDBOpt(ExecutionContext& exec_c
                      column_ids.size());
 
     auto& catalog_table = Catalog::GetCatalog(exec_context.client, INVALID_CATALOG);
-    if (gpuBufferManager->gpuCachingPointer[0] + gpuBufferManager->cpuCachingPointer[0] +
-          total_size >=
+    // Per-GPU need, not whole-table: this path row-partitions the table across
+    // NUM_GPUS, so each GPU's slab takes ~total/NUM_GPUS (+1 chunk skew). The
+    // old whole-table check fired spuriously — lineitem@SF100 is ~45GB total
+    // but ~23GB/GPU, and the needless mid-query ResetCache it triggered
+    // orphaned the part pointers Q19's join Sink had already stashed.
+    const size_t n_cache_gpus =
+      std::max<size_t>(gpuBufferManager->tables_per_gpu.size(), 1);
+    const size_t per_gpu_size = total_size / n_cache_gpus + (STANDARD_VECTOR_SIZE * 64);
+    size_t max_ptr = 0;
+    for (size_t g = 0; g < n_cache_gpus; ++g) {
+      max_ptr = std::max(max_ptr, gpuBufferManager->gpuCachingPointer[g]);
+    }
+    if (max_ptr + gpuBufferManager->cpuCachingPointer[0] + per_gpu_size >=
         gpuBufferManager->cache_size_per_gpu) {
-      if (total_size > gpuBufferManager->cache_size_per_gpu) {
+      if (per_gpu_size > gpuBufferManager->cache_size_per_gpu) {
         throw InvalidInputException(
           "Total size of columns (%lu) to be cached is greater than the cache size (%lu)",
-          total_size,
+          per_gpu_size,
           gpuBufferManager->cache_size_per_gpu);
+      }
+      // A reset is only safe when nothing of THIS query lives in the cache yet:
+      // operators that already executed (join Sink build stashes, CTE scans)
+      // hold raw pointers into the slab, and rewinding hands their memory to
+      // this scan — silent corruption, not an error anyone sees. Fall back.
+      if (gpuBufferManager->cache_touched_this_query) {
+        throw InvalidInputException(
+          "Cache overflow mid-query: table %s needs %lu bytes per GPU but earlier "
+          "operators of this query hold cached pointers (falls back to DuckDB)",
+          table_name, per_gpu_size);
       }
       gpuBufferManager->ResetCache();
       uncached_scan_column_ids.clear();
@@ -1732,6 +1753,22 @@ void GPUPhysicalTableScan::ScanDataDuckDBOpt(ExecutionContext& exec_context,
       cudaDeviceSynchronize();
     }
     cudaSetDevice(sirius_current_gpu);
+    if (std::getenv("MAGI_PHASE_TIME")) {
+      // Post-sync verification: read back the first mask word of every column
+      // just uploaded. Distinguishes "copy never landed" from "overwritten
+      // later" for the garbage-mask investigation.
+      for (int g = 0; g < NUM_G; ++g) {
+        cudaSetDevice(g);
+        for (int col = 0; col < (int)(column_ids.size() - gen_row_id_column); col++) {
+          if (already_cached[col] || d_mask_per_gpu[g][col] == nullptr) continue;
+          uint32_t w0 = 0;
+          cudaMemcpy(&w0, d_mask_per_gpu[g][col], 4, cudaMemcpyDeviceToHost);
+          std::fprintf(stderr, "[scan-mask-verify] col=%d gpu=%d dev_word0=0x%08x ptr=%p\n",
+                       col, g, w0, (void*)d_mask_per_gpu[g][col]);
+        }
+      }
+      cudaSetDevice(sirius_current_gpu);
+    }
 
     // (No GPU prefix sum needed — VARCHAR offsets were prefix-summed on host
     // before partitioning so that each GPU's slice could be computed in
@@ -1892,6 +1929,13 @@ SourceResultType GPUPhysicalTableScan::GetDataDuckDB(ExecutionContext& exec_cont
       if (total_size > gpuBufferManager->cache_size_per_gpu) {
         throw InvalidInputException(
           "Total size of columns to be cached is greater than the cache size");
+      }
+      // Same mid-query guard as the multi-GPU path: never rewind the cache
+      // while earlier operators of this query hold pointers into it.
+      if (gpuBufferManager->cache_touched_this_query) {
+        throw InvalidInputException(
+          "Cache overflow mid-query: earlier operators of this query hold "
+          "cached pointers (falls back to DuckDB)");
       }
       gpuBufferManager->ResetCache();
       for (int col = 0; col < num_columns; col++) {

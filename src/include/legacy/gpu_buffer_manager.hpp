@@ -124,10 +124,25 @@ class GPUBufferManager {
 
   void ResetBuffer();
   void ResetCache();
+  // Marks everything allocated in the cache region SO FAR as permanent:
+  // ResetCache() rewinds the bump pointer to this floor instead of 0.
+  // Called once from gpu_buffer_init after magi's persistent arenas are
+  // carved — without the floor, a scan-triggered ResetCache (cache too full
+  // for a new table) handed the arenas' addresses back to table caching, and
+  // magi's per-query arena writes (result slots, ops tables) then silently
+  // corrupted whichever cached columns landed on top (SF100 Q1-class bug).
+  void SealCacheFloor();
   uint8_t **gpuCache, **cpuCache;  // each gpu has one, `cpuCache` will be used if `gpuCache` is
                                    // full
   uint8_t **gpuProcessing, *cpuProcessing;
   size_t *gpuProcessingPointer, *gpuCachingPointer, *cpuCachingPointer;  // each gpu has one
+  size_t *gpuCachingFloor;  // ResetCache rewind level, one per gpu
+  // True once any table caching happened inside the CURRENT query
+  // (reset in ResetBuffer, set by the caching allocator). Guards against a
+  // mid-query ResetCache: operators that already ran (e.g. a join Sink)
+  // hold raw pointers into the cache slab, and a reset would silently hand
+  // their memory to the next scan (Q19@SF100: lineitem clobbered part).
+  bool cache_touched_this_query = false;
   size_t cpuProcessingPointer;
 
   size_t cache_size_per_gpu;
