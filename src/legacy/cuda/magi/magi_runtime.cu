@@ -279,7 +279,9 @@ void MagiInitOnce()
     size_t f = 0, t = 0; cudaMemGetInfo(&f, &t);
     std::printf("[magi] GPU %d channel cost: %.2f GB (free %.2f -> %.2f GB), "
                 "user_grid=%zu intra=%zuMiB inter=%zuMiB\n",
-                s.gpu_ids[i], (free_before[i] - f) / (1024.0 * 1024 * 1024),
+                s.gpu_ids[i],
+                (static_cast<double>(free_before[i]) - static_cast<double>(f)) /
+                    (1024.0 * 1024 * 1024),
                 free_before[i] / (1024.0 * 1024 * 1024), f / (1024.0 * 1024 * 1024),
                 USER_KERNEL_GRID_SIZE,
                 KBUFFERING_INTRA_PARTITION_SIZE >> 20,

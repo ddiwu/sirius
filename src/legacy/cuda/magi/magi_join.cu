@@ -451,12 +451,35 @@ void Run(int                                       gpu_id,
   // Build cardinality drives the tier (build keys, like groupby's PickTableSize).
   const uint64_t build_rows = build_keys.empty() ? 0 : build_keys[0]->column_length;
   const uint64_t est        = build_rows + build_rows / 3;
+  // The tier ladder tops out at XXLARGE. Falling through to it for a build side
+  // that cannot fit does NOT degrade gracefully: once H_build is full,
+  // global_find_or_insert linear-probes all N_SLOTS entries (an atomicCAS each,
+  // plus a publish spin-wait on the 16B-key path) before returning nullptr, so
+  // every remaining row scans 64M slots and the query hangs with no diagnostic.
+  // TPC-H SF100 Q9 hit exactly this: its third join has a 150M-row build side
+  // (orders), 75M keys per GPU against 64M slots — physically unable to fit even
+  // at 100% load. Refuse up front so the query takes the CPU fallback instead.
+  // Each GPU owns roughly build_rows / NUM_GPUS keys after the key-hash shuffle,
+  // but reject on the un-partitioned estimate too: skew makes the per-GPU share
+  // exceed the average, and a table above ~70% load already probes badly.
+  const uint64_t per_gpu_est =
+      est / static_cast<uint64_t>(std::max(GPUBufferManager::GetMaxGpus(), 1));
+  if (per_gpu_est > static_cast<uint64_t>(magi_generic::N_SLOTS_XXLARGE)) {
+    throw NotImplementedException(
+        "magi_join: build side too large for the shuffle join — %llu rows "
+        "(~%llu keys/GPU with 1.33x headroom) exceeds the %d-slot hash table; "
+        "falling back to DuckDB",
+        static_cast<unsigned long long>(build_rows),
+        static_cast<unsigned long long>(per_gpu_est),
+        magi_generic::N_SLOTS_XXXLARGE);
+  }
   magi_generic::TableSize ts =
       (est <= magi_generic::N_SLOTS_SMALL)  ? magi_generic::TableSize::SMALL
       : (est <= magi_generic::N_SLOTS_MEDIUM) ? magi_generic::TableSize::MEDIUM
       : (est <= magi_generic::N_SLOTS_LARGE)  ? magi_generic::TableSize::LARGE
       : (est <= magi_generic::N_SLOTS_XLARGE) ? magi_generic::TableSize::XLARGE
-                                              : magi_generic::TableSize::XXLARGE;
+      : (est <= magi_generic::N_SLOTS_XXLARGE) ? magi_generic::TableSize::XXLARGE
+                                               : magi_generic::TableSize::XXXLARGE;
 
   std::vector<JoinPayloadEntry> build_pl_tbl, probe_pl_tbl;
   auto build_in = BuildJoinInputs(build_keys, build_payload, build_pl_tbl);

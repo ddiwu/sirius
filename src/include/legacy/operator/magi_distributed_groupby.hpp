@@ -16,6 +16,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <vector>
 
 #include "operator/magi_groupby.hpp"
@@ -56,6 +57,7 @@ enum class TableSize : std::int8_t {
   LARGE   = 2,
   XLARGE  = 3,
   XXLARGE = 4,
+  XXXLARGE = 5,   // JOIN only (narrow JoinSlot); the groupby path stops at XXLARGE
 };
 
 // Tier slot counts. Single source of truth shared by the cardinality→tier
@@ -80,6 +82,31 @@ constexpr int N_SLOTS_XLARGE = 16 * 1024 * 1024;
 // NotImplemented beyond XXLARGE instead. 64B slots only (≤6 agg values) —
 // a 128B XXLARGE table would double the always-allocated arena again.
 constexpr int N_SLOTS_XXLARGE = 64 * 1024 * 1024;
+// XXXLARGE (128M = 2^27): only reachable by the JOIN path, whose table is the
+// narrow JoinSlot (key + a 4-byte payload index) rather than a 64B AggSlot64.
+// Sized so the ALWAYS-RESIDENT arena stays at the 4 GB it was before the slot
+// shrank (128M * 32B for the widest key); 256M slots would double it to 8 GB and
+// the SF100 pools cannot spare that — the arena allocation itself then stalls
+// long before any join runs. Doubling the slot count while keeping the arena
+// constant is exactly what the narrow slot bought.
+// Needed for build sides like TPC-H SF100 Q9's orders (150M rows -> ~100M keys
+// per GPU with headroom), which no AggSlot64 tier could hold.
+constexpr int N_SLOTS_XXXLARGE = 128 * 1024 * 1024;
+
+// The GROUPBY path may also use XXXLARGE (Q18@SF100 groups by l_orderkey:
+// ~75M partials/GPU, over the 64M XXLARGE ceiling), but its slots stay 64B,
+// so enabling it doubles the two always-resident agg arenas (4 GB -> 8 GB
+// each). That is affordable inside the SF100 protocol pools (52 GB cache)
+// but eats cache headroom at smaller inits — this switch is the escape
+// hatch: MAGI_GROUPBY_XXXL=0 restores the XXLARGE ceiling and the 4 GB
+// arenas without a rebuild.
+inline bool GroupbyXxxlEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("MAGI_GROUPBY_XXXL");
+    return !(e && e[0] == '0');
+  }();
+  return on;
+}
 
 // One worker thread's input: how many rows + the packed column views the
 // kernel will read. ColPack column ordering must match the KeyFieldEntry[]

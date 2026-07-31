@@ -98,24 +98,126 @@ static_assert(sizeof(JoinBuildWire) == 64, "JoinBuildWire must be 64B");
 // data_plane already uses (cf. magi::PartBySuppkey). The drains
 // (recv_direct_*_drain) and send_direct accept any callable ProcessFn/PartFn.
 
-// Receiver action (build): hash the incoming key into H_build (open-addressing)
-// and store the build payload into the claimed slot's values[] so the probe can
-// emit it. Unique build key → each slot is claimed once (first writer stores).
+// ── Narrow build slot: key + an index into a dense payload array ────────────
+// The build table used to be AggSlot64, i.e. the key plus room for JOIN_MAX_PAYLOAD
+// doubles — 64 bytes per slot, reserved in EVERY slot including the empty ones.
+// That capped the table at 64M slots for a 4 GB arena, which is why a 150M-row
+// build side (TPC-H SF100 Q9's orders) could not fit: 75M keys per GPU against
+// 64M slots cannot be held even at 100% load.
+//
+// The payload does not have to live in the slot. It arrives in the build wire
+// tuple, and the wire buffers are recycled by the channel, so the receiver must
+// copy it somewhere — but "somewhere" can be a DENSE array appended in arrival
+// order, sized by the number of rows received rather than by the number of
+// slots. The slot then only needs the key and a 4-byte index into that array.
+//
+//   uint64 key : 8 + 4 + 4  = 16 B  (4x more capacity per byte than AggSlot64)
+//   u128 key   : 16 + 4 + 4 = 24 B, padded to 32 B by the 16-byte alignment
+//
+// Everything stays on the owner GPU: the shuffle already moved the row here, so
+// the probe reads a local array, never a peer's memory.
+template <typename KeyT>
+struct alignas(sizeof(KeyT) > 8 ? 16 : 8) JoinSlot {
+  KeyT    key;
+  int32_t index;        // wide-key claim state: 0=empty, -1=claiming, 1=valid
+  int32_t payload_idx;  // -1 = no payload stored
+};
+
+// Claim/insert in the narrow table. Deliberately a copy of magi_ops::
+// global_find_or_insert's protocol rather than a call into it: that one is
+// typed on AggSlot64 and shared with the groupby path, whose slot layout is
+// constrained by the channel's cell size. The HASH below must stay
+// byte-identical to global_find (and to groupby_stages.cuh's), or build and
+// probe map the same key to different slots and every match is missed.
+template <typename KeyT, int N_SLOTS>
+__device__ __forceinline__ JoinSlot<KeyT>*
+join_find_or_insert(JoinSlot<KeyT>* __restrict__ H, KeyT key,
+                    unsigned int* __restrict__ overflow)
+{
+  if (overflow != nullptr && *overflow != 0u) return nullptr;  // table already full
+  unsigned int h;
+  if constexpr (sizeof(KeyT) > 8) {
+    const unsigned __int128 ku = static_cast<unsigned __int128>(key);
+    const std::uint64_t lo = static_cast<std::uint64_t>(ku);
+    const std::uint64_t hi = static_cast<std::uint64_t>(ku >> 64);
+    std::uint64_t z = lo * 0x9E3779B97F4A7C15ull ^ hi;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    z =  z ^ (z >> 31);
+    h = static_cast<unsigned int>(z);
+  } else {
+    const std::uint64_t k64 =
+        static_cast<std::uint64_t>(static_cast<std::make_unsigned_t<KeyT>>(key));
+    h = static_cast<unsigned int>(k64 ^ (k64 >> 32)) * 2654435761u;
+  }
+  const int start = static_cast<int>(h) & (N_SLOTS - 1);
+  // Bounded probe: scanning all N_SLOTS on a full table turns "does not fit"
+  // into a hang instead of an error (see the SF100 Q9 note above).
+  const int max_probe = N_SLOTS < 4096 ? N_SLOTS : 4096;
+  for (int probe = 0; probe < max_probe; ++probe) {
+    const int idx = (start + probe) & (N_SLOTS - 1);
+    if constexpr (sizeof(KeyT) > 8) {
+      const int prev = atomicCAS(&H[idx].index, 0, -1);   // claim empty?
+      if (prev == 0) {
+        H[idx].key = key;                                 // 16B plain store
+        __threadfence();
+        atomicExch(&H[idx].index, 1);                     // publish
+        return &H[idx];
+      }
+      for (unsigned ns = 8; atomicAdd(&H[idx].index, 0) != 1; ) {
+        __nanosleep(ns);                                  // backoff, else the
+        if (ns < 256) ns <<= 1;                           // claimer starves
+      }
+      __threadfence();
+      if (H[idx].key == key) return &H[idx];
+    } else if constexpr (sizeof(KeyT) == 4) {
+      const int existing = atomicCAS(reinterpret_cast<int*>(&H[idx].key),
+                                     static_cast<int>(magi_ops::empty_key_v<KeyT>),
+                                     static_cast<int>(key));
+      if (existing == static_cast<int>(magi_ops::empty_key_v<KeyT>) ||
+          existing == static_cast<int>(key)) return &H[idx];
+    } else {
+      const unsigned long long existing = atomicCAS(
+          reinterpret_cast<unsigned long long*>(&H[idx].key),
+          static_cast<unsigned long long>(magi_ops::empty_key_v<KeyT>),
+          static_cast<unsigned long long>(key));
+      if (existing == static_cast<unsigned long long>(magi_ops::empty_key_v<KeyT>) ||
+          existing == static_cast<unsigned long long>(key)) return &H[idx];
+    }
+  }
+  if (overflow != nullptr) atomicAdd(overflow, 1u);
+  return nullptr;
+}
+
+// Receiver action (build): hash the incoming key into H_build, append this row's
+// payload to the dense array, and record its index in the claimed slot.
+// Unique build key → each slot is claimed once (first writer stores).
 template <typename KeyT, int N_SLOTS>
 struct BuildInsert {
-  magi_ops::AggSlot64<KeyT>* H_build;
-  int                        n_build_pl;
-  unsigned int*              overflow;
+  JoinSlot<KeyT>* H_build;
+  double*         payload_arr;   // n_rows * n_build_pl doubles, dense
+  unsigned int*   payload_count;  // bump allocator over payload_arr
+  unsigned int    payload_cap;    // rows the array can hold
+  int             n_build_pl;
+  unsigned int*   overflow;
   __device__ __forceinline__ void operator()(JoinBuildWire& t) const {
     if (t.index == -1) return;
-    magi_ops::AggSlot64<KeyT>* slot =
-        magi_ops::global_find_or_insert<KeyT, N_SLOTS>(
-            H_build, static_cast<KeyT>(t.key), overflow);
+    JoinSlot<KeyT>* slot =
+        join_find_or_insert<KeyT, N_SLOTS>(H_build, static_cast<KeyT>(t.key), overflow);
     if (slot == nullptr) return;
+    if (n_build_pl <= 0 || payload_arr == nullptr) { slot->payload_idx = -1; return; }
+    const unsigned pos = atomicAdd(payload_count, 1u);
+    if (pos >= payload_cap) {                 // never expected: cap = total build rows
+      if (overflow != nullptr) atomicAdd(overflow, 1u);
+      slot->payload_idx = -1;
+      return;
+    }
+    double* dst = payload_arr + static_cast<std::size_t>(pos) * n_build_pl;
     for (int i = 0; i < n_build_pl && i < JOIN_MAX_PAYLOAD; ++i) {
       double d; __builtin_memcpy(&d, &t.payload[i], sizeof(double));
-      slot->values[i] = d;
+      dst[i] = d;
     }
+    slot->payload_idx = static_cast<int32_t>(pos);
   }
 };
 
@@ -163,8 +265,8 @@ struct WirePackSrc {
 // Find-only open-addressing probe of H_build (never claims a slot). Returns the
 // matching slot or nullptr. v1 supports <=8B keys (Q11's join key is int32).
 template <typename KeyT, int N_SLOTS>
-__device__ __forceinline__ magi_ops::AggSlot64<KeyT>*
-global_find(magi_ops::AggSlot64<KeyT>* __restrict__ H, KeyT key)
+__device__ __forceinline__ JoinSlot<KeyT>*
+global_find(JoinSlot<KeyT>* __restrict__ H, KeyT key)
 {
   // Hash MUST match magi_ops::global_find_or_insert (build side) or the probe
   // lands in a different slot and every match is missed. For 16B compound keys
@@ -191,11 +293,20 @@ global_find(magi_ops::AggSlot64<KeyT>* __restrict__ H, KeyT key)
     h = static_cast<unsigned int>(k64 ^ (k64 >> 32)) * 2654435761u;
   }
   const int start = static_cast<int>(h) & (N_SLOTS - 1);
-  for (int probe = 0; probe < N_SLOTS; ++probe) {
-    const int  idx      = (start + probe) & (N_SLOTS - 1);
-    const KeyT slot_key = H[idx].key;
-    if (slot_key == magi_ops::empty_key_v<KeyT>) return nullptr;  // empty → miss
-    if (slot_key == key)                          return &H[idx]; // hit
+  // Same bound as the insert side: a miss must not scan the whole table.
+  const int max_probe = N_SLOTS < 4096 ? N_SLOTS : 4096;
+  for (int probe = 0; probe < max_probe; ++probe) {
+    const int idx = (start + probe) & (N_SLOTS - 1);
+    if constexpr (sizeof(KeyT) > 8) {
+      // Wide keys are published via `index`; the key field of an unclaimed slot
+      // is whatever join_clear_slots wrote, so test the claim state, not the key.
+      if (H[idx].index == 0) return nullptr;                     // never claimed → miss
+      if (H[idx].key == key) return &H[idx];                     // hit
+    } else {
+      const KeyT slot_key = H[idx].key;
+      if (slot_key == magi_ops::empty_key_v<KeyT>) return nullptr;
+      if (slot_key == key)                          return &H[idx];
+    }
   }
   return nullptr;
 }
@@ -205,7 +316,8 @@ global_find(magi_ops::AggSlot64<KeyT>* __restrict__ H, KeyT key)
 // guards under-allocation (drops + bumps overflow once cap is reached).
 template <typename KeyT, int N_SLOTS>
 struct ProbeEmit {
-  magi_ops::AggSlot64<KeyT>*           H_build;
+  JoinSlot<KeyT>*                      H_build;
+  const double*                        build_payload;  // 密集数组,按 slot->payload_idx 索引
   duckdb::magi_generic::JoinResultRow* out;
   unsigned int*                        out_count;
   unsigned int                         out_cap;
@@ -237,7 +349,7 @@ struct ProbeEmit {
     // (~5.3s); warp aggregation cuts atomics 32× and coalesces the writes.
     const unsigned active = __activemask();
     bool                        do_emit = false;
-    magi_ops::AggSlot64<KeyT>*  slot    = nullptr;
+    JoinSlot<KeyT>*             slot    = nullptr;
     if (t.index != -1) {
       if (n_drained) atomicAdd(n_drained, 1u);
       if (cuco_ref != nullptr) {
@@ -286,10 +398,14 @@ struct ProbeEmit {
           for (int i = 0; i < JOIN_MAX_PAYLOAD; ++i)
             __builtin_memcpy(&probe_d[i], &t.payload[i], sizeof(double));
           for (int a = 0; a < agg_prog->n_aggs; ++a) {
+            const double* bvals =
+                (build_payload != nullptr && slot->payload_idx >= 0)
+                    ? build_payload + (std::size_t)slot->payload_idx * n_build_pl
+                    : nullptr;
             double v = (agg_prog->kind[a] == duckdb::magi_fused::AGG_COUNT)
                            ? 1.0
                            : duckdb::magi_fused::magi_vm_eval(*agg_prog, a,
-                                                              slot->values, probe_d);
+                                                              bvals, probe_d);
             atomicAdd(&agg_accum[a], v);
           }
         } else {
@@ -318,8 +434,11 @@ struct ProbeEmit {
     duckdb::magi_generic::JoinResultRow& r = out[pos];
     r.key_packed =
         static_cast<unsigned __int128>(static_cast<std::uint64_t>(t.key));
+    const double* bvals = (build_payload != nullptr && slot->payload_idx >= 0)
+                              ? build_payload + (std::size_t)slot->payload_idx * n_build_pl
+                              : nullptr;
     for (int i = 0; i < duckdb::magi_generic::JoinResultRow::N_VALUES; ++i)
-      r.build_values[i] = (i < n_build_pl) ? slot->values[i] : 0.0;
+      r.build_values[i] = (bvals != nullptr && i < n_build_pl) ? bvals[i] : 0.0;
     for (int i = 0; i < duckdb::magi_generic::JoinResultRow::N_VALUES; ++i) {
       if (i < JOIN_MAX_PAYLOAD) {
         double d; __builtin_memcpy(&d, &t.payload[i], sizeof(double));
@@ -438,7 +557,10 @@ template <typename KeyT, int N_SLOTS, size_t K_INTRA, size_t K_INTER>
 __global__ __launch_bounds__(1024, 1) void
 join_build_kernel(const duckdb::magi_join::JoinBuildWire* __restrict__ tuples,
                   std::uint64_t                            n,
-                  magi_ops::AggSlot64<KeyT>* __restrict__  H_build,
+                  duckdb::magi_join::JoinSlot<KeyT>* __restrict__ H_build,
+                  double* __restrict__                     build_payload,
+                  unsigned int* __restrict__               payload_count,
+                  unsigned int                             payload_cap,
                   int                                      n_build_pl,
                   bool                                     just_load,
                   unsigned int* __restrict__               overflow,
@@ -465,7 +587,8 @@ join_build_kernel(const duckdb::magi_join::JoinBuildWire* __restrict__ tuples,
 
   bool recv_eof = false;
 
-  duckdb::magi_join::BuildInsert<KeyT, N_SLOTS>      insert{H_build, n_build_pl, overflow};
+  duckdb::magi_join::BuildInsert<KeyT, N_SLOTS>      insert{
+      H_build, build_payload, payload_count, payload_cap, n_build_pl, overflow};
   duckdb::magi_join::JoinKeyPartition<Wire>          part;
 
   std::uint64_t offset  = 0;
@@ -579,12 +702,14 @@ join_pack_probe_kernel(const std::uint64_t* __restrict__       row_ids,
 // (cg_size=1). Only instantiated/launched for the uint64 key path.
 template <typename KeyT, int N_SLOTS>
 __global__ void cuco_insert_from_hbuild(duckdb::magi_join::CucoInsertRef ins,
-                                        const magi_ops::AggSlot64<KeyT>* __restrict__ H)
+                                        const duckdb::magi_join::JoinSlot<KeyT>* __restrict__ H)
 {
   const std::uint64_t i = blockIdx.x * (std::uint64_t)blockDim.x + threadIdx.x;
   if (i >= (std::uint64_t)N_SLOTS) return;
+  // Occupancy test matches global_find: wide keys publish via `index`.
+  if constexpr (sizeof(KeyT) > 8) { if (H[i].index == 0) return; }
   const KeyT k = H[i].key;
-  if (k == magi_ops::empty_key_v<KeyT>) return;
+  if constexpr (sizeof(KeyT) <= 8) { if (k == magi_ops::empty_key_v<KeyT>) return; }
   std::uint64_t ck;
   if constexpr (sizeof(KeyT) > 8) {  // pack 16B compound key -> uint64 (see ProbeEmit)
     const unsigned __int128 ku = static_cast<unsigned __int128>(k);
@@ -594,6 +719,19 @@ __global__ void cuco_insert_from_hbuild(duckdb::magi_join::CucoInsertRef ins,
     ck = static_cast<std::uint64_t>(k);
   }
   ins.insert(cuco::pair<std::uint64_t, std::int32_t>{ck, static_cast<std::int32_t>(i)});
+}
+
+// Clear the narrow join table: index=0 marks "never claimed" for wide keys, and
+// the key sentinel does the same for narrow ones. payload_idx = -1 = no payload.
+template <typename KeyT>
+__global__ void join_clear_slots(duckdb::magi_join::JoinSlot<KeyT>* H, int n_slots)
+{
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n_slots) {
+    H[i].key         = magi_ops::empty_key_v<KeyT>;
+    H[i].index       = 0;
+    H[i].payload_idx = -1;
+  }
 }
 
 // NOTE: a device-side stats kernel over the fused group table used to live here.
@@ -657,7 +795,8 @@ template <typename KeyT, int N_SLOTS, size_t K_INTRA, size_t K_INTER>
 __global__ __launch_bounds__(1024, 1) void
 join_probe_kernel(const duckdb::magi_join::JoinProbeWire* __restrict__ tuples,
                   std::uint64_t                            n,
-                  magi_ops::AggSlot64<KeyT>* __restrict__  H_build,
+                  duckdb::magi_join::JoinSlot<KeyT>* __restrict__ H_build,
+                  const double* __restrict__               build_payload,
                   duckdb::magi_generic::JoinResultRow* __restrict__ out,
                   unsigned int* __restrict__               out_count,
                   unsigned int                             out_cap,
@@ -696,7 +835,8 @@ join_probe_kernel(const duckdb::magi_join::JoinProbeWire* __restrict__ tuples,
   __shared__ int          s_taken;   // source rows the packed chunk consumed
 
   bool recv_eof = false;
-  duckdb::magi_join::ProbeEmit<KeyT, N_SLOTS> emit{H_build,  out,       out_count,
+  duckdb::magi_join::ProbeEmit<KeyT, N_SLOTS> emit{H_build, build_payload,
+                                                   out,      out_count,
                                                    out_cap,  n_build_pl, overflow,
                                                    n_drained, agg_accum, agg_prog, cuco_ref,
                                                    group_tbl, group_overflow,
