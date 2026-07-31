@@ -263,9 +263,14 @@ static BcastStrategy PickBcastStrategy(uint64_t probe_total,
     const char* e = std::getenv("MAGI_BCAST_PROBE_MAX");
     return e ? std::strtoull(e, nullptr, 10) : uint64_t(20'000'000);
   }();
+  // build 16M -> 24M: Q19@SF100 builds the UNFILTERED part table (20M rows;
+  // its OR-of-three-clauses predicate can't sink below the join), and the v1
+  // shuffle it would otherwise take throws outright — Q19's carried columns
+  // exceed the 6-payload-slot wire budget. Replicating 20M build rows is
+  // ~1 GB/GPU, well within what the join arena already absorbs.
   static const uint64_t build_max = [] {
     const char* e = std::getenv("MAGI_BCAST_BUILD_MAX");
-    return e ? std::strtoull(e, nullptr, 10) : uint64_t(16'000'000);
+    return e ? std::strtoull(e, nullptr, 10) : uint64_t(24'000'000);
   }();
   const bool probe_fits = probe_total > 0 && probe_total <= probe_max && build_total > 0;
   const bool build_fits = build_total > 0 && build_total <= build_max && probe_total > 0;
@@ -1009,9 +1014,13 @@ OperatorResultType GPUPhysicalHashJoin::Execute(GPUIntermediateRelation& input_r
       // output (payload) columns may still be late-materialized refs, so
       // densify them here — they must be gathered anyway if we broadcast.
       bool eligible = true;
-      for (auto& bk : rstate.materialized_build_key->columns) {
-        if (!MaskAllValid(bk)) {
+      for (idx_t k = 0; k < rstate.materialized_build_key->columns.size(); k++) {
+        if (!MaskAllValid(rstate.materialized_build_key->columns[k])) {
           eligible = false;
+          if (bcast_phase_time) {
+            std::fprintf(stderr, "[bcast-inelig gpu=%d] build KEY %llu has null mask\n",
+                         sirius_current_gpu, (unsigned long long)k);
+          }
         }
       }
       bcast_build_dense.reserve(rstate.hash_table_result->columns.size() - conditions.size());
@@ -1020,6 +1029,12 @@ OperatorResultType GPUPhysicalHashJoin::Execute(GPUIntermediateRelation& input_r
                                                  gpuBufferManager);
         if (!MaskAllValid(dense)) {
           eligible = false;
+          if (bcast_phase_time) {
+            std::fprintf(stderr,
+                         "[bcast-inelig gpu=%d] build payload %llu type=%d has null mask\n",
+                         sirius_current_gpu, (unsigned long long)(i - conditions.size()),
+                         (int)dense->data_wrapper.type.id());
+          }
         }
         bcast_build_dense.push_back(std::move(dense));
       }
