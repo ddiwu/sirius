@@ -171,8 +171,14 @@ magi_generic::TableSize PickTableSize(const vector<shared_ptr<GPUColumn>>& keys,
   if (est <= magi_generic::N_SLOTS_MEDIUM) return magi_generic::TableSize::MEDIUM;
   if (est <= magi_generic::N_SLOTS_LARGE)  return magi_generic::TableSize::LARGE;
   if (est <= magi_generic::N_SLOTS_XLARGE) return magi_generic::TableSize::XLARGE;
-  // Beyond XXLARGE Run()'s cross-GPU-consistent guard throws (fallback).
-  return magi_generic::TableSize::XXLARGE;
+  if (est <= magi_generic::N_SLOTS_XXLARGE || !magi_generic::GroupbyXxxlEnabled()) {
+    // Beyond the arena's largest tier Run()'s cross-GPU-consistent guard
+    // throws (fallback) — returning XXLARGE for an over-XXLARGE estimate is
+    // deliberate: the guard compares real exchanged counts, not this local
+    // estimate, so borderline queries still get their chance.
+    return magi_generic::TableSize::XXLARGE;
+  }
+  return magi_generic::TableSize::XXXLARGE;
 }
 
 magi_generic::PerGpuInputs BuildGenericInputs(
@@ -1525,6 +1531,115 @@ void Run(int                                gpu_id,
 
   auto in   = BuildGenericInputs(group_by_keys, aggregate_keys,
                                   num_group_keys, num_aggregates, agg_mode);
+  // MAGI_INPUT_DUMP=1: sample every aggregate input column AT MAGI ENTRY
+  // (front/middle/back windows -> mean/min/max). The SF100 rerun corruption
+  // signature (avg 4.9e6 where l_quantity should read 25.5) points at the
+  // input columns being wrong before any shuffle happens; this pins down
+  // whether the damage exists here or is introduced later.
+  if (getenv("MAGI_INPUT_DUMP")) {
+    auto dump_win = [&](const char* tag, int a, const void* base, size_t n,
+                        bool is_i64) {
+      if (!base || n == 0) {
+        fprintf(stderr, "[magi-in gpu=%d] agg%d %s ptr=null n=%zu\n",
+                gpu_id, a, tag, n);
+        return;
+      }
+      constexpr size_t W = 1024;
+      const size_t off[3] = {0, n > W ? n / 2 : 0, n > W ? n - W : 0};
+      double mn = 1e300, mx = -1e300, sum = 0.0;
+      size_t cnt = 0;
+      std::vector<double> h(W);
+      for (int w = 0; w < 3; ++w) {
+        const size_t take = std::min(W, n - off[w]);
+        cudaMemcpy(h.data(),
+                   reinterpret_cast<const char*>(base) + off[w] * 8,
+                   take * 8, cudaMemcpyDeviceToHost);
+        for (size_t i = 0; i < take; ++i) {
+          const double v = is_i64
+              ? static_cast<double>(reinterpret_cast<const int64_t*>(h.data())[i])
+              : h[i];
+          mn = std::min(mn, v); mx = std::max(mx, v); sum += v; ++cnt;
+        }
+      }
+      fprintf(stderr,
+              "[magi-in gpu=%d] agg%d %s ptr=%p n=%zu mean=%.6g min=%.6g max=%.6g\n",
+              gpu_id, a, tag, base, n, sum / cnt, mn, mx);
+    };
+    fprintf(stderr, "[magi-in gpu=%d] n_filtered=%zu key0_len=%zu key0_rowids=%zu\n",
+            gpu_id, (size_t)in.n_filtered,
+            (size_t)group_by_keys[0]->column_length,
+            (size_t)group_by_keys[0]->row_id_count);
+    for (int a = 0; a < num_aggregates; ++a) {
+      if (!aggregate_keys[a]) continue;
+      const auto id = aggregate_keys[a]->data_wrapper.type.id();
+      const bool i64 = (id == GPUColumnTypeId::INT64 ||
+                        id == GPUColumnTypeId::DECIMAL);
+      dump_win(i64 ? "i64" : "f64", a, aggregate_keys[a]->data_wrapper.data,
+               aggregate_keys[a]->column_length, i64);
+      if (aggregate_keys[a]->row_id_count)
+        fprintf(stderr, "[magi-in gpu=%d] agg%d HAS row_ids=%zu\n", gpu_id, a,
+                (size_t)aggregate_keys[a]->row_id_count);
+    }
+  }
+  // MAGI_INPUT_SCAN=1: full sweep of the first i64 aggregate input for values
+  // no TPC-H cents column can hold (negative or > 1e10). The warm-run garbage
+  // rows land somewhere in these 296M-row buffers; this finds their indices
+  // and prints every column (and the group-key bytes) at those rows.
+  if (getenv("MAGI_INPUT_SCAN")) {
+    const size_t N = in.n_filtered;
+    std::vector<size_t> bad;
+    const int64_t* q = nullptr;
+    for (int a = 0; a < num_aggregates && !q; ++a) {
+      if (!aggregate_keys[a] || !aggregate_keys[a]->data_wrapper.data) continue;
+      const auto id = aggregate_keys[a]->data_wrapper.type.id();
+      if (id == GPUColumnTypeId::INT64 || id == GPUColumnTypeId::DECIMAL)
+        q = reinterpret_cast<const int64_t*>(aggregate_keys[a]->data_wrapper.data);
+    }
+    if (q && N) {
+      constexpr size_t CH = 8u << 20;
+      std::vector<int64_t> h(CH);
+      for (size_t off = 0; off < N && bad.size() < 64; off += CH) {
+        const size_t take = std::min(CH, N - off);
+        cudaMemcpy(h.data(), q + off, take * 8, cudaMemcpyDeviceToHost);
+        for (size_t i = 0; i < take && bad.size() < 64; ++i)
+          if (h[i] < 0 || h[i] > 10000000000LL) bad.push_back(off + i);
+      }
+    }
+    fprintf(stderr, "[magi-scan gpu=%d] N=%zu bad_rows=%zu%s\n", gpu_id, N,
+            bad.size(), bad.size() >= 64 ? " (capped)" : "");
+    for (size_t bi = 0; bi < bad.size() && bi < 8; ++bi) {
+      const size_t i = bad[bi];
+      fprintf(stderr, "[magi-scan gpu=%d] row=%zu (N-row=%zu)", gpu_id, i, N - i);
+      for (int a = 0; a < num_aggregates; ++a) {
+        if (!aggregate_keys[a] || !aggregate_keys[a]->data_wrapper.data) continue;
+        int64_t v;
+        cudaMemcpy(&v,
+                   reinterpret_cast<const int64_t*>(
+                       aggregate_keys[a]->data_wrapper.data) + i,
+                   8, cudaMemcpyDeviceToHost);
+        fprintf(stderr, " a%d=%lld", a, (long long)v);
+      }
+      for (int k = 0; k < num_group_keys; ++k) {
+        if (group_by_keys[k]->data_wrapper.type.id() != GPUColumnTypeId::VARCHAR)
+          continue;
+        uint64_t o2[2] = {0, 0};
+        cudaMemcpy(o2,
+                   reinterpret_cast<const uint64_t*>(
+                       group_by_keys[k]->data_wrapper.offset) + i,
+                   16, cudaMemcpyDeviceToHost);
+        char c[8] = {0};
+        const uint64_t L = std::min<uint64_t>(o2[1] - o2[0], 7);
+        if (o2[1] > o2[0] && L <= 7)
+          cudaMemcpy(c,
+                     reinterpret_cast<const char*>(
+                         group_by_keys[k]->data_wrapper.data) + o2[0],
+                     L, cudaMemcpyDeviceToHost);
+        fprintf(stderr, " k%d='%s'(off=%llu len=%llu)", k, c,
+                (unsigned long long)o2[0], (unsigned long long)(o2[1] - o2[0]));
+      }
+      fprintf(stderr, "\n");
+    }
+  }
   int  avg_count_slot = -1;
   auto ops  = BuildAggOpsTable(aggregate_keys, num_aggregates, agg_mode,
                                avg_count_slot);
