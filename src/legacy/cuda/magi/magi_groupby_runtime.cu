@@ -202,10 +202,22 @@ namespace magi {
   shuffle_global_kernel<KEY_TYPE,                                                \
                         KBUFFERING_INTRA_PARTITION_SIZE,                         \
                         KBUFFERING_INTER_PARTITION_SIZE,                         \
-                        N_SLOTS, SB>(                                            \
+                        N_SLOTS, SB, false>(                                     \
       const magi_ops::AggSlot64<KEY_TYPE, SB>*,                                  \
       const magi_ops::AggOpEntry*, int,                                          \
       magi_ops::AggSlot64<KEY_TYPE, SB>*, bool, unsigned int*)
+
+// send_direct-batch benchmark variant (A/B vs SendDirectStream); 64B slots
+// only — send_direct is tuple-granular.
+#define MAGI_INSTANTIATE_SHUFFLE_DIRECT(KEY_TYPE, N_SLOTS)                       \
+  template __global__ void                                                       \
+  shuffle_global_kernel<KEY_TYPE,                                                \
+                        KBUFFERING_INTRA_PARTITION_SIZE,                         \
+                        KBUFFERING_INTER_PARTITION_SIZE,                         \
+                        N_SLOTS, 64, true>(                                      \
+      const magi_ops::AggSlot64<KEY_TYPE, 64>*,                                  \
+      const magi_ops::AggOpEntry*, int,                                          \
+      magi_ops::AggSlot64<KEY_TYPE, 64>*, bool, unsigned int*)
 
 #define MAGI_INSTANTIATE_BOTH(KEY_TYPE, N_SLOTS, SB)                            \
   MAGI_INSTANTIATE_PREAGG(KEY_TYPE, N_SLOTS, SB);                                \
@@ -252,6 +264,8 @@ MAGI_INSTANTIATE_BOTH(std::int32_t,  duckdb::magi_generic::N_SLOTS_XXLARGE, 64);
 MAGI_INSTANTIATE_BOTH(std::uint64_t, duckdb::magi_generic::N_SLOTS_XXLARGE, 64);
 MAGI_INSTANTIATE_BOTH(unsigned __int128, duckdb::magi_generic::N_SLOTS_XXLARGE, 64);
 MAGI_INSTANTIATE_BOTH(std::int32_t,  duckdb::magi_generic::N_SLOTS_XXXLARGE, 64);
+MAGI_INSTANTIATE_SHUFFLE_DIRECT(std::uint64_t, duckdb::magi_generic::N_SLOTS_XXLARGE);
+MAGI_INSTANTIATE_SHUFFLE_DIRECT(std::uint64_t, duckdb::magi_generic::N_SLOTS_XXXLARGE);
 MAGI_INSTANTIATE_BOTH(std::uint64_t, duckdb::magi_generic::N_SLOTS_XXXLARGE, 64);
 MAGI_INSTANTIATE_BOTH(unsigned __int128, duckdb::magi_generic::N_SLOTS_XXXLARGE, 64);
 MAGI_INST_ALLTIERS(std::int32_t,      128);
@@ -604,17 +618,42 @@ static std::size_t run_per_gpu_typed_tier(int                        gpu_id,
       }
     }
     //   B: scan H -> shuffle to owners -> merge into final
-    magi::shuffle_global_kernel<KeyT,
-                                KBUFFERING_INTRA_PARTITION_SIZE,
-                                KBUFFERING_INTER_PARTITION_SIZE,
-                                N_SLOTS, SB>
-        <<<session_grid, BLOCK_SIZE, 0,
-           magi_runtime::magi_stream(gpu_id)>>>(stage_typed,
-                                            g_ops_dev[gpu_id],
-                                            xc.n_ops[gpu_id],
-                                            global_agg_typed,
-                                            /*just_load=*/false,
-                                            g_overflow_dev[gpu_id]);
+    // MAGI_SEND_DIRECT_BATCH=1: benchmark variant driving the send through
+    // bounded send_direct batches (q5-style) instead of SendDirectStream —
+    // wired only for uint64/64B tiers that have the direct instantiation.
+    static const bool send_direct_batch =
+        std::getenv("MAGI_SEND_DIRECT_BATCH") != nullptr;
+    bool launched_direct = false;
+    if constexpr (SB == 64 && std::is_same_v<KeyT, std::uint64_t> &&
+                  (N_SLOTS == N_SLOTS_XXLARGE || N_SLOTS == N_SLOTS_XXXLARGE)) {
+      if (send_direct_batch) {
+        magi::shuffle_global_kernel<KeyT,
+                                    KBUFFERING_INTRA_PARTITION_SIZE,
+                                    KBUFFERING_INTER_PARTITION_SIZE,
+                                    N_SLOTS, SB, true>
+            <<<session_grid, BLOCK_SIZE, 0,
+               magi_runtime::magi_stream(gpu_id)>>>(stage_typed,
+                                                g_ops_dev[gpu_id],
+                                                xc.n_ops[gpu_id],
+                                                global_agg_typed,
+                                                /*just_load=*/false,
+                                                g_overflow_dev[gpu_id]);
+        launched_direct = true;
+      }
+    }
+    if (!launched_direct) {
+      magi::shuffle_global_kernel<KeyT,
+                                  KBUFFERING_INTRA_PARTITION_SIZE,
+                                  KBUFFERING_INTER_PARTITION_SIZE,
+                                  N_SLOTS, SB>
+          <<<session_grid, BLOCK_SIZE, 0,
+             magi_runtime::magi_stream(gpu_id)>>>(stage_typed,
+                                              g_ops_dev[gpu_id],
+                                              xc.n_ops[gpu_id],
+                                              global_agg_typed,
+                                              /*just_load=*/false,
+                                              g_overflow_dev[gpu_id]);
+    }
   }
   {
     cudaError_t e = cudaGetLastError();
