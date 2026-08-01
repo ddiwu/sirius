@@ -47,13 +47,17 @@ struct SlotPredicate {
 //   - num_aggregates ∈ {SUM(DOUBLE), COUNT_STAR, COUNT(DOUBLE)}
 // Any other shape throws NotImplementedException; future queries widen
 // the dispatch table inside Run().
+// input_preagged: the caller already collapsed this GPU's slice to one row
+// per key (cudf pre-agg) — magi may then skip its producer hash and stream
+// rows straight to their owner GPUs (shuffle_direct).
 void Run(int                                gpu_id,
          vector<shared_ptr<GPUColumn>>&     group_by_keys,
          vector<shared_ptr<GPUColumn>>&     aggregate_keys,
          int                                num_group_keys,
          int                                num_aggregates,
          sirius::AggregationType*           agg_mode,
-         const SlotPredicate&               having_pred = {});
+         const SlotPredicate&               having_pred = {},
+         bool                               input_preagged = false);
 
 // True iff this per-GPU slice is high-cardinality (would route magi to XLARGE).
 // The operator runs a cudf local groupby first for these, then calls Run() on the

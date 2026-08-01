@@ -100,10 +100,15 @@ constexpr int N_SLOTS_XXXLARGE = 128 * 1024 * 1024;
 // but eats cache headroom at smaller inits — this switch is the escape
 // hatch: MAGI_GROUPBY_XXXL=0 restores the XXLARGE ceiling and the 4 GB
 // arenas without a rebuild.
+// DEFAULT OFF since the narrow XXXLARGE receiver landed: pre-aggregated
+// ≤8B-key queries (the only shapes that reach XXXLARGE in practice) use
+// per-query pool memory instead, and the resident arenas stay at BASE
+// (4 GB). MAGI_GROUPBY_XXXL=1 re-grows them for the remaining fat-XXXLARGE
+// shapes (u128 keys / forced producer-hash path).
 inline bool GroupbyXxxlEnabled() {
   static const bool on = [] {
     const char* e = std::getenv("MAGI_GROUPBY_XXXL");
-    return !(e && e[0] == '0');
+    return e && e[0] == '1';
   }();
   return on;
 }
@@ -115,6 +120,9 @@ inline bool GroupbyXxxlEnabled() {
 struct PerGpuInputs {
   std::uint64_t      n_filtered;
   magi_ops::ColPack  cols;
+  // Input is already one row per key (cudf pre-agg ran): the runtime skips
+  // the producer hash and streams rows directly (shuffle_direct).
+  bool               preagged = false;
 };
 
 // One output row per surviving open-addressing slot on this GPU's receiver.

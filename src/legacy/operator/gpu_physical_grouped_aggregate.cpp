@@ -258,6 +258,7 @@ void HandleGroupByAggregateCuDF(vector<shared_ptr<GPUColumn>>& group_by_keys,
   // and COUNT_DISTINCT are excluded — they would need SUM+COUNT carriers; those
   // stay on the magi-direct path. The cudf decision is identical on every GPU
   // (same query + even slicing) so the begin barrier inside Run() stays balanced.
+  bool magi_input_preagged = false;
   if (magi_groupby::ShouldCudfPreAgg(sirius_current_gpu, group_by_keys, num_group_keys)) {
     bool reagg_ok = true;
     for (size_t i = 0; i < aggregates.size(); ++i)
@@ -285,6 +286,9 @@ void HandleGroupByAggregateCuDF(vector<shared_ptr<GPUColumn>>& group_by_keys,
         if (agg_mode[i] == AggregationType::COUNT_STAR ||
             agg_mode[i] == AggregationType::COUNT)
           agg_mode[i] = AggregationType::SUM;
+      // One row per key now: Run() may stream rows directly to their owner
+      // GPUs and skip the (redundant) producer hash.
+      magi_input_preagged = true;
     }
   }
 
@@ -299,7 +303,8 @@ void HandleGroupByAggregateCuDF(vector<shared_ptr<GPUColumn>>& group_by_keys,
                     num_group_keys,
                     static_cast<int>(aggregates.size()),
                     agg_mode,
-                    having_pred);
+                    having_pred,
+                    magi_input_preagged);
 }
 
 void HandleDistinctGroupByCuDF(vector<shared_ptr<GPUColumn>>& group_by_keys,

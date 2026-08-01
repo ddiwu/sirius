@@ -154,7 +154,8 @@ bool DeriveKeyShape(const vector<shared_ptr<GPUColumn>>& keys,
 // even cache slicing every GPU sees ~the same row count and so picks the same
 // tier (the cross-GPU wire format is tier-independent regardless).
 magi_generic::TableSize PickTableSize(const vector<shared_ptr<GPUColumn>>& keys,
-                                       int                                  n_keys)
+                                       int                                  n_keys,
+                                       bool                                 allow_xxxl = false)
 {
   bool has_bigint = false;
   for (int k = 0; k < n_keys; ++k) {
@@ -171,7 +172,8 @@ magi_generic::TableSize PickTableSize(const vector<shared_ptr<GPUColumn>>& keys,
   if (est <= magi_generic::N_SLOTS_MEDIUM) return magi_generic::TableSize::MEDIUM;
   if (est <= magi_generic::N_SLOTS_LARGE)  return magi_generic::TableSize::LARGE;
   if (est <= magi_generic::N_SLOTS_XLARGE) return magi_generic::TableSize::XLARGE;
-  if (est <= magi_generic::N_SLOTS_XXLARGE || !magi_generic::GroupbyXxxlEnabled()) {
+  if (est <= magi_generic::N_SLOTS_XXLARGE ||
+      !(allow_xxxl || magi_generic::GroupbyXxxlEnabled())) {
     // Beyond the arena's largest tier Run()'s cross-GPU-consistent guard
     // throws (fallback) — returning XXLARGE for an over-XXLARGE estimate is
     // deliberate: the guard compares real exchanged counts, not this local
@@ -1462,7 +1464,8 @@ void Run(int                                gpu_id,
          int                                num_group_keys,
          int                                num_aggregates,
          sirius::AggregationType*           agg_mode,
-         const SlotPredicate&               having_pred)
+         const SlotPredicate&               having_pred,
+         bool                               input_preagged)
 {
   // ── Widen narrow SUM/AVG inputs up front ────────────────────────────────
   // SUM over INT32 (e.g. Q12's `CASE WHEN .. THEN 1 ELSE 0`) has no device
@@ -1526,11 +1529,19 @@ void Run(int                                gpu_id,
         group_by_keys.empty() ? -1
         : static_cast<int>(group_by_keys[0]->data_wrapper.type.id()));
   }
+  // MAGI_NO_DIRECT_SEND=1: force the producer-hash path (A/B + fallback knob).
+  static const bool no_direct = std::getenv("MAGI_NO_DIRECT_SEND") != nullptr;
+  const bool effective_preagged = input_preagged && !no_direct;
+  // XXXLARGE without the fat-arena env: only the narrow receiver can host it,
+  // which needs a pre-aggregated input and a ≤8B key.
+  const bool allow_xxxl =
+      effective_preagged && key_kind != magi_generic::KeyKind::UINT128;
   const magi_generic::TableSize table_size =
-      PickTableSize(group_by_keys, num_group_keys);
+      PickTableSize(group_by_keys, num_group_keys, allow_xxxl);
 
   auto in   = BuildGenericInputs(group_by_keys, aggregate_keys,
                                   num_group_keys, num_aggregates, agg_mode);
+  in.preagged = effective_preagged;
   // MAGI_INPUT_DUMP=1: sample every aggregate input column AT MAGI ENTRY
   // (front/middle/back windows -> mean/min/max). The SF100 rerun corruption
   // signature (avg 4.9e6 where l_quantity should read 25.5) points at the
