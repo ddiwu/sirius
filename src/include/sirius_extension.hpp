@@ -48,6 +48,15 @@ class SiriusExtension : public Extension {
                                    TableFunctionInput& data_p,
                                    DataChunk& output);
 #ifdef SIRIUS_ENABLE_LEGACY
+  static void GPUWarmupFunction(ClientContext& context,
+                                TableFunctionInput& data_p,
+                                DataChunk& output);
+
+  static unique_ptr<FunctionData> GPUWarmupBind(ClientContext& context,
+                                                TableFunctionBindInput& input,
+                                                vector<LogicalType>& return_types,
+                                                vector<string>& names);
+
   static void GPUBufferInitFunction(ClientContext& context,
                                     TableFunctionInput& data_p,
                                     DataChunk& output);

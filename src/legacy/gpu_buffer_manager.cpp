@@ -394,6 +394,10 @@ void GPUBufferManager::ResetCache()
   }
   for (auto& tables : tables_per_gpu) {
     for (auto it = tables.begin(); it != tables.end(); it++) {
+      // gpu_warmup()-pinned tables live below the (re-sealed) floor: their
+      // memory survives the rewind above, so their registry entries must
+      // survive too — clearing them would orphan permanently reserved bytes.
+      if (pinned_tables.count(it->first)) { continue; }
       shared_ptr<GPUIntermediateRelation> table = it->second;
       for (int col = 0; col < table->columns.size(); col++) {
         table->columns[col] = nullptr;

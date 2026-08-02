@@ -377,6 +377,201 @@ void SiriusExtension::GPUProcessingFunction(ClientContext& context,
   return;
 }
 
+
+// ── gpu_warmup: load every base table's every column into the GPU cache ────
+//
+// CALL gpu_warmup()               — all base tables in schema main
+// CALL gpu_warmup('t1,t2')       — only the listed tables
+//
+// Loading reuses the ordinary gpu_processing scan path (SELECT <all cols>
+// FROM t LIMIT 1 — the scan caches whole columns regardless of LIMIT), so
+// partitioning/replication, VARCHAR layout and masks are identical to what
+// a query-triggered cache produces. After all tables load, they are PINNED:
+// the cache floor is re-sealed above them and ResetCache keeps their
+// registry entries, so every later query is a pure warm run. No capacity
+// pre-check by design — if a table does not fit, this call FAILS loudly
+// (cache-OOM throw from the allocator, or the spill/registry verification
+// below) instead of silently evicting or spilling to host.
+struct GPUWarmupData : public TableFunctionData {
+  unique_ptr<Connection> conn;
+  string                 table_filter;
+  bool                   finished = false;
+};
+
+unique_ptr<FunctionData> SiriusExtension::GPUWarmupBind(ClientContext& context,
+                                                        TableFunctionBindInput& input,
+                                                        vector<LogicalType>& return_types,
+                                                        vector<string>& names)
+{
+  auto result  = make_uniq<GPUWarmupData>();
+  result->conn = make_uniq<Connection>(*context.db);
+  if (!input.inputs.empty() && !input.inputs[0].IsNull()) {
+    result->table_filter = input.inputs[0].ToString();
+  }
+  names.emplace_back("table_name");
+  return_types.emplace_back(LogicalType::VARCHAR);
+  names.emplace_back("rows");
+  return_types.emplace_back(LogicalType::BIGINT);
+  names.emplace_back("status");
+  return_types.emplace_back(LogicalType::VARCHAR);
+  return std::move(result);
+}
+
+void SiriusExtension::GPUWarmupFunction(ClientContext& context,
+                                        TableFunctionInput& data_p,
+                                        DataChunk& output)
+{
+  auto& data = (GPUWarmupData&)*data_p.bind_data;
+  if (data.finished) { return; }
+  data.finished = true;
+  if (!buffer_is_initialized) {
+    throw InvalidInputException("gpu_warmup: call gpu_buffer_init first");
+  }
+  auto& conn = *data.conn;
+
+  // Enumerate target tables (schema main, base tables only).
+  vector<string> tables;
+  {
+    auto res = run_internal_cpu_fallback_query(
+      context, conn,
+      "SELECT table_name FROM duckdb_tables() "
+      "WHERE schema_name='main' AND NOT internal "
+      "ORDER BY estimated_size DESC");
+    if (res->HasError()) {
+      throw InvalidInputException("gpu_warmup: table enumeration failed: %s",
+                                  res->GetError().c_str());
+    }
+    for (auto& row : *res) {
+      auto t = row.GetValue<string>(0);
+      if (!data.table_filter.empty()) {
+        bool wanted = false;
+        for (auto& want : StringUtil::Split(data.table_filter, ',')) {
+          auto w = want;
+          StringUtil::Trim(w);
+          if (StringUtil::CIEquals(w, t)) { wanted = true; break; }
+        }
+        if (!wanted) { continue; }
+      }
+      tables.push_back(t);
+    }
+  }
+  if (tables.empty()) {
+    throw InvalidInputException("gpu_warmup: no matching base tables");
+  }
+
+  GPUBufferManager* gbm = &GPUBufferManager::GetInstance();
+  const int num_gpus    = static_cast<int>(gbm->tables_per_gpu.size());
+
+  vector<string>  out_names;
+  vector<int64_t> out_rows;
+  for (auto& t : tables) {
+    // Column list, in declaration order.
+    vector<string> cols;
+    auto cres = run_internal_cpu_fallback_query(
+      context, conn,
+      StringUtil::Format("SELECT column_name FROM duckdb_columns() WHERE "
+                         "schema_name='main' AND table_name=%s ORDER BY "
+                         "column_index", SQLString(t)));
+    if (cres->HasError()) {
+      throw InvalidInputException("gpu_warmup: column enumeration failed for %s", t.c_str());
+    }
+    for (auto& row : *cres) { cols.push_back(row.GetValue<string>(0)); }
+
+    string select_list;
+    for (auto& c : cols) {
+      if (!select_list.empty()) select_list += ", ";
+      select_list += StringUtil::Format("%s", SQLIdentifier(c));
+    }
+    // Drive the ordinary GPU scan (which caches full columns); LIMIT 1 keeps
+    // the result trivial. Escape single quotes for the nested literal.
+    string inner = StringUtil::Format("SELECT %s FROM %s LIMIT 1", select_list.c_str(),
+                                      SQLIdentifier(t));
+    string call  = StringUtil::Format("CALL gpu_processing(%s)", SQLString(inner));
+    // Run the nested CALL as an INTERNAL query: the outer CALL gpu_warmup
+    // already holds the SiriusContext query-lifecycle slot, and an unguarded
+    // nested query would block on acquire_query_lifecycle_slot forever
+    // (deadlock). The guard only bypasses the transparent-layer lifecycle —
+    // gpu_processing's own GPU execution is unaffected.
+    auto r = run_internal_cpu_fallback_query(context, conn, call);
+    if (r->HasError()) {
+      throw InvalidInputException("gpu_warmup: load failed for %s: %s", t.c_str(),
+                                  r->GetError().c_str());
+    }
+
+    // Verify the load really landed on the GPU: the gpu_processing wrapper
+    // swallows GPU errors into a CPU fallback, and the caching allocator
+    // spills to HOST cache when the GPU region is full — both must surface
+    // as a warmup FAILURE, not a silent lukewarm state.
+    auto up = StringUtil::Upper(t);
+    for (int g = 0; g < num_gpus; ++g) {
+      auto it = gbm->tables_per_gpu[g].find(up);
+      if (it == gbm->tables_per_gpu[g].end() || !it->second) {
+        throw InvalidInputException(
+          "gpu_warmup: %s not registered on GPU %d after load (query fell back "
+          "to CPU — likely cache OOM; increase gpu_buffer_init caching size)",
+          t.c_str(), g);
+      }
+      auto& rel = *it->second;
+      for (auto& c : cols) {
+        auto cu    = StringUtil::Upper(c);
+        auto cit   = std::find(rel.column_names.begin(), rel.column_names.end(), cu);
+        bool found = cit != rel.column_names.end();
+        idx_t ci   = found ? (idx_t)(cit - rel.column_names.begin()) : 0;
+        if (!found || !rel.columns[ci] || rel.columns[ci]->data_wrapper.data == nullptr) {
+          throw InvalidInputException(
+            "gpu_warmup: column %s.%s missing on GPU %d after load (likely "
+            "cache OOM; increase gpu_buffer_init caching size)",
+            t.c_str(), c.c_str(), g);
+        }
+      }
+      if (gbm->cpuCachingPointer[g] != 0) {
+        throw InvalidInputException(
+          "gpu_warmup: %s partially spilled to HOST cache on GPU %d (%llu "
+          "bytes) — does not fit on the GPU; increase gpu_buffer_init "
+          "caching size",
+          t.c_str(), g, (unsigned long long)gbm->cpuCachingPointer[g]);
+      }
+    }
+    int64_t nrows = 0;
+    {
+      auto rr = run_internal_cpu_fallback_query(
+        context, conn,
+        StringUtil::Format("SELECT count(*) FROM %s", SQLIdentifier(t)));
+      if (!rr->HasError()) {
+        for (auto& row : *rr) { nrows = row.GetValue<int64_t>(0); }
+      }
+    }
+    out_names.push_back(t);
+    out_rows.push_back(nrows);
+    gbm->pinned_tables.insert(up);
+    SIRIUS_LOG_INFO("gpu_warmup: pinned {} ({} rows)", t, nrows);
+  }
+
+  // Everything loaded — seal the floor above the warmed tables so ResetCache
+  // can never rewind over them (registry entries survive via pinned_tables).
+  gbm->SealCacheFloor();
+
+  // Warm the magi runtime too: its channel/session setup is lazy on the
+  // first cross-GPU query (~1.3s) — without this, the first real query of a
+  // warm deployment eats it (observed: Q1 1350ms vs 159ms steady-state).
+  // A tiny grouped aggregate over an already-pinned column triggers it.
+  {
+    auto r = run_internal_cpu_fallback_query(
+      context, conn,
+      "CALL gpu_processing('SELECT l_returnflag, count(*) FROM lineitem "
+      "GROUP BY l_returnflag')");
+    (void)r;  // best-effort: a fallback here only forfeits the pre-warm
+  }
+
+  idx_t n = MinValue<idx_t>(out_names.size(), STANDARD_VECTOR_SIZE);
+  output.SetCardinality(n);
+  for (idx_t i = 0; i < n; i++) {
+    output.SetValue(0, i, Value(out_names[i]));
+    output.SetValue(1, i, Value::BIGINT(out_rows[i]));
+    output.SetValue(2, i, Value("pinned"));
+  }
+}
+
 static void RegisterLegacyGPUFunctions(CatalogTransaction& transaction, Catalog& catalog)
 {
   TableFunction gpu_processing("gpu_processing",
@@ -386,6 +581,16 @@ static void RegisterLegacyGPUFunctions(CatalogTransaction& transaction, Catalog&
   gpu_processing.named_parameters["enable_optimizer"] = LogicalType::BOOLEAN;
   CreateTableFunctionInfo gpu_processing_info(gpu_processing);
   catalog.CreateTableFunction(transaction, gpu_processing_info);
+
+  TableFunctionSet gpu_warmup_set("gpu_warmup");
+  gpu_warmup_set.AddFunction(TableFunction({},
+                                           SiriusExtension::GPUWarmupFunction,
+                                           SiriusExtension::GPUWarmupBind));
+  gpu_warmup_set.AddFunction(TableFunction({LogicalType::VARCHAR},
+                                           SiriusExtension::GPUWarmupFunction,
+                                           SiriusExtension::GPUWarmupBind));
+  CreateTableFunctionInfo gpu_warmup_info(gpu_warmup_set);
+  catalog.CreateTableFunction(transaction, gpu_warmup_info);
   // Magi cross-GPU group-by is now wired in through GPUPhysicalGroupedAggregate
   // (legacy path); the standalone `magi_q1` table function entry has been
   // retired in favour of `gpu_processing('SELECT ... GROUP BY ...')`.

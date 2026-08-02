@@ -24,6 +24,7 @@
 #include "utils.hpp"
 
 #include <mutex>
+#include <set>
 
 #include <rmm/version_config.hpp>
 
@@ -143,6 +144,11 @@ class GPUBufferManager {
   // hold raw pointers into the cache slab, and a reset would silently hand
   // their memory to the next scan (Q19@SF100: lineitem clobbered part).
   bool cache_touched_this_query = false;
+  // Tables loaded by gpu_warmup(): ResetCache must neither rewind over their
+  // columns (the warmup re-seals the floor above them) nor clear their
+  // registry entries — they are the permanent working set of a warm-run
+  // deployment.
+  std::set<std::string> pinned_tables;
   size_t cpuProcessingPointer;
 
   size_t cache_size_per_gpu;
