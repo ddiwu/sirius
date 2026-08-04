@@ -183,7 +183,7 @@ __global__ void compact_live_slots_kernel(const magi_ops::AggSlot64<KeyT, SB>* _
 //
 // Outside namespace duckdb so the symbols match what the kernel template
 // expects in `namespace magi`. 6 instantiations: {int32_t, uint64_t} × {S,M,L}.
-namespace magi {
+namespace mgi {
 
 // Two-kernel global-memory hashagg: Kernel A (rows -> per-GPU global hash H)
 // and Kernel B (scan H -> shuffle -> per-GPU final). Replaces the single
@@ -200,8 +200,8 @@ namespace magi {
 #define MAGI_INSTANTIATE_SHUFFLE(KEY_TYPE, N_SLOTS, SB)                         \
   template __global__ void                                                       \
   shuffle_global_kernel<KEY_TYPE,                                                \
-                        KBUFFERING_INTRA_PARTITION_SIZE,                         \
-                        KBUFFERING_INTER_PARTITION_SIZE,                         \
+                        KBUFFER_INTRA_PARTITION_BYTES,                         \
+                        KBUFFER_INTER_PARTITION_BYTES,                         \
                         N_SLOTS, SB, false>(                                     \
       const magi_ops::AggSlot64<KEY_TYPE, SB>*,                                  \
       const magi_ops::AggOpEntry*, int,                                          \
@@ -210,8 +210,8 @@ namespace magi {
 #define MAGI_INSTANTIATE_DIRECT(KEY_TYPE, N_SLOTS, SB)                          \
   template __global__ void                                                       \
   shuffle_direct_kernel<KEY_TYPE,                                                \
-                        KBUFFERING_INTRA_PARTITION_SIZE,                         \
-                        KBUFFERING_INTER_PARTITION_SIZE,                         \
+                        KBUFFER_INTRA_PARTITION_BYTES,                         \
+                        KBUFFER_INTER_PARTITION_BYTES,                         \
                         N_SLOTS, SB>(                                            \
       const uint64_t*, uint64_t, magi_ops::ColPack,                              \
       const magi_ops::KeyFieldEntry*, int,                                       \
@@ -221,8 +221,8 @@ namespace magi {
 #define MAGI_INSTANTIATE_NARROW(KEY_TYPE)                                        \
   template __global__ void                                                       \
   shuffle_direct_narrow_kernel<KEY_TYPE,                                         \
-                        KBUFFERING_INTRA_PARTITION_SIZE,                         \
-                        KBUFFERING_INTER_PARTITION_SIZE,                         \
+                        KBUFFER_INTRA_PARTITION_BYTES,                         \
+                        KBUFFER_INTER_PARTITION_BYTES,                         \
                         duckdb::magi_generic::N_SLOTS_XXXLARGE, 64>(             \
       const uint64_t*, uint64_t, magi_ops::ColPack,                              \
       const magi_ops::KeyFieldEntry*, int,                                       \
@@ -234,8 +234,8 @@ namespace magi {
 #define MAGI_INSTANTIATE_SHUFFLE_DIRECT(KEY_TYPE, N_SLOTS)                       \
   template __global__ void                                                       \
   shuffle_global_kernel<KEY_TYPE,                                                \
-                        KBUFFERING_INTRA_PARTITION_SIZE,                         \
-                        KBUFFERING_INTER_PARTITION_SIZE,                         \
+                        KBUFFER_INTRA_PARTITION_BYTES,                         \
+                        KBUFFER_INTER_PARTITION_BYTES,                         \
                         N_SLOTS, 64, true>(                                      \
       const magi_ops::AggSlot64<KEY_TYPE, 64>*,                                  \
       const magi_ops::AggOpEntry*, int,                                          \
@@ -257,8 +257,8 @@ namespace magi {
   template __global__ void                                                       \
   distributed_hash_groupby_kernel<KEY_TYPE,                                      \
                                    duckdb::magi_generic::BLOCK_SIZE,             \
-                                   KBUFFERING_INTRA_PARTITION_SIZE,              \
-                                   KBUFFERING_INTER_PARTITION_SIZE,             \
+                                   KBUFFER_INTRA_PARTITION_BYTES,              \
+                                   KBUFFER_INTER_PARTITION_BYTES,             \
                                    duckdb::magi_generic::N_LOCAL_SLOTS,          \
                                    duckdb::magi_generic::N_SLOTS_SMALL, SB>(     \
       const std::uint64_t*, std::uint64_t,                                       \
@@ -304,7 +304,7 @@ MAGI_INST_ALLTIERS(unsigned __int128, 128);
 #undef MAGI_INSTANTIATE_SHUFFLE
 #undef MAGI_INSTANTIATE_BOTH
 
-}  // namespace magi
+}  // namespace mgi
 
 namespace duckdb { namespace magi_generic {
 
@@ -532,7 +532,7 @@ static std::size_t run_per_gpu_typed_tier(int                        gpu_id,
   // tuple_size = CELL_SIZE lets nbytes = tail_cells × CELL_SIZE come out right
   // for slots wider than one cell (128B). For 64B slots CELL_SIZE == sizeof,
   // so this is unchanged behaviour.
-  magi_runtime::magi_set_tuple_size(gpu_id, magi::CELL_SIZE);
+  magi_runtime::magi_set_tuple_size(gpu_id, mgi::CELL_SIZE);
   if (phase_time) {
     cudaStreamSynchronize(magi_runtime::magi_stream(gpu_id));
     cudaError_t e = cudaGetLastError();
@@ -592,10 +592,10 @@ static std::size_t run_per_gpu_typed_tier(int                        gpu_id,
       used_single = true;
       // Single kernel: producer shmem-combiner → shuffle → final, all at once.
       // Overflow still counted in producer_local_agg → no silent drop.
-      magi::distributed_hash_groupby_kernel<KeyT,
+      mgi::distributed_hash_groupby_kernel<KeyT,
                                             BLOCK_SIZE,
-                                            KBUFFERING_INTRA_PARTITION_SIZE,
-                                            KBUFFERING_INTER_PARTITION_SIZE,
+                                            KBUFFER_INTRA_PARTITION_BYTES,
+                                            KBUFFER_INTER_PARTITION_BYTES,
                                             N_LOCAL_SLOTS,
                                             N_SLOTS, SB>
           <<<USER_KERNEL_GRID_SIZE, BLOCK_SIZE, 0,
@@ -627,7 +627,7 @@ static std::size_t run_per_gpu_typed_tier(int                        gpu_id,
     {
       // DEFAULT OFF: shrinking the grid deadlocked the session (the recv
       // side evidently waits on ring state beyond the block-symmetric
-      // mapping assumed here — needs a real look at the KBuffering reset /
+      // mapping assumed here — needs a real look at the KBufferPool reset /
       // host-worker geometry before this can be enabled). Opt in with
       // MAGI_SMALL_SESSION_GRID=<blocks> for experiments.
       static const long sg_grid = [] {
@@ -653,7 +653,7 @@ static std::size_t run_per_gpu_typed_tier(int                        gpu_id,
     //   Skipped entirely under direct-send: pre-aggregated input has one row
     //   per key, so H would merge nothing — rows stream straight to owners.
     if (!direct_send)
-    magi::global_preagg_kernel<KeyT, N_SLOTS, SB>
+    mgi::global_preagg_kernel<KeyT, N_SLOTS, SB>
         <<<session_grid, BLOCK_SIZE, 0,
            magi_runtime::magi_stream(gpu_id)>>>(row_ids,
                                             in.n_filtered,
@@ -701,9 +701,9 @@ static std::size_t run_per_gpu_typed_tier(int                        gpu_id,
     bool launched_direct = false;
     if constexpr (narrow_eligible) {
     if (narrow_recv) {
-      magi::shuffle_direct_narrow_kernel<KeyT,
-                                         KBUFFERING_INTRA_PARTITION_SIZE,
-                                         KBUFFERING_INTER_PARTITION_SIZE,
+      mgi::shuffle_direct_narrow_kernel<KeyT,
+                                         KBUFFER_INTRA_PARTITION_BYTES,
+                                         KBUFFER_INTER_PARTITION_BYTES,
                                          N_SLOTS, SB>
           <<<session_grid, BLOCK_SIZE, 0,
              magi_runtime::magi_stream(gpu_id)>>>(row_ids,
@@ -720,9 +720,9 @@ static std::size_t run_per_gpu_typed_tier(int                        gpu_id,
     }
     }
     if (!launched_direct && direct_send) {
-      magi::shuffle_direct_kernel<KeyT,
-                                  KBUFFERING_INTRA_PARTITION_SIZE,
-                                  KBUFFERING_INTER_PARTITION_SIZE,
+      mgi::shuffle_direct_kernel<KeyT,
+                                  KBUFFER_INTRA_PARTITION_BYTES,
+                                  KBUFFER_INTER_PARTITION_BYTES,
                                   N_SLOTS, SB>
           <<<session_grid, BLOCK_SIZE, 0,
              magi_runtime::magi_stream(gpu_id)>>>(row_ids,
@@ -740,9 +740,9 @@ static std::size_t run_per_gpu_typed_tier(int                        gpu_id,
     if constexpr (SB == 64 && std::is_same_v<KeyT, std::uint64_t> &&
                   (N_SLOTS == N_SLOTS_XXLARGE || N_SLOTS == N_SLOTS_XXXLARGE)) {
       if (send_direct_batch && !launched_direct) {
-        magi::shuffle_global_kernel<KeyT,
-                                    KBUFFERING_INTRA_PARTITION_SIZE,
-                                    KBUFFERING_INTER_PARTITION_SIZE,
+        mgi::shuffle_global_kernel<KeyT,
+                                    KBUFFER_INTRA_PARTITION_BYTES,
+                                    KBUFFER_INTER_PARTITION_BYTES,
                                     N_SLOTS, SB, true>
             <<<session_grid, BLOCK_SIZE, 0,
                magi_runtime::magi_stream(gpu_id)>>>(stage_typed,
@@ -755,9 +755,9 @@ static std::size_t run_per_gpu_typed_tier(int                        gpu_id,
       }
     }
     if (!launched_direct) {
-      magi::shuffle_global_kernel<KeyT,
-                                  KBUFFERING_INTRA_PARTITION_SIZE,
-                                  KBUFFERING_INTER_PARTITION_SIZE,
+      mgi::shuffle_global_kernel<KeyT,
+                                  KBUFFER_INTRA_PARTITION_BYTES,
+                                  KBUFFER_INTER_PARTITION_BYTES,
                                   N_SLOTS, SB>
           <<<session_grid, BLOCK_SIZE, 0,
              magi_runtime::magi_stream(gpu_id)>>>(stage_typed,
@@ -781,7 +781,7 @@ static std::size_t run_per_gpu_typed_tier(int                        gpu_id,
       std::fprintf(stderr, "[magi-dbg gpu=%d] post-sync: %s\n", gpu_id,
                    cudaGetErrorString(e));
   }
-  if (std::getenv("MAGI_EOF_PROFILE")) {
+  if (std::getenv("MGI_EOF_PROFILE")) {
     // Per-block EOF-protocol leg durations recorded by receiver_merge_until_eof
     // (clock64 deltas within each block; see g_eof_prof layout).
     unsigned long long prof[64 * 8];

@@ -17,7 +17,7 @@
 //     (reuses the groupby shuffle_global_kernel pattern). The k-deep ring hides
 //     NVLink latency behind the probe lookup — tuple granularity, no host tiles.
 //
-// Reuses the generic magi infra: KBuffering ring, Endpoints/ChannelRuntime
+// Reuses the generic magi infra: KBufferPool ring, Endpoints/ChannelRuntime
 // (magi_runtime::MagiInitOnce / magi_stream / magi_bump_session), send_direct /
 // recv_direct, global_find_or_insert, and the GenericExchange per-GPU barrier.
 

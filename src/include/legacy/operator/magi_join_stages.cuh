@@ -95,7 +95,7 @@ static_assert(sizeof(JoinBuildWire) == 64, "JoinBuildWire must be 64B");
 
 // Receiver/partition actions are functor structs (not lambdas): the legacy
 // build does not enable nvcc --extended-lambda, and functors are the idiom the
-// data_plane already uses (cf. magi::PartBySuppkey). The drains
+// data_plane already uses (cf. mgi::PartBySuppkey). The drains
 // (recv_direct_*_drain) and send_direct accept any callable ProcessFn/PartFn.
 
 // ── Narrow build slot: key + an index into a dense payload array ────────────
@@ -450,10 +450,10 @@ struct ProbeEmit {
   }
 };
 
-}  // namespace magi_join
+}  // namespace mgi_join
 }  // namespace duckdb
 
-namespace magi {
+namespace mgi {
 
 // ── Pack ONE row into a wire tuple ─────────────────────────────────────────
 // Shared by the standalone pack kernels and by the fused pack-inside-send path
@@ -625,9 +625,9 @@ join_build_kernel(const duckdb::magi_join::JoinBuildWire* __restrict__ tuples,
         send_ptr = &tuples[offset + start_row];
       }
       const int status = (items > 0)
-                             ? magi::send_direct<Wire, K_INTRA, K_INTER>(send_ptr, items, part)
-                             : MAGI_STATUS_SUCCESS;
-      if (status == MAGI_STATUS_SUCCESS) {
+                             ? mgi::send_direct<Wire, K_INTRA, K_INTER>(send_ptr, items, part)
+                             : MGI_STATUS_SUCCESS;
+      if (status == MGI_STATUS_SUCCESS) {
         if (fused_pack) { offset += static_cast<std::uint64_t>(s_taken); pending = false; }
         else            { offset += items; }
       } else {
@@ -635,32 +635,32 @@ join_build_kernel(const duckdb::magi_join::JoinBuildWire* __restrict__ tuples,
       }
     }
     while (true) {
-      const int s = magi::recv_direct_self_drain<Wire>(insert);
-      if (s != MAGI_STATUS_SUCCESS) break;
+      const int s = mgi::recv_direct_self_drain<Wire>(insert);
+      if (s != MGI_STATUS_SUCCESS) break;
     }
     while (!recv_eof) {
-      const int s = magi::recv_direct_drain<Wire>(insert);
-      if (s == MAGI_STATUS_EOF) { recv_eof = true; break; }
-      else if (s != MAGI_STATUS_SUCCESS) break;
+      const int s = mgi::recv_direct_drain<Wire>(insert);
+      if (s == MGI_STATUS_EOF) { recv_eof = true; break; }
+      else if (s != MGI_STATUS_SUCCESS) break;
     }
   }
 
   // Flush + EOF + drain remainder (multisession_join build tail).
   bool flushed = false, eof_sent = false;
   while (true) {
-    if (!flushed && magi::flush_direct_nb()) flushed = true;
+    if (!flushed && mgi::flush_direct_nb()) flushed = true;
     __syncthreads();
     while (true) {
-      const int s = magi::recv_direct_self_drain<Wire>(insert);
-      if (s != MAGI_STATUS_SUCCESS) break;
+      const int s = mgi::recv_direct_self_drain<Wire>(insert);
+      if (s != MGI_STATUS_SUCCESS) break;
     }
     __syncthreads();
-    if (flushed && !eof_sent && magi::eof_send_direct_nb()) eof_sent = true;
+    if (flushed && !eof_sent && mgi::eof_send_direct_nb()) eof_sent = true;
     __syncthreads();
     while (!recv_eof) {
-      const int s = magi::recv_direct_drain<Wire>(insert);
-      if (s == MAGI_STATUS_EOF) { recv_eof = true; break; }
-      else if (s != MAGI_STATUS_SUCCESS) break;
+      const int s = mgi::recv_direct_drain<Wire>(insert);
+      if (s == MGI_STATUS_EOF) { recv_eof = true; break; }
+      else if (s != MGI_STATUS_SUCCESS) break;
     }
     __syncthreads();
     if (flushed && eof_sent && recv_eof) break;
@@ -880,9 +880,9 @@ join_probe_kernel(const duckdb::magi_join::JoinProbeWire* __restrict__ tuples,
       }
       // An all-filtered chunk sends nothing but still consumes its source rows.
       const int status = (items > 0)
-                             ? magi::send_direct<Wire, K_INTRA, K_INTER>(send_ptr, items, part)
-                             : MAGI_STATUS_SUCCESS;
-      if (status == MAGI_STATUS_SUCCESS) {
+                             ? mgi::send_direct<Wire, K_INTRA, K_INTER>(send_ptr, items, part)
+                             : MGI_STATUS_SUCCESS;
+      if (status == MGI_STATUS_SUCCESS) {
         if (fused_pack) { offset += static_cast<std::uint64_t>(s_taken); pending = false; }
         else            { offset += items; }
       } else {
@@ -890,35 +890,35 @@ join_probe_kernel(const duckdb::magi_join::JoinProbeWire* __restrict__ tuples,
       }
     }
     while (true) {
-      const int s = magi::recv_direct_self_drain<Wire>(emit);
-      if (s != MAGI_STATUS_SUCCESS) break;
+      const int s = mgi::recv_direct_self_drain<Wire>(emit);
+      if (s != MGI_STATUS_SUCCESS) break;
     }
     while (!recv_eof) {
-      const int s = magi::recv_direct_drain<Wire>(emit);
-      if (s == MAGI_STATUS_EOF) { recv_eof = true; break; }
-      else if (s != MAGI_STATUS_SUCCESS) break;
+      const int s = mgi::recv_direct_drain<Wire>(emit);
+      if (s == MGI_STATUS_EOF) { recv_eof = true; break; }
+      else if (s != MGI_STATUS_SUCCESS) break;
     }
   }
 
   bool flushed = false, eof_sent = false;
   while (true) {
-    if (!flushed && magi::flush_direct_nb()) flushed = true;
+    if (!flushed && mgi::flush_direct_nb()) flushed = true;
     __syncthreads();
     while (true) {
-      const int s = magi::recv_direct_self_drain<Wire>(emit);
-      if (s != MAGI_STATUS_SUCCESS) break;
+      const int s = mgi::recv_direct_self_drain<Wire>(emit);
+      if (s != MGI_STATUS_SUCCESS) break;
     }
     __syncthreads();
-    if (flushed && !eof_sent && magi::eof_send_direct_nb()) eof_sent = true;
+    if (flushed && !eof_sent && mgi::eof_send_direct_nb()) eof_sent = true;
     __syncthreads();
     while (!recv_eof) {
-      const int s = magi::recv_direct_drain<Wire>(emit);
-      if (s == MAGI_STATUS_EOF) { recv_eof = true; break; }
-      else if (s != MAGI_STATUS_SUCCESS) break;
+      const int s = mgi::recv_direct_drain<Wire>(emit);
+      if (s == MGI_STATUS_EOF) { recv_eof = true; break; }
+      else if (s != MGI_STATUS_SUCCESS) break;
     }
     __syncthreads();
     if (flushed && eof_sent && recv_eof) break;
   }
 }
 
-}  // namespace magi
+}  // namespace mgi

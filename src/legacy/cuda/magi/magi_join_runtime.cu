@@ -36,7 +36,7 @@
 #include "legacy/operator/magi_runtime_shared.hpp"
 
 // ── Explicit kernel instantiations (build + probe) ─────────────────────────
-namespace magi {
+namespace mgi {
 
 #define MAGI_JOIN_INST_PACK_BUILD(KEY_TYPE)                                     \
   template __global__ void join_pack_build_kernel<KEY_TYPE>(                    \
@@ -55,8 +55,8 @@ namespace magi {
 #define MAGI_JOIN_INST_BUILD(KEY_TYPE, N_SLOTS)                                 \
   template __global__ void                                                      \
   join_build_kernel<KEY_TYPE, N_SLOTS,                                          \
-                    KBUFFERING_INTRA_PARTITION_SIZE,                            \
-                    KBUFFERING_INTER_PARTITION_SIZE>(                           \
+                    KBUFFER_INTRA_PARTITION_BYTES,                            \
+                    KBUFFER_INTER_PARTITION_BYTES>(                           \
       const duckdb::magi_join::JoinBuildWire*, std::uint64_t,                   \
       duckdb::magi_join::JoinSlot<KEY_TYPE>*, double*, unsigned int*,           \
       unsigned int, int, bool, unsigned int*,                                   \
@@ -65,8 +65,8 @@ namespace magi {
 #define MAGI_JOIN_INST_PROBE(KEY_TYPE, N_SLOTS)                                 \
   template __global__ void                                                      \
   join_probe_kernel<KEY_TYPE, N_SLOTS,                                          \
-                    KBUFFERING_INTRA_PARTITION_SIZE,                            \
-                    KBUFFERING_INTER_PARTITION_SIZE>(                           \
+                    KBUFFER_INTRA_PARTITION_BYTES,                            \
+                    KBUFFER_INTER_PARTITION_BYTES>(                           \
       const duckdb::magi_join::JoinProbeWire*, std::uint64_t,                   \
       duckdb::magi_join::JoinSlot<KEY_TYPE>*, const double*,                    \
       duckdb::magi_generic::JoinResultRow*, unsigned int*, unsigned int, int,   \
@@ -113,7 +113,7 @@ template __global__ void join_clear_slots<std::int32_t>(duckdb::magi_join::JoinS
 template __global__ void join_clear_slots<std::uint64_t>(duckdb::magi_join::JoinSlot<std::uint64_t>*, int);
 template __global__ void join_clear_slots<unsigned __int128>(duckdb::magi_join::JoinSlot<unsigned __int128>*, int);
 
-}  // namespace magi
+}  // namespace mgi
 
 namespace duckdb {
 
@@ -121,7 +121,7 @@ namespace magi_fused {
 // Singleton side channel (Option 3): the fused join publishes per-GPU partial
 // sums here; the result collector reduces them + applies the top projection.
 FusedResultChannel& fused_channel() { static FusedResultChannel c{}; return c; }
-}  // namespace magi_fused
+}  // namespace mgi_fused
 
 namespace magi_generic {
 
@@ -337,7 +337,7 @@ static std::size_t join_run_typed_tier(int gpu_id, std::vector<JoinResultRow>& m
 
   // Clear H_build prefix + push the per-query key_fields / probe-payload tables.
   const int clear_grid = (N_SLOTS + 255) / 256;
-  magi::join_clear_slots<KeyT><<<clear_grid, 256, 0, st>>>(H, N_SLOTS);
+  mgi::join_clear_slots<KeyT><<<clear_grid, 256, 0, st>>>(H, N_SLOTS);
   cudaMemcpyAsync(g_jkfields_dev[gpu_id], xc.kf_ptr[gpu_id],
                   sizeof(magi_ops::KeyFieldEntry) * xc.n_kf[gpu_id],
                   cudaMemcpyHostToDevice, st);
@@ -368,7 +368,7 @@ static std::size_t join_run_typed_tier(int gpu_id, std::vector<JoinResultRow>& m
     bsrc.n_pl         = xc.n_bpl[gpu_id];
     bsrc.chunk        = FUSE_PACK_CHUNK;
   } else {
-    magi::join_pack_build_kernel<KeyT><<<magi_user_grid(), JOIN_BLOCK, 0, st>>>(
+    mgi::join_pack_build_kernel<KeyT><<<magi_user_grid(), JOIN_BLOCK, 0, st>>>(
         brow, bn, xc.build_in[gpu_id].cols, g_jkfields_dev[gpu_id], xc.n_kf[gpu_id],
         g_jbpl_dev[gpu_id], xc.n_bpl[gpu_id], bw, bw_count);
     cudaStreamSynchronize(st);
@@ -385,9 +385,9 @@ static std::size_t join_run_typed_tier(int gpu_id, std::vector<JoinResultRow>& m
   if (gpu_id == 0) xc.build_session = magi_runtime::magi_bump_session();
   xc.build_start.arrive_and_wait();
   auto pt_t2 = pt_clock::now();
-  magi::join_build_kernel<KeyT, N_SLOTS,
-                          KBUFFERING_INTRA_PARTITION_SIZE,
-                          KBUFFERING_INTER_PARTITION_SIZE>
+  mgi::join_build_kernel<KeyT, N_SLOTS,
+                          KBUFFER_INTRA_PARTITION_BYTES,
+                          KBUFFER_INTER_PARTITION_BYTES>
       <<<magi_user_grid(), JOIN_BLOCK, 0, st>>>(
           bw, bw_n, H, build_payload, payload_count,
           static_cast<unsigned int>(std::min<std::uint64_t>(build_total_rows, 0xFFFFFFFFull)),
@@ -421,7 +421,7 @@ static std::size_t join_run_typed_tier(int gpu_id, std::vector<JoinResultRow>& m
     cudaDeviceSynchronize();  // map storage alloc (default stream) before insert on st
     auto ins_ref = cuco_map->ref(cuco::insert);
     const int g = (N_SLOTS + 255) / 256;
-    magi::cuco_insert_from_hbuild<KeyT, N_SLOTS><<<g, 256, 0, st>>>(ins_ref, H);
+    mgi::cuco_insert_from_hbuild<KeyT, N_SLOTS><<<g, 256, 0, st>>>(ins_ref, H);
     cudaStreamSynchronize(st);
     chk("cuco_insert");
     auto find_ref = cuco_map->ref(cuco::find);
@@ -453,7 +453,7 @@ static std::size_t join_run_typed_tier(int gpu_id, std::vector<JoinResultRow>& m
     psrc.n_pl         = xc.n_ppl[gpu_id];
     psrc.chunk        = FUSE_PACK_CHUNK;
   } else {
-    magi::join_pack_probe_kernel<KeyT><<<magi_user_grid(), JOIN_BLOCK, 0, st>>>(
+    mgi::join_pack_probe_kernel<KeyT><<<magi_user_grid(), JOIN_BLOCK, 0, st>>>(
         prow, pn, xc.probe_in[gpu_id].cols, g_jkfields_dev[gpu_id], xc.n_kf[gpu_id],
         g_jppl_dev[gpu_id], xc.n_ppl[gpu_id], pw, pw_count);
     cudaStreamSynchronize(st);
@@ -546,12 +546,12 @@ static std::size_t join_run_typed_tier(int gpu_id, std::vector<JoinResultRow>& m
     // Clear and probe are both issued on `st`, so the clear is ordered before
     // the probe's group writes without an explicit sync.
     const int gclear = (magi_join::GROUP_N_SLOTS + 255) / 256;
-    magi::join_clear_hbuild<std::uint64_t>
+    mgi::join_clear_hbuild<std::uint64_t>
         <<<gclear, 256, 0, st>>>(group_tbl, magi_join::GROUP_N_SLOTS);
   }
-  magi::join_probe_kernel<KeyT, N_SLOTS,
-                          KBUFFERING_INTRA_PARTITION_SIZE,
-                          KBUFFERING_INTER_PARTITION_SIZE>
+  mgi::join_probe_kernel<KeyT, N_SLOTS,
+                          KBUFFER_INTRA_PARTITION_BYTES,
+                          KBUFFER_INTER_PARTITION_BYTES>
       <<<magi_user_grid(), JOIN_BLOCK, 0, st>>>(
           pw, pw_n, H, build_payload, out, out_count, static_cast<unsigned int>(out_cap),
           n_bpl_slots, /*just_load=*/false, g_joverflow_dev[gpu_id],
@@ -589,7 +589,7 @@ static std::size_t join_run_typed_tier(int gpu_id, std::vector<JoinResultRow>& m
     // Emit one result row per group (the join's output for the fused path).
     cudaMemsetAsync(out_count_dev, 0, sizeof(unsigned int), st);
     const int cg = (magi_join::GROUP_N_SLOTS + 255) / 256;
-    magi::fused_group_compact<<<cg, 256, 0, st>>>(
+    mgi::fused_group_compact<<<cg, 256, 0, st>>>(
         group_tbl, magi_join::GROUP_N_SLOTS, out, out_count_dev,
         static_cast<unsigned int>(out_cap), fuse_key_dst, fuse_sum_idx);
     cudaStreamSynchronize(st);
@@ -757,5 +757,5 @@ std::size_t distributed_hash_join_run_per_gpu(
                        agg_prog_host);
 }
 
-}  // namespace magi_generic
+}  // namespace mgi_generic
 }  // namespace duckdb

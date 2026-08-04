@@ -36,8 +36,8 @@
 #include "legacy/operator/magi_runtime_shared.hpp"  // ensures decl/def of magi_phys_gpu etc. match
 
 // Magi data-plane headers. core.cuh + kbuffering.cuh must be included before
-// channel_runtime.cuh: the channel runtime references KBuffering / Semaphore /
-// SessionBarrier / WorkerProgress / the host-worker runtime / MAGI_EOF etc.
+// channel_runtime.cuh: the channel runtime references KBufferPool / Semaphore /
+// SessionBarrier / WorkerProgress / the host-worker runtime / MGI_EOF etc.
 // without including their definitions itself — q1.cuh used to satisfy this
 // transitively before the runtime was made query-agnostic.
 #include "data_plane/api/core.cuh"
@@ -79,9 +79,9 @@ static_assert(sizeof(MagiWireCell) == 64,
 
 using EndpointT = ::Endpoint<1, 1, PARTITIONS_COUNT,
                              USER_KERNEL_GRID_SIZE, USER_KERNEL_GRID_SIZE,
-                             K_BUFFERING_K,
-                             KBUFFERING_INTRA_PARTITION_SIZE,
-                             KBUFFERING_INTER_PARTITION_SIZE,
+                             KBUFFER_DEPTH,
+                             KBUFFER_INTRA_PARTITION_BYTES,
+                             KBUFFER_INTER_PARTITION_BYTES,
                              MagiWireCell>;
 using ChannelT = channel::ChannelRuntime<USER_KERNEL_GRID_SIZE>;
 
@@ -90,11 +90,11 @@ struct MagiState {
   bool                              initialised = false;
   gdr_t                             gdr{};
   std::vector<int>                  gpu_ids;
-  std::unique_ptr<magi::P2PMemcpyOp> nvlink;
+  std::unique_ptr<mgi::P2PMemcpyOp> nvlink;
   std::vector<EndpointT*>           endpoints;            // per-GPU
   std::unique_ptr<ChannelT[]>       channels;             // per-GPU, non-moveable
   channel::SessionBarrier           barrier;
-  std::map<int, KBuffering*>        recv_stagings;
+  std::map<int, KBufferPool*>        recv_stagings;
   std::map<int, Semaphore*>         recv_connections;
   std::vector<std::map<int, int>>   fwd_tables;
   std::map<int, int>                lock_table;
@@ -199,7 +199,7 @@ void MagiInitOnce()
     size_t f = 0, t = 0; cudaMemGetInfo(&f, &t); free_before[i] = f;
   }
 
-  s.nvlink = std::make_unique<magi::P2PMemcpyOp>();
+  s.nvlink = std::make_unique<mgi::P2PMemcpyOp>();
 
   s.endpoints.assign(NUM_GPUS, nullptr);
   s.fwd_tables.resize(NUM_GPUS);
@@ -284,8 +284,8 @@ void MagiInitOnce()
                     (1024.0 * 1024 * 1024),
                 free_before[i] / (1024.0 * 1024 * 1024), f / (1024.0 * 1024 * 1024),
                 USER_KERNEL_GRID_SIZE,
-                KBUFFERING_INTRA_PARTITION_SIZE >> 20,
-                KBUFFERING_INTER_PARTITION_SIZE >> 20);
+                KBUFFER_INTRA_PARTITION_BYTES >> 20,
+                KBUFFER_INTER_PARTITION_BYTES >> 20);
   }
   std::printf("[magi] runtime initialised: %d GPUs\n", NUM_GPUS);
 }
